@@ -1,0 +1,26 @@
+{
+  "job_title": "Software Engineer",
+  "location": "Berlin",
+  "max_applications": 1,
+  "title_keyword": "",
+  "dry_run": false,
+  "profile": {
+    "first_name": "Andrew",
+    "last_name": "Bodzsar",
+    "phone_country_code": "+44",
+    "phone_number": "7951187359",
+    "email": "andrewbodzsar@proton.me",
+    "city": "Berlin"
+  },
+  "answers": {
+    "visa_sponsorship": "No",
+    "authorized_to_work": "Yes",
+    "onsite": "Yes",
+    "english_level": "Native or Bilingual",
+    "years_experience": {
+      "C++": "3",
+      "Python": "4"
+    }
+  },
+  "resume_path": "data/resume.pdf"
+}
