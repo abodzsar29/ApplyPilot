@@ -1,6 +1,6 @@
 {
-  "job_title": "Junior Developer",
-  "location": "Berlin",
+  "job_title": "Junior Software Developer",
+  "location": "London",
   "max_applications": 2,
   "title_keyword": "",
   "dry_run": false,
@@ -31,6 +31,7 @@
     "Bash/Shell": "2",
 
     "Software Engineering": "4",
+            "DevSecOps": "1",
     "Object-Oriented Programming": "4",
     "Functional Programming": "2",
     "Template Metaprogramming (C++)": "2",

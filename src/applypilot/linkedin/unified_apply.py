@@ -437,7 +437,7 @@ def _infer_question_answer(label_text: str, profile: dict, answers: dict) -> str
         return profile.get("last_name")
     if any(x in label_lower for x in ["email", "e-mail"]):
         return profile.get("email")
-    if any(x in label_lower for x in ["city"]) and "phone" not in label_lower:
+    if any(x in label_lower for x in ["city", "current location", "current city", "where are you located"]) and "phone" not in label_lower:
         return profile.get("city")
     if "visa" in label_lower or "sponsorship" in label_lower:
         return answers.get("visa_sponsorship", "No")
@@ -529,6 +529,16 @@ def _select_radio_group(scope, group_name: str, desired_value: str) -> bool:
     return False
 
 
+def _fallback_radio_choice(label_text: str) -> str:
+    """Deterministic fallback for unseen radio yes/no questions."""
+    label_lower = label_text.lower()
+    if "visa" in label_lower or "sponsorship" in label_lower:
+        return "No"
+    if any(x in label_lower for x in ["authorized", "eligible", "can you legally work"]):
+        return "Yes"
+    return "Yes"
+
+
 def _parse_year_range(option_text: str) -> tuple[float, float] | None:
     text = option_text.lower().strip()
     range_match = re.search(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)", text)
@@ -545,6 +555,52 @@ def _parse_year_range(option_text: str) -> tuple[float, float] | None:
         return value, value
 
     return None
+
+
+def _fallback_select_value(input_elem, label_text: str, profile: dict, answers: dict) -> str | None:
+    """Choose a deterministic fallback option when inference fails."""
+    label_lower = label_text.lower()
+    options = input_elem.query_selector_all("option")
+    candidates: list[tuple[str, str]] = []
+    for opt in options:
+        text = (opt.text_content() or "").strip()
+        value = (opt.get_attribute("value") or "").strip()
+        if not text:
+            continue
+        normalized = text.lower()
+        if "select an option" in normalized or normalized in {"select", "choose", "choose one"}:
+            continue
+        candidates.append((text, value or text))
+
+    if not candidates:
+        return None
+
+    if any(x in label_lower for x in ["current location", "where are you located", "current city", "location"]):
+        city = str(profile.get("city", "")).lower()
+        for text, value in candidates:
+            lowered = text.lower()
+            if city and city in lowered:
+                return value
+            if "berlin" in city and ("germany" in lowered or "berlin" in lowered):
+                return value
+
+    if any(x in label_lower for x in ["visa", "sponsorship"]):
+        for text, value in candidates:
+            if text.strip().lower() == "no":
+                return value
+
+    if any(x in label_lower for x in ["authorized", "eligible", "legally work", "open to relocating", "willing"]):
+        for text, value in candidates:
+            lowered = text.strip().lower()
+            if lowered == "yes" or "berlin" in lowered or "germany" in lowered:
+                return value
+
+    if "llm frameworks" in label_lower or "langchain" in label_lower:
+        for text, value in candidates:
+            if "experimented personally" in text.lower():
+                return value
+
+    return candidates[0][1]
 
 
 def _try_fill_select(input_elem, value: str, label_text: str) -> bool:
@@ -608,6 +664,30 @@ def _try_fill_select(input_elem, value: str, label_text: str) -> bool:
             continue
 
     return False
+
+
+def _click_action_button(button) -> bool:
+    """Click an action button with minimal scrolling/retries."""
+    if not button:
+        return False
+    try:
+        button.evaluate(
+            """el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})"""
+        )
+    except Exception:
+        pass
+
+    try:
+        button.click(timeout=1000, force=True)
+        return True
+    except Exception:
+        pass
+
+    try:
+        button.evaluate("el => el.click()")
+        return True
+    except Exception:
+        return False
 
 
 def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str = "") -> str:
@@ -683,7 +763,7 @@ def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str =
 
                     if field_type == "radio":
                         if not value:
-                            continue
+                            value = _fallback_radio_choice(label_text)
                         group_name = field_name or input_elem.get_attribute("name") or input_elem.get_attribute("id") or ""
                         if group_name in processed_radio_groups:
                             continue
@@ -696,7 +776,9 @@ def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str =
                             input_elem.check()
                     elif tag_name == "select":
                         if not value:
-                            continue
+                            value = _fallback_select_value(input_elem, label_text, profile, answers)
+                            if not value:
+                                continue
                         current_text = _element_current_text(input_elem).lower()
                         if "email" in label_lower and current_text:
                             log.info(f"Leaving prefilled email dropdown unchanged: '{current_text}'")
@@ -748,17 +830,28 @@ def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str =
             )
             if next_btn and next_btn.is_enabled():
                 log.info(f"Clicking Next button on step {step}")
-                next_btn.click()
+                if not _click_action_button(next_btn):
+                    log.warning(f"Could not click Next button on step {step}")
+                    return "FAILED"
                 page.wait_for_timeout(2000)
                 continue
 
             # Look for final Submit/Apply button
-            submit_btn = scope.query_selector(
-                "button:has-text('Submit'), button:has-text('Apply'), button:has-text('Send'), button[type='submit'], button:has-text('Finish')"
+            submit_btn = (
+                scope.query_selector("button[aria-label='Submit application']")
+                or scope.query_selector("[data-live-test-easy-apply-submit-button]")
+                or scope.query_selector("button:has-text('Submit application')")
+                or scope.query_selector("button:has-text('Submit')")
+                or scope.query_selector("button:has-text('Apply')")
+                or scope.query_selector("button:has-text('Send')")
+                or scope.query_selector("button[type='submit']")
+                or scope.query_selector("button:has-text('Finish')")
             )
             if submit_btn and submit_btn.is_enabled():
                 log.info(f"Clicking Submit button on step {step}")
-                submit_btn.click()
+                if not _click_action_button(submit_btn):
+                    log.warning(f"Could not click Submit button on step {step}")
+                    return "FAILED"
                 page.wait_for_timeout(2000)
 
                 # Check for success message
