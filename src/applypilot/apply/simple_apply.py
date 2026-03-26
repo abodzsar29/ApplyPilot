@@ -23,6 +23,7 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
     """
     profile = config.get("profile", {})
     answers = config.get("answers", {})
+    resume_path = config.get("resume_path", "")
 
     try:
         with sync_playwright() as p:
@@ -92,7 +93,7 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
                     return "FAILED:form_not_found"
 
                 # Fill form fields
-                form_filled = _fill_form(page, config, profile, answers)
+                form_filled = _fill_form(page, config, profile, answers, resume_path)
                 if not form_filled:
                     log.info("Could not fill form or skipped due to required fields")
                     return "SKIPPED:could_not_fill_form"
@@ -127,19 +128,37 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
         return f"FAILED:{str(e)[:50]}"
 
 
-def _fill_form(page, config: dict, profile: dict, answers: dict) -> bool:
+def _fill_form(page, config: dict, profile: dict, answers: dict, resume_path: str = "") -> bool:
     """Fill out the LinkedIn Easy Apply form.
 
     Returns:
         True if form was filled successfully, False otherwise
     """
     try:
+        modal = page.query_selector("dialog, .artdeco-modal__content, [role='dialog']")
+        scope = modal or page
+
+        resume_input = scope.query_selector("input[type='file']")
+        if resume_input and resume_path:
+            try:
+                resume_input.set_input_files(resume_path)
+                page.wait_for_timeout(1500)
+            except Exception as e:
+                log.debug(f"Could not upload resume: {e}")
+
         # Get all input fields
-        inputs = page.query_selector_all("input, select, textarea")
+        inputs = scope.query_selector_all("input, select, textarea")
+
+        if not inputs and not resume_input:
+            next_btn = scope.query_selector("button:has-text('Next'), button:has-text('Continue'), button:has-text('Review')")
+            if next_btn and next_btn.is_enabled():
+                next_btn.click()
+                page.wait_for_timeout(1500)
+                return True
 
         for input_elem in inputs:
             try:
-                label = _get_field_label(page, input_elem)
+                label = _get_field_label(scope, input_elem)
                 if not label:
                     continue
 
