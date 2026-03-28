@@ -332,6 +332,72 @@ def linkedin_apply(
     console.print(f"  Failed:   {result['failed']}")
 
 
+@app.command(name="linkedin-noneasy")
+def linkedin_noneasy(
+    config_path: str = typer.Option("config/linkedin_apply.json", "--config", "-c",
+                                    help="Path to linkedin_apply.json config file"),
+    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+) -> None:
+    """Search LinkedIn for non-Easy-Apply jobs and apply only to external ATS sites."""
+    import json
+    from pathlib import Path
+
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    from applypilot.linkedin.non_easy import run_non_easy_apply
+
+    check_tier(3, "linkedin-noneasy")
+
+    config_file = Path(config_path)
+    if not config_file.exists():
+        console.print(f"[red]Config not found:[/red] {config_path}")
+        console.print(f"[yellow]Template:[/yellow] {Path('config/linkedin_apply.json').resolve()}")
+        raise typer.Exit(code=1)
+
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Invalid JSON in config:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    required_keys = ["job_title", "location", "profile", "answers", "resume_path"]
+    for key in required_keys:
+        if key not in config:
+            console.print(f"[red]Missing required config key:[/red] {key}")
+            raise typer.Exit(code=1)
+
+    resume_path = Path(config["resume_path"])
+    if not resume_path.exists():
+        console.print(f"[red]Resume not found:[/red] {resume_path}")
+        raise typer.Exit(code=1)
+
+    console.print("\n[bold blue]LinkedIn Non-Easy-Apply[/bold blue]")
+    console.print(f"  Config:   {config_path}")
+    console.print(f"  Title:    {config.get('job_title', 'N/A')}")
+    console.print(f"  Location: {config.get('location', 'N/A')}")
+    console.print(f"  Keyword:  {config.get('title_keyword', 'N/A')}")
+    console.print(f"  Max:      {config.get('max_applications', 'N/A')}")
+    console.print(f"  Model:    {model}")
+    console.print(f"  Dry run:  {dry_run}")
+    console.print()
+
+    result = run_non_easy_apply(
+        config_dict=config,
+        model=model,
+        headless=headless,
+        dry_run=dry_run,
+    )
+
+    console.print("\n[bold]Summary:[/bold]")
+    console.print(f"  Found external jobs: {result['found']}")
+    console.print(f"  Applied:             {result['applied']}")
+    console.print(f"  Skipped:             {result['skipped']}")
+    console.print(f"  Failed:              {result['failed']}")
+
+
 @app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""

@@ -494,6 +494,108 @@ def _country_code_option_matches(candidate: str, option_text: str, option_value:
     return False
 
 
+def _collect_select_candidates(input_elem) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    try:
+        options = input_elem.query_selector_all("option")
+    except Exception:
+        return candidates
+
+    for opt in options:
+        text = (opt.text_content() or "").strip()
+        value = (opt.get_attribute("value") or "").strip()
+        normalized = text.lower()
+        if not text:
+            continue
+        if "select an option" in normalized or normalized in {"select", "choose", "choose one"}:
+            continue
+        candidates.append((text, value or text))
+    return candidates
+
+
+def _score_option(label_text: str, option_text: str, inferred_value: str | None, profile: dict, answers: dict) -> int:
+    label_lower = " ".join(label_text.lower().split())
+    option_lower = " ".join(option_text.lower().split())
+    score = 0
+
+    if inferred_value:
+        inferred_lower = str(inferred_value).lower()
+        if option_lower == inferred_lower:
+            score += 120
+        elif inferred_lower in option_lower:
+            score += 90
+
+        numeric_value = _safe_years_value(str(inferred_value))
+        if numeric_value is not None:
+            year_range = _parse_year_range(option_text)
+            if year_range and year_range[0] <= numeric_value <= year_range[1]:
+                score += 110
+
+    city = str(profile.get("city", "")).lower()
+    phone_country = str(profile.get("phone_country_code", ""))
+    authorized = str(answers.get("authorized_to_work", "")).lower()
+    sponsorship = str(answers.get("visa_sponsorship", "")).lower()
+
+    if any(x in label_lower for x in ["location", "city", "where are you located", "current location"]):
+        if city and city in option_lower:
+            score += 100
+        if "berlin" in city and ("berlin" in option_lower or "germany" in option_lower):
+            score += 80
+
+    if any(x in label_lower for x in ["country code", "dial code"]) or ("phone" in label_lower and "country" in label_lower):
+        if _country_code_option_matches(phone_country, option_text, option_text):
+            score += 120
+
+    if any(x in label_lower for x in ["visa", "sponsorship"]):
+        if sponsorship == "no":
+            if option_lower in {"no", "false"} or "do not require" in option_lower or "no sponsorship" in option_lower:
+                score += 120
+            if "sponsorship" in option_lower and any(x in option_lower for x in ["yes", "require", "need"]):
+                score -= 120
+        elif sponsorship == "yes":
+            if option_lower in {"yes", "true"} or "require" in option_lower or "need sponsorship" in option_lower:
+                score += 120
+
+    if any(x in label_lower for x in ["authorized to work", "work authorization", "legally authorized", "right to work", "legally work"]):
+        if authorized == "yes":
+            if option_lower in {"yes", "true"}:
+                score += 110
+            if any(x in option_lower for x in ["eu", "germany", "german", "citizen", "citizenship", "permanent", "authorized", "work permit"]):
+                score += 95
+            if any(x in option_lower for x in ["no", "false", "need sponsorship", "require sponsorship", "none"]):
+                score -= 120
+        elif authorized == "no":
+            if option_lower in {"no", "false"}:
+                score += 110
+
+    if any(x in label_lower for x in ["open to relocating", "based in berlin", "willing"]):
+        if any(x in option_lower for x in ["yes", "open to relocating", "berlin", "germany"]):
+            score += 80
+        if "outside" in option_lower:
+            score -= 30
+
+    if "email" in label_lower and profile.get("email") and str(profile.get("email")).lower() in option_lower:
+        score += 120
+
+    if "no experience" in option_lower or option_lower == "none":
+        score -= 10
+
+    return score
+
+
+def _best_option_value(label_text: str, candidates: list[tuple[str, str]], inferred_value: str | None, profile: dict, answers: dict) -> str | None:
+    if not candidates:
+        return None
+
+    best_text, best_value = candidates[0]
+    best_score = _score_option(label_text, best_text, inferred_value, profile, answers)
+    for text, value in candidates[1:]:
+        score = _score_option(label_text, text, inferred_value, profile, answers)
+        if score > best_score:
+            best_text, best_value, best_score = text, value, score
+    return best_value
+
+
 def _select_radio_group(scope, group_name: str, desired_value: str) -> bool:
     """Select a radio option by group name and desired value/label."""
     if not group_name:
@@ -529,14 +631,87 @@ def _select_radio_group(scope, group_name: str, desired_value: str) -> bool:
     return False
 
 
-def _fallback_radio_choice(label_text: str) -> str:
-    """Deterministic fallback for unseen radio yes/no questions."""
-    label_lower = label_text.lower()
-    if "visa" in label_lower or "sponsorship" in label_lower:
-        return "No"
-    if any(x in label_lower for x in ["authorized", "eligible", "can you legally work"]):
-        return "Yes"
-    return "Yes"
+def _select_best_radio_option(scope, group_name: str, label_text: str, inferred_value: str | None, profile: dict, answers: dict) -> bool:
+    if not group_name:
+        return False
+
+    radios = scope.query_selector_all(f"input[type='radio'][name='{group_name}']")
+    candidates: list[tuple[str, str]] = []
+    for radio in radios:
+        try:
+            radio_id = radio.get_attribute("id") or ""
+            option_label = (radio.get_attribute("value") or "").strip()
+            if radio_id:
+                label = scope.query_selector(f"label[for='{radio_id}']")
+                if label:
+                    option_label = (label.text_content() or "").strip() or option_label
+            if option_label:
+                candidates.append((option_label, option_label))
+        except Exception:
+            continue
+
+    best_value = _best_option_value(label_text, candidates, inferred_value, profile, answers)
+    if not best_value:
+        return False
+    return _select_radio_group(scope, group_name, best_value)
+
+
+def _select_checkbox_option(scope, group_name: str, desired_value: str) -> bool:
+    """Select a checkbox option by group name and desired label/value."""
+    if not group_name:
+        return False
+
+    desired = desired_value.strip().lower()
+    checkboxes = scope.query_selector_all(f"input[type='checkbox'][name='{group_name}']")
+    for checkbox in checkboxes:
+        try:
+            option_value = (checkbox.get_attribute("value") or "").strip().lower()
+            checkbox_id = checkbox.get_attribute("id") or ""
+            label_text = ""
+            if checkbox_id:
+                label = scope.query_selector(f"label[for='{checkbox_id}']")
+                if label:
+                    label_text = (label.text_content() or "").strip().lower()
+
+            if desired not in {option_value, label_text}:
+                continue
+
+            if checkbox_id:
+                label = scope.query_selector(f"label[for='{checkbox_id}']")
+                if label and label.is_visible():
+                    label.click(timeout=1000)
+                    return True
+
+            checkbox.check(timeout=1000, force=True)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _select_best_checkbox_option(scope, group_name: str, label_text: str, inferred_value: str | None, profile: dict, answers: dict) -> bool:
+    if not group_name:
+        return False
+
+    checkboxes = scope.query_selector_all(f"input[type='checkbox'][name='{group_name}']")
+    candidates: list[tuple[str, str]] = []
+    for checkbox in checkboxes:
+        try:
+            checkbox_id = checkbox.get_attribute("id") or ""
+            option_label = (checkbox.get_attribute("value") or "").strip()
+            if checkbox_id:
+                label = scope.query_selector(f"label[for='{checkbox_id}']")
+                if label:
+                    option_label = (label.text_content() or "").strip() or option_label
+            if option_label:
+                candidates.append((option_label, option_label))
+        except Exception:
+            continue
+
+    best_value = _best_option_value(label_text, candidates, inferred_value, profile, answers)
+    if not best_value:
+        return False
+    return _select_checkbox_option(scope, group_name, best_value)
 
 
 def _parse_year_range(option_text: str) -> tuple[float, float] | None:
@@ -559,48 +734,9 @@ def _parse_year_range(option_text: str) -> tuple[float, float] | None:
 
 def _fallback_select_value(input_elem, label_text: str, profile: dict, answers: dict) -> str | None:
     """Choose a deterministic fallback option when inference fails."""
-    label_lower = label_text.lower()
-    options = input_elem.query_selector_all("option")
-    candidates: list[tuple[str, str]] = []
-    for opt in options:
-        text = (opt.text_content() or "").strip()
-        value = (opt.get_attribute("value") or "").strip()
-        if not text:
-            continue
-        normalized = text.lower()
-        if "select an option" in normalized or normalized in {"select", "choose", "choose one"}:
-            continue
-        candidates.append((text, value or text))
-
-    if not candidates:
-        return None
-
-    if any(x in label_lower for x in ["current location", "where are you located", "current city", "location"]):
-        city = str(profile.get("city", "")).lower()
-        for text, value in candidates:
-            lowered = text.lower()
-            if city and city in lowered:
-                return value
-            if "berlin" in city and ("germany" in lowered or "berlin" in lowered):
-                return value
-
-    if any(x in label_lower for x in ["visa", "sponsorship"]):
-        for text, value in candidates:
-            if text.strip().lower() == "no":
-                return value
-
-    if any(x in label_lower for x in ["authorized", "eligible", "legally work", "open to relocating", "willing"]):
-        for text, value in candidates:
-            lowered = text.strip().lower()
-            if lowered == "yes" or "berlin" in lowered or "germany" in lowered:
-                return value
-
-    if "llm frameworks" in label_lower or "langchain" in label_lower:
-        for text, value in candidates:
-            if "experimented personally" in text.lower():
-                return value
-
-    return candidates[0][1]
+    candidates = _collect_select_candidates(input_elem)
+    inferred_value = _infer_question_answer(label_text, profile, answers)
+    return _best_option_value(label_text, candidates, inferred_value, profile, answers)
 
 
 def _try_fill_select(input_elem, value: str, label_text: str) -> bool:
@@ -690,6 +826,26 @@ def _click_action_button(button) -> bool:
         return False
 
 
+def _confirm_typeahead_input(page, input_elem, value: str) -> bool:
+    """Accept the first matching suggestion for LinkedIn typeahead inputs."""
+    try:
+        role = (input_elem.get_attribute("role") or "").lower()
+        autocomplete = (input_elem.get_attribute("aria-autocomplete") or "").lower()
+        if role != "combobox" and autocomplete != "list":
+            return False
+
+        input_elem.focus()
+        input_elem.press("Control+A")
+        input_elem.fill(str(value), timeout=1000)
+        page.wait_for_timeout(2000)
+        input_elem.press("ArrowDown")
+        page.wait_for_timeout(2000)
+        input_elem.press("Enter")
+        return True
+    except Exception:
+        return False
+
+
 def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str = "") -> str:
     """Fill and submit the multi-step Easy Apply form.
 
@@ -740,7 +896,7 @@ def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str =
                 except Exception as e:
                     log.warning(f"Could not upload resume: {e}")
 
-            processed_radio_groups = set()
+            processed_choice_groups = set()
 
             # Fill fields
             for input_elem in inputs:
@@ -762,18 +918,34 @@ def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str =
                         tag_name = "unknown"
 
                     if field_type == "radio":
-                        if not value:
-                            value = _fallback_radio_choice(label_text)
                         group_name = field_name or input_elem.get_attribute("name") or input_elem.get_attribute("id") or ""
-                        if group_name in processed_radio_groups:
+                        if group_name in processed_choice_groups:
                             continue
-                        if _select_radio_group(scope, group_name, str(value)):
-                            processed_radio_groups.add(group_name)
-                            log.info(f"Selected radio answer '{value}' for '{label_text}'")
+                        selected = False
+                        if value:
+                            selected = _select_radio_group(scope, group_name, str(value))
+                        if not selected:
+                            selected = _select_best_radio_option(scope, group_name, label_text, value, profile, answers)
+                        if selected:
+                            processed_choice_groups.add(group_name)
+                            log.info(f"Selected radio answer for '{label_text}'")
                         continue
                     if field_type == "checkbox":
+                        group_name = field_name or input_elem.get_attribute("name") or input_elem.get_attribute("id") or ""
+                        if group_name in processed_choice_groups:
+                            continue
+                        selected = False
                         if value and str(value).lower() in ["yes", "true", "selected"]:
-                            input_elem.check()
+                            try:
+                                input_elem.check(timeout=1000, force=True)
+                                selected = True
+                            except Exception:
+                                selected = False
+                        if not selected:
+                            selected = _select_best_checkbox_option(scope, group_name, label_text, value, profile, answers)
+                        if selected:
+                            processed_choice_groups.add(group_name)
+                            log.info(f"Selected checkbox answer for '{label_text}'")
                     elif tag_name == "select":
                         if not value:
                             value = _fallback_select_value(input_elem, label_text, profile, answers)
@@ -798,7 +970,14 @@ def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str =
                             continue
 
                         text_value = str(value) if value else "a"
-                        input_elem.fill(text_value, timeout=1000)
+                        used_typeahead = False
+                        if any(x in label_lower for x in ["location", "city"]) or (
+                            (input_elem.get_attribute("role") or "").lower() == "combobox"
+                        ):
+                            used_typeahead = _confirm_typeahead_input(page, input_elem, text_value)
+
+                        if not used_typeahead:
+                            input_elem.fill(text_value, timeout=1000)
                         log.debug(f"Filled: {label_text[:30]} = {text_value[:20]}")
 
                 except Exception as e:
