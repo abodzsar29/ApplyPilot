@@ -18,6 +18,12 @@
     "onsite": "Yes",
     "english_level": "Native or Bilingual",
     "german_level": "Conversational",
+    "screening_overrides": {
+        "live in london, oxford, or within a 1-hour commute": "Yes",
+        "do you require visa support": "No",
+        "bachelor’s or master’s in computer science": "Yes",
+        "bachelors degree in computer science": "Yes"
+    }
     "years_experience": {
       "C++": "3",
       "Python": "4",

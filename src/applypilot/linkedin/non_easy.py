@@ -96,6 +96,20 @@ def _answer_bank_summary(answers: dict) -> str:
     return "\n".join(lines) if lines else "- none provided"
 
 
+def _screening_override_summary(answers: dict) -> str:
+    """Render explicit question-to-answer overrides for recurring screenings."""
+    overrides = answers.get("screening_overrides", {}) or {}
+    if not overrides:
+        return "- none provided"
+
+    lines: list[str] = []
+    for question_hint, answer in overrides.items():
+        if not question_hint or answer in (None, ""):
+            continue
+        lines.append(f"- when question contains '{question_hint}': answer '{answer}'")
+    return "\n".join(lines) if lines else "- none provided"
+
+
 def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     """Build an autonomous prompt for external non-Easy-Apply sites."""
     from applypilot.apply.prompt import _build_captcha_section
@@ -114,6 +128,7 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
         f"City: {profile.get('city', '')}",
     ]
     answer_bank = _answer_bank_summary(answers)
+    screening_overrides = _screening_override_summary(answers)
     captcha_section = _build_captcha_section()
     submit_instruction = (
         "Do NOT click the final Submit/Apply button. Review the form, then output RESULT:APPLIED (dry run)."
@@ -140,6 +155,9 @@ Resume PDF (upload this): {resume_path}
 == STANDARD ANSWERS ==
 {answer_bank}
 
+== SCREENING OVERRIDES ==
+{screening_overrides}
+
 == RESUME TEXT ==
 {resume_text or "Not available as text. Use the uploaded resume PDF plus the profile/answer bank above."}
 
@@ -154,7 +172,11 @@ Resume PDF (upload this): {resume_path}
 8. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
 
 == QUESTION POLICY ==
+- FIRST: check SCREENING OVERRIDES. If the visible question text substantially matches an override, use that override answer exactly.
 - Prefer deterministic answers from the provided profile and answer bank.
+- For location / commute / willing-to-work-onsite threshold questions, use answers.onsite when present.
+- For visa / sponsorship / work permit / require support questions, use answers.visa_sponsorship when present.
+- For authorized-to-work questions, use answers.authorized_to_work when present.
 - For yes/no tool questions: if the tool clearly matches a skill listed in years_experience with > 0 years, answer Yes.
 - For "years of experience" questions: use the matching years_experience value when present.
 - For open text such as "Why are you interested?" or "Tell us about yourself": write 2-3 sentences grounded in the visible job description and the provided profile/resume.
