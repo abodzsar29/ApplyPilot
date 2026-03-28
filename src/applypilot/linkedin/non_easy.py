@@ -110,6 +110,20 @@ def _screening_override_summary(answers: dict) -> str:
     return "\n".join(lines) if lines else "- none provided"
 
 
+def _education_summary(answers: dict) -> str:
+    """Render structured education data for deterministic degree answers."""
+    education = answers.get("education", {}) or {}
+    if not education:
+        return "- none provided"
+
+    lines: list[str] = []
+    for key, value in education.items():
+        if value in (None, "", []):
+            continue
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines) if lines else "- none provided"
+
+
 def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     """Build an autonomous prompt for external non-Easy-Apply sites."""
     from applypilot.apply.prompt import _build_captcha_section
@@ -129,6 +143,7 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     ]
     answer_bank = _answer_bank_summary(answers)
     screening_overrides = _screening_override_summary(answers)
+    education_summary = _education_summary(answers)
     captcha_section = _build_captcha_section()
     submit_instruction = (
         "Do NOT click the final Submit/Apply button. Review the form, then output RESULT:APPLIED (dry run)."
@@ -158,6 +173,9 @@ Resume PDF (upload this): {resume_path}
 == SCREENING OVERRIDES ==
 {screening_overrides}
 
+== EDUCATION ==
+{education_summary}
+
 == RESUME TEXT ==
 {resume_text or "Not available as text. Use the uploaded resume PDF plus the profile/answer bank above."}
 
@@ -177,6 +195,9 @@ Resume PDF (upload this): {resume_path}
 - For location / commute / willing-to-work-onsite threshold questions, use answers.onsite when present.
 - For visa / sponsorship / work permit / require support questions, use answers.visa_sponsorship when present.
 - For authorized-to-work questions, use answers.authorized_to_work when present.
+- For degree and field-of-study questions, use EDUCATION first. Treat that section as the source of truth for bachelor's, master's, highest education, and Computer Science field checks.
+- If EDUCATION provides explicit booleans such as computer_science_bachelors, computer_science_masters, or computer_science_bachelors_or_masters, use them directly for matching yes/no questions.
+- If EDUCATION provides bachelors_field or masters_field, use those exact fields when asked what subject the degree is in.
 - For yes/no tool questions: if the tool clearly matches a skill listed in years_experience with > 0 years, answer Yes.
 - For "years of experience" questions: use the matching years_experience value when present.
 - For open text such as "Why are you interested?" or "Tell us about yourself": write 2-3 sentences grounded in the visible job description and the provided profile/resume.

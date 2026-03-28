@@ -23,7 +23,17 @@
         "do you require visa support": "No",
         "bachelor’s or master’s in computer science": "Yes",
         "bachelors degree in computer science": "Yes"
-    }
+    },
+    "education": {
+        "highest_level": "Master's",
+        "bachelors": "Yes",
+        "bachelors_field": "Computer Security and Forensics",
+        "masters": "Yes",
+        "masters_field": "Computational Finance",
+        "computer_science_bachelors": "Yes",
+        "computer_science_masters": "Yes",
+        "computer_science_bachelors_or_masters": "Yes"
+    },
     "years_experience": {
       "C++": "3",
       "Python": "4",
