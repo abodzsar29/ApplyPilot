@@ -346,12 +346,12 @@ def linkedin_noneasy(
 
     _bootstrap()
 
-    from applypilot.config import check_qwen_non_easy_requirements
+    from applypilot.config import check_non_easy_provider_requirements
     from applypilot.linkedin.non_easy import run_non_easy_apply
     from applypilot.qwen_mcp import get_effective_model_and_provider
 
-    check_qwen_non_easy_requirements("linkedin-noneasy")
     effective_model, provider = get_effective_model_and_provider(model)
+    check_non_easy_provider_requirements("linkedin-noneasy", provider)
 
     config_file = Path(config_path)
     if not config_file.exists():

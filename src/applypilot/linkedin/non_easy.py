@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+import json
+import subprocess
 import time
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
@@ -17,8 +19,9 @@ from applypilot.apply.chrome import (
     cleanup_worker,
     kill_all_chrome,
     launch_chrome,
+    reset_worker_dir,
 )
-from applypilot.qwen_mcp import QwenMCPAgent, get_qwen_model
+from applypilot.qwen_mcp import QwenMCPAgent, get_effective_model_and_provider
 
 log = logging.getLogger(__name__)
 
@@ -681,16 +684,84 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
 
 
 def _run_external_application(
-    agent: QwenMCPAgent,
+    provider: str,
+    model: str,
+    agent: QwenMCPAgent | None,
     job: dict,
     config_dict: dict,
+    port: int,
     dry_run: bool,
 ) -> tuple[str, int]:
-    """Run Qwen MCP against a single external application URL."""
+    """Run the configured browser agent against a single external application URL."""
+    if provider == "claude":
+        start = time.time()
+        prompt = _build_prompt(job, config_dict, dry_run=dry_run)
+
+        mcp_config_path = config.APP_DIR / ".mcp-linkedin-noneasy-0.json"
+        mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
+
+        cmd = [
+            "claude",
+            "--model", model,
+            "-p",
+            "--mcp-config", str(mcp_config_path),
+            "--permission-mode", "bypassPermissions",
+            "--no-session-persistence",
+            "--output-format", "stream-json",
+            "--verbose", "-",
+        ]
+
+        worker_dir = reset_worker_dir(0)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=str(worker_dir),
+        )
+
+        assert proc.stdin is not None
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+
+        text_parts: list[str] = []
+        log_file = config.LOG_DIR / f"linkedin_noneasy_claude_{int(start)}.log"
+        with open(log_file, "w", encoding="utf-8") as lf:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    msg_type = msg.get("type")
+                    if msg_type == "assistant":
+                        for block in msg.get("message", {}).get("content", []):
+                            if block.get("type") == "text":
+                                text_parts.append(block["text"])
+                                lf.write(block["text"] + "\n")
+                    elif msg_type == "result":
+                        text_parts.append(msg.get("result", ""))
+                except json.JSONDecodeError:
+                    text_parts.append(line)
+                    lf.write(line + "\n")
+
+        proc.wait(timeout=config.DEFAULTS["apply_timeout"])
+        output = "\n".join(text_parts)
+        status = _extract_result(output)
+        duration_ms = int((time.time() - start) * 1000)
+        return status, duration_ms
+
+    if agent is None:
+        raise RuntimeError(f"Provider '{provider}' requires an initialized MCP agent")
+
     start = time.time()
     prompt = _build_prompt(job, config_dict, dry_run=dry_run)
 
-    log_file = config.LOG_DIR / f"linkedin_noneasy_qwen_{int(start)}.log"
+    log_file = config.LOG_DIR / f"linkedin_noneasy_{provider}_{int(start)}.log"
     output = agent.run_prompt(prompt, log_path=log_file)
     status = _extract_result(output)
     duration_ms = int((time.time() - start) * 1000)
@@ -741,7 +812,11 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
-        agent = QwenMCPAgent(model=get_qwen_model(model), mcp_config=_make_mcp_config(port))
+        effective_model, provider = get_effective_model_and_provider(model)
+        agent = None if provider == "claude" else QwenMCPAgent(
+            model=effective_model,
+            mcp_config=_make_mcp_config(port),
+        )
 
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -842,9 +917,12 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         log.info("Opened external application page: %s", application_url or "<unknown>")
 
                         result, _duration_ms = _run_external_application(
+                            provider=provider,
+                            model=effective_model,
                             agent=agent,
                             job=job,
                             config_dict=config_dict,
+                            port=port,
                             dry_run=dry_run,
                         )
                         if result == "applied":
@@ -857,7 +935,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 result,
                             )
                             if result == "failed:provider_credit_low":
-                                log.error("Stopping non-easy apply run: Qwen credits are exhausted.")
+                                log.error("Stopping non-easy apply run: provider credits are exhausted.")
                                 return summary
 
                         # Cleanup any external tabs opened during apply, but keep the LinkedIn pages alive.

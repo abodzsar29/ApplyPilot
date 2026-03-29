@@ -22,9 +22,11 @@ def get_qwen_api_key() -> str:
 
 
 def get_qwen_model(default: str = "qwen-flash") -> str:
-    """Return the configured Qwen model name."""
+    """Return the configured OpenRouter/DashScope model name."""
     return (
-        os.environ.get("OPENROUTER_MODEL")
+        os.environ.get("NON_EASY_MODEL")
+        or os.environ.get("APPLYPILOT_NON_EASY_MODEL")
+        or os.environ.get("OPENROUTER_MODEL")
         or os.environ.get("QWEN_MODEL")
         or os.environ.get("LLM_MODEL")
         or default
@@ -32,16 +34,34 @@ def get_qwen_model(default: str = "qwen-flash") -> str:
 
 
 def get_qwen_provider() -> str:
-    """Return the configured Qwen backend provider."""
+    """Return the configured linkedin-noneasy provider."""
+    explicit = (
+        os.environ.get("NON_EASY_PROVIDER")
+        or os.environ.get("APPLYPILOT_NON_EASY_PROVIDER")
+        or ""
+    ).strip().lower()
+    if explicit:
+        return explicit
     if os.environ.get("OPENROUTER_API_KEY"):
         return "openrouter"
+    if os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("QWEN_API_KEY") or os.environ.get("BAILIAN_API_KEY"):
+        return "dashscope"
     return "dashscope"
 
 
 def get_effective_model_and_provider(cli_model: str) -> tuple[str, str]:
     """Resolve the actual provider and model after env overrides."""
-    model = get_qwen_model(cli_model)
     provider = get_qwen_provider()
+    if provider == "claude":
+        model = (
+            os.environ.get("NON_EASY_MODEL")
+            or os.environ.get("APPLYPILOT_NON_EASY_MODEL")
+            or os.environ.get("CLAUDE_MODEL")
+            or cli_model
+            or "haiku"
+        ).strip()
+    else:
+        model = get_qwen_model(cli_model)
     return model, provider
 
 

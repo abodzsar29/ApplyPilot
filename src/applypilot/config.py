@@ -261,6 +261,49 @@ def check_qwen_non_easy_requirements(feature: str) -> None:
     raise SystemExit(1)
 
 
+def check_non_easy_provider_requirements(feature: str, provider: str) -> None:
+    """Raise SystemExit with a clear message if the selected non-easy provider is missing prerequisites."""
+    load_env()
+
+    from rich.console import Console
+
+    console = Console(stderr=True)
+    missing: list[str] = []
+
+    if provider == "claude":
+        if shutil.which("claude") is None:
+            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+    elif provider in {"openrouter", "dashscope"}:
+        if provider == "openrouter":
+            if not os.environ.get("OPENROUTER_API_KEY"):
+                missing.append("OpenRouter API key — set OPENROUTER_API_KEY")
+        else:
+            if not any(os.environ.get(k) for k in ("DASHSCOPE_API_KEY", "QWEN_API_KEY", "BAILIAN_API_KEY")):
+                missing.append("Qwen API key — set DASHSCOPE_API_KEY")
+        if importlib.util.find_spec("qwen_agent") is None:
+            missing.append('Python package qwen-agent[mcp] — install with [bold]pip install -U "qwen-agent[mcp]"[/bold]')
+    else:
+        missing.append(f"Unsupported NON_EASY_PROVIDER '{provider}' — use 'claude', 'openrouter', or 'dashscope'")
+
+    if shutil.which("npx") is None:
+        missing.append("Node.js / npx — install Node.js 18+ (needed for Playwright MCP)")
+
+    try:
+        get_chrome_path()
+    except FileNotFoundError:
+        missing.append("Chrome/Chromium — install or set CHROME_PATH")
+
+    if not missing:
+        return
+
+    console.print(f"\n[red]'{feature}' requires provider prerequisites for '{provider}'.[/red]")
+    console.print("\n[yellow]Missing:[/yellow]")
+    for item in missing:
+        console.print(f"  - {item}")
+    console.print()
+    raise SystemExit(1)
+
+
 def check_tier(required: int, feature: str) -> None:
     """Raise SystemExit with a clear message if the current tier is too low.
 
