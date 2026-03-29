@@ -90,11 +90,13 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
+| OpenRouter or DashScope Qwen API key | LinkedIn non-Easy-Apply via Qwen | Set `OPENROUTER_API_KEY` for OpenRouter or `DASHSCOPE_API_KEY` for DashScope |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
+| `qwen-agent[mcp]` | LinkedIn non-Easy-Apply via Qwen | Install with `pip install -U "qwen-agent[mcp]"` |
 
-**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
+**Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). Qwen via OpenRouter or DashScope / Model Studio, OpenAI, and local models (Ollama/llama.cpp) are also supported.
 
 ### Optional
 
@@ -117,7 +119,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `QWEN_MODEL`, `DASHSCOPE_API_KEY`, `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)

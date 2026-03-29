@@ -336,7 +336,7 @@ def linkedin_apply(
 def linkedin_noneasy(
     config_path: str = typer.Option("config/linkedin_apply.json", "--config", "-c",
                                     help="Path to linkedin_apply.json config file"),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: str = typer.Option("qwen-flash", "--model", "-m", help="Qwen model name."),
     headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
 ) -> None:
@@ -346,10 +346,12 @@ def linkedin_noneasy(
 
     _bootstrap()
 
-    from applypilot.config import check_tier
+    from applypilot.config import check_qwen_non_easy_requirements
     from applypilot.linkedin.non_easy import run_non_easy_apply
+    from applypilot.qwen_mcp import get_effective_model_and_provider
 
-    check_tier(3, "linkedin-noneasy")
+    check_qwen_non_easy_requirements("linkedin-noneasy")
+    effective_model, provider = get_effective_model_and_provider(model)
 
     config_file = Path(config_path)
     if not config_file.exists():
@@ -380,13 +382,14 @@ def linkedin_noneasy(
     console.print(f"  Location: {config.get('location', 'N/A')}")
     console.print(f"  Keyword:  {config.get('title_keyword', 'N/A')}")
     console.print(f"  Max:      {config.get('max_applications', 'N/A')}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Provider: {provider}")
+    console.print(f"  Model:    {effective_model}")
     console.print(f"  Dry run:  {dry_run}")
     console.print()
 
     result = run_non_easy_apply(
         config_dict=config,
-        model=model,
+        model=effective_model,
         headless=headless,
         dry_run=dry_run,
     )
@@ -522,10 +525,28 @@ def doctor() -> None:
 
     # --- Tier 2 checks ---
     import os
+    has_qwen = bool(
+        os.environ.get("OPENROUTER_API_KEY")
+        or os.environ.get("OPENROUTER_MODEL")
+        or os.environ.get("DASHSCOPE_API_KEY")
+        or os.environ.get("QWEN_API_KEY")
+        or os.environ.get("BAILIAN_API_KEY")
+    )
     has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    if has_qwen:
+        model = (
+            os.environ.get("OPENROUTER_MODEL")
+            or os.environ.get("QWEN_MODEL")
+            or os.environ.get("LLM_MODEL", "qwen-flash")
+        )
+        provider = "OpenRouter" if (
+            os.environ.get("OPENROUTER_API_KEY")
+            or os.environ.get("OPENROUTER_BASE_URL") == "https://openrouter.ai/api/v1"
+        ) else "Qwen"
+        results.append(("LLM API key", ok_mark, f"{provider} ({model})"))
+    elif has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
     elif has_openai:
@@ -535,7 +556,7 @@ def doctor() -> None:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+                        "Set OPENROUTER_API_KEY, DASHSCOPE_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY in ~/.applypilot/.env"))
 
     # --- Tier 3 checks ---
     # Claude Code CLI
@@ -561,6 +582,13 @@ def doctor() -> None:
     else:
         results.append(("Node.js (npx)", fail_mark,
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
+
+    try:
+        import qwen_agent  # noqa: F401
+        results.append(("qwen-agent[mcp]", ok_mark, "Python package available"))
+    except ImportError:
+        results.append(("qwen-agent[mcp]", fail_mark,
+                        "Install with pip install -U \"qwen-agent[mcp]\" (needed for linkedin-noneasy Qwen mode)"))
 
     # CapSolver (optional)
     capsolver = os.environ.get("CAPSOLVER_API_KEY")

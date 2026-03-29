@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import subprocess
 import time
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
@@ -19,8 +17,8 @@ from applypilot.apply.chrome import (
     cleanup_worker,
     kill_all_chrome,
     launch_chrome,
-    reset_worker_dir,
 )
+from applypilot.qwen_mcp import QwenMCPAgent, get_qwen_model
 
 log = logging.getLogger(__name__)
 
@@ -44,12 +42,12 @@ def _make_mcp_config(cdp_port: int) -> dict:
 
 
 def _extract_result(output: str) -> str:
-    """Parse the Claude output into a normalized status string."""
+    """Parse the agent output into a normalized status string."""
     lowered = output.lower()
     if "credit balance is too low" in lowered:
-        return "failed:claude_credit_low"
+        return "failed:provider_credit_low"
     if "insufficient credits" in lowered or "insufficient balance" in lowered:
-        return "failed:claude_credit_low"
+        return "failed:provider_credit_low"
 
     for result_status in ("APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"):
         if f"RESULT:{result_status}" in output:
@@ -682,65 +680,18 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
     return found_jobs, stats
 
 
-def _run_external_application(job: dict, config_dict: dict, model: str, port: int, dry_run: bool) -> tuple[str, int]:
-    """Run Claude Code against a single external application URL."""
+def _run_external_application(
+    agent: QwenMCPAgent,
+    job: dict,
+    config_dict: dict,
+    dry_run: bool,
+) -> tuple[str, int]:
+    """Run Qwen MCP against a single external application URL."""
     start = time.time()
     prompt = _build_prompt(job, config_dict, dry_run=dry_run)
 
-    mcp_config_path = config.APP_DIR / ".mcp-linkedin-noneasy-0.json"
-    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
-
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
-
-    worker_dir = reset_worker_dir(0)
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=str(worker_dir),
-    )
-
-    assert proc.stdin is not None
-    proc.stdin.write(prompt)
-    proc.stdin.close()
-
-    text_parts: list[str] = []
-    log_file = config.LOG_DIR / f"linkedin_noneasy_{int(start)}.log"
-    with open(log_file, "w", encoding="utf-8") as lf:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-                msg_type = msg.get("type")
-                if msg_type == "assistant":
-                    for block in msg.get("message", {}).get("content", []):
-                        if block.get("type") == "text":
-                            text_parts.append(block["text"])
-                            lf.write(block["text"] + "\n")
-                elif msg_type == "result":
-                    text_parts.append(msg.get("result", ""))
-            except json.JSONDecodeError:
-                text_parts.append(line)
-                lf.write(line + "\n")
-
-    proc.wait(timeout=config.DEFAULTS["apply_timeout"])
-    output = "\n".join(text_parts)
+    log_file = config.LOG_DIR / f"linkedin_noneasy_qwen_{int(start)}.log"
+    output = agent.run_prompt(prompt, log_path=log_file)
     status = _extract_result(output)
     duration_ms = int((time.time() - start) * 1000)
     return status, duration_ms
@@ -758,7 +709,7 @@ def _iter_result_cards(page):
     return page.query_selector_all("a.base-card__full-link, div.job-card-container a[href*='/jobs/view/']")
 
 
-def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
+def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                headless: bool = False, dry_run: bool = False) -> dict:
     """Process LinkedIn non-Easy-Apply jobs directly from search results."""
     job_title = config_dict.get("job_title", "")
@@ -790,6 +741,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
+        agent = QwenMCPAgent(model=get_qwen_model(model), mcp_config=_make_mcp_config(port))
 
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
@@ -890,10 +842,9 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
                         log.info("Opened external application page: %s", application_url or "<unknown>")
 
                         result, _duration_ms = _run_external_application(
-                            job,
+                            agent=agent,
+                            job=job,
                             config_dict=config_dict,
-                            model=model,
-                            port=port,
                             dry_run=dry_run,
                         )
                         if result == "applied":
@@ -905,8 +856,8 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
                                 application_url or linkedin_url,
                                 result,
                             )
-                            if result == "failed:claude_credit_low":
-                                log.error("Stopping non-easy apply run: Claude Code credits are exhausted.")
+                            if result == "failed:provider_credit_low":
+                                log.error("Stopping non-easy apply run: Qwen credits are exhausted.")
                                 return summary
 
                         # Cleanup any external tabs opened during apply, but keep the LinkedIn pages alive.
@@ -950,7 +901,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
     return summary
 
 
-def run_non_easy_apply(config_dict: dict, model: str = "haiku",
+def run_non_easy_apply(config_dict: dict, model: str = "qwen-flash",
                        headless: bool = False, dry_run: bool = False) -> dict:
     """Backward-compatible shim."""
     return _run_non_easy_apply_direct(config_dict, model=model, headless=headless, dry_run=dry_run)

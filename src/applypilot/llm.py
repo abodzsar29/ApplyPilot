@@ -2,6 +2,7 @@
 Unified LLM client for ApplyPilot.
 
 Auto-detects provider from environment:
+  DASHSCOPE_API_KEY -> Qwen / DashScope (default: qwen-flash)
   GEMINI_API_KEY  -> Google Gemini (default: gemini-2.0-flash)
   OPENAI_API_KEY  -> OpenAI (default: gpt-4o-mini)
   LLM_URL         -> Local llama.cpp / Ollama compatible endpoint
@@ -28,9 +29,22 @@ def _detect_provider() -> tuple[str, str, str]:
     in _bootstrap() is always visible here.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    qwen_key = (
+        os.environ.get("DASHSCOPE_API_KEY", "")
+        or os.environ.get("QWEN_API_KEY", "")
+        or os.environ.get("BAILIAN_API_KEY", "")
+    )
     openai_key = os.environ.get("OPENAI_API_KEY", "")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
+    dashscope_base = os.environ.get("DASHSCOPE_BASE_URL", "").rstrip("/")
+
+    if qwen_key and not local_url:
+        return (
+            dashscope_base or "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            model_override or "qwen-flash",
+            qwen_key,
+        )
 
     if gemini_key and not local_url:
         return (
@@ -55,7 +69,7 @@ def _detect_provider() -> tuple[str, str, str]:
 
     raise RuntimeError(
         "No LLM provider configured. "
-        "Set GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
+        "Set DASHSCOPE_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY, or LLM_URL in your environment."
     )
 
 

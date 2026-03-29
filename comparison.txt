@@ -1,0 +1,78 @@
+• Yes, some of those are better candidates than nvidia/nemotron-3-super-120b-a12b:free for your browser-
+  agent task.
+
+  Best options from your list for linkedin-noneasy:
+
+  - minimax/minimax-m2.5:free
+    OpenRouter says it was trained in “real-world digital working environments,” can context-switch
+    across software, and optimize actions through planning. That matches browser automation unusually
+    well.
+  - z-ai/glm-4.5-air:free
+    Its page explicitly says it is “purpose-built for agent-centric applications” and supports a thinking
+    mode for reasoning and tool use.
+  - openai/gpt-oss-120b:free
+    Its page explicitly says it is for “agentic” production use and has native tool use, function
+    calling, browsing, and structured outputs.
+  - qwen/qwen3-next-80b-a3b-instruct:free
+    Its page says it is suited for tool use and agentic workflows with stable final answers, which is
+    relevant because your run failed partly on missing RESULT: termination.
+  - arcee-ai/trinity-mini:free
+    Its page explicitly mentions robust function calling and multi-step agent workflows.
+
+  Models from your list I would avoid for this task:
+
+  - nvidia/llama-nemotron-embed-vl-1b-v2:free
+    Not a chat agent model. It is an embedding model.
+  - black-forest-labs/flux.2-klein-4b
+  - black-forest-labs/flux.2-max
+    These are image generation models, not browser agents.
+  - liquid/lfm-2.5-1.2b-thinking:free
+  - liquid/lfm-2.5-1.2b-instruct:free
+    1.2B is too small for reliable form-filling/tool-use on messy external job sites.
+  - qwen/qwen3-coder:free
+    Stronger for coding/tool use around code, but not obviously the best fit for job-form browser
+    interaction.
+  - arcee-ai/trinity-large-preview:free
+    Potentially decent, but OpenRouter marks it “Going away March 31, 2026,” so I would not build on it
+    now.
+
+  My ranking from your list for this exact task:
+
+  1. minimax/minimax-m2.5:free
+  2. z-ai/glm-4.5-air:free
+  3. openai/gpt-oss-120b:free
+  4. qwen/qwen3-next-80b-a3b-instruct:free
+  5. arcee-ai/trinity-mini:free
+
+  Free-status confirmation:
+
+  - Models with :free pages that show Free variant and $0/M input tokens + $0/M output tokens are free on
+    OpenRouter’s free tier, subject to free-tier limits.
+  - OpenRouter’s pricing page says the free plan has “25+ free models” and rate limits of 50 requests/day
+    and 20 requests/minute.
+  - Your FLUX examples are not free text models. Their pages show $0/M input/output but also a separate
+    per-image price, and OpenRouter explicitly says they are image-generation models. That “$X/M tokens”
+    line is just an effective normalized cost, not literal free text generation.
+
+  So the best next model to try is:
+
+  QWEN_MODEL=minimax/minimax-m2.5:free
+
+  If that still feels sloppy, try:
+
+  QWEN_MODEL=z-ai/glm-4.5-air:free
+
+  Sources:
+
+  - OpenRouter MiniMax M2.5: https://openrouter.ai/minimax/minimax-m2.5:free
+  - OpenRouter GLM 4.5 Air: https://openrouter.ai/z-ai/glm-4.5-air:free
+  - OpenRouter gpt-oss-120b: https://openrouter.ai/openai/gpt-oss-120b:free
+  - OpenRouter Qwen3 Next 80B A3B Instruct: https://openrouter.ai/qwen/qwen3-next-80b-a3b-instruct:free
+  - OpenRouter Trinity Mini: https://openrouter.ai/arcee-ai/trinity-mini:free
+  - OpenRouter Trinity Large Preview: https://openrouter.ai/arcee-ai/trinity-large-preview:free
+  - OpenRouter FLUX.2 Klein 4B: https://openrouter.ai/black-forest-labs/flux.2-klein-4b
+  - OpenRouter FLUX.2 Max: https://openrouter.ai/black-forest-labs/flux.2-max
+  - OpenRouter pricing: https://openrouter.ai/pricing
+
+  If you want, I can also give you a short “test order” of 3 models to try in sequence based on cheapest
+  likely success.

@@ -1,5 +1,6 @@
 """ApplyPilot configuration: paths, platform detection, user data."""
 
+import importlib.util
 import os
 import platform
 import shutil
@@ -221,6 +222,43 @@ def get_tier() -> int:
         return 3
 
     return 2
+
+
+def check_qwen_non_easy_requirements(feature: str) -> None:
+    """Raise SystemExit with a clear message if Qwen MCP requirements are missing."""
+    load_env()
+
+    from rich.console import Console
+
+    console = Console(stderr=True)
+    missing: list[str] = []
+
+    if not any(
+        os.environ.get(k)
+        for k in ("OPENROUTER_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY", "BAILIAN_API_KEY")
+    ):
+        missing.append("Qwen API key — set OPENROUTER_API_KEY or DASHSCOPE_API_KEY")
+
+    if importlib.util.find_spec("qwen_agent") is None:
+        missing.append('Python package qwen-agent[mcp] — install with [bold]pip install -U "qwen-agent[mcp]"[/bold]')
+
+    if shutil.which("npx") is None:
+        missing.append("Node.js / npx — install Node.js 18+ (needed for Playwright MCP)")
+
+    try:
+        get_chrome_path()
+    except FileNotFoundError:
+        missing.append("Chrome/Chromium — install or set CHROME_PATH")
+
+    if not missing:
+        return
+
+    console.print(f"\n[red]'{feature}' requires Qwen MCP browser automation prerequisites.[/red]")
+    console.print("\n[yellow]Missing:[/yellow]")
+    for item in missing:
+        console.print(f"  - {item}")
+    console.print()
+    raise SystemExit(1)
 
 
 def check_tier(required: int, feature: str) -> None:

@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.1"]
+qwen = ["qwen-agent[mcp]"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"
