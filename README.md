@@ -1,3 +1,7 @@
+The project is being developed to apply to LinkedIn EasyApply jobs through Playwright + Python based on hard-coded rule matching, and apply to external jobs after searching on LinkedIn with interaction through MCP, for as little of a cost as possible, currently with capabilities through OpenRouter and Claude.
+
+## README.md from the time of forking below
+
 <!-- logo here -->
 
 > **⚠️ ApplyPilot** is the original open-source project, created by [Pickle-Pixel](https://github.com/Pickle-Pixel) and first published on GitHub on **February 17, 2026**. We are **not affiliated** with applypilot.app, useapplypilot.com, or any other product using the "ApplyPilot" name. These sites are **not associated with this project** and may misrepresent what they offer. If you're looking for the autonomous, open-source job application agent — you're in the right place.
