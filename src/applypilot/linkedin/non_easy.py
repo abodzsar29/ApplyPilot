@@ -25,6 +25,8 @@ from applypilot.apply.chrome import (
 log = logging.getLogger(__name__)
 
 LINKEDIN_BASE_URL = "https://www.linkedin.com"
+PROTONMAIL_INBOX_URL = "https://mail.proton.me/u/0/inbox"
+NONEASY_APPLIED_FILE = config.APP_DIR / "linkedin_noneasy_applied.jsonl"
 
 
 def _make_mcp_config(cdp_port: int) -> dict:
@@ -41,6 +43,62 @@ def _make_mcp_config(cdp_port: int) -> dict:
             }
         }
     }
+
+
+def _normalize_registry_value(value: str) -> str:
+    """Normalize title/company strings for stable duplicate detection."""
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def _job_registry_key(title: str, company: str) -> str:
+    """Build a normalized registry key from title and company."""
+    return f"{_normalize_registry_value(title)}\t{_normalize_registry_value(company)}"
+
+
+def _load_applied_job_keys() -> set[str]:
+    """Load previously applied non-easy jobs from the local registry file."""
+    if not NONEASY_APPLIED_FILE.exists():
+        return set()
+
+    keys: set[str] = set()
+    try:
+        for raw_line in NONEASY_APPLIED_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            title = row.get("title", "")
+            company = row.get("company", "")
+            key = _job_registry_key(title, company)
+            if key != "\t":
+                keys.add(key)
+    except Exception:
+        log.debug("Could not read non-easy applied registry", exc_info=True)
+    return keys
+
+
+def _record_applied_job(job: dict) -> None:
+    """Append a successfully applied non-easy job to the local registry file."""
+    title = job.get("title", "")
+    company = job.get("company", "")
+    key = _job_registry_key(title, company)
+    if key == "\t":
+        return
+
+    config.ensure_dirs()
+    entry = {
+        "title": title,
+        "company": company,
+        "linkedin_url": job.get("linkedin_url", ""),
+        "application_url": job.get("application_url", ""),
+        "recorded_at": int(time.time()),
+    }
+    with open(NONEASY_APPLIED_FILE, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
 
 
 def _extract_result(output: str) -> str:
@@ -124,7 +182,23 @@ def _education_summary(answers: dict) -> str:
     return "\n".join(lines) if lines else "- none provided"
 
 
-def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
+def _mailbox_context(config_dict: dict) -> tuple[str | None, str]:
+    """Return inbox URL and applicant email for email-code retrieval flows."""
+    profile = config_dict.get("profile", {}) or {}
+    email = (profile.get("email", "") or "").strip()
+    inbox_url = (config_dict.get("mail_inbox_url", "") or "").strip()
+
+    if inbox_url:
+        return inbox_url, email
+
+    lowered = email.lower()
+    if lowered.endswith(("@proton.me", "@protonmail.com", "@pm.me")):
+        return PROTONMAIL_INBOX_URL, email
+
+    return None, email
+
+
+def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False, mailbox_url: str | None = None) -> str:
     """Build an autonomous prompt for external non-Easy-Apply sites."""
     from applypilot.apply.prompt import _build_captcha_section
 
@@ -132,11 +206,12 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     answers = config_dict.get("answers", {}) or {}
     resume_path = Path(config_dict["resume_path"]).resolve()
     resume_text = _read_resume_text(resume_path)
+    applicant_email = (profile.get("email", "") or "").strip()
 
     profile_lines = [
         f"First name: {profile.get('first_name', '')}",
         f"Last name: {profile.get('last_name', '')}",
-        f"Email: {profile.get('email', '')}",
+        f"Email: {applicant_email}",
         f"Phone country code: {profile.get('phone_country_code', '')}",
         f"Phone number: {profile.get('phone_number', '')}",
         f"City: {profile.get('city', '')}",
@@ -150,6 +225,22 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
         if dry_run
         else "Submit the application after verifying all required fields are correct."
     )
+    email_2fa_section = ""
+    if mailbox_url:
+        email_2fa_section = f"""
+
+== EMAIL / 2FA ==
+- Applicant email address: {applicant_email or "not provided"}
+- Mail inbox tab should already be available at: {mailbox_url}
+- Use the mail tab ONLY if the application flow visibly asks for an email verification code, OTP, passcode, one-time code, or 2FA code.
+- When such a code is required:
+  1. Switch to the Proton Mail tab.
+  2. Wait briefly and refresh/check for the newest relevant email from the employer / ATS / verification sender.
+  3. Open the newest matching message, extract the verification code, copy it, and return to the application tab.
+  4. Paste the code into the blocking verification field and continue the registration/application flow.
+- If the site never requests an email code, ignore the mail tab completely.
+- If a visible email-code challenge is blocking progress and the mailbox cannot be accessed or no code arrives after reasonable retries, output RESULT:FAILED:email_2fa_unavailable.
+"""
 
     return f"""You are an autonomous browser agent completing a LinkedIn non-Easy-Apply job application.
 
@@ -178,6 +269,7 @@ Resume PDF (upload this): {resume_path}
 
 == RESUME TEXT ==
 {resume_text or "Not available as text. Use the uploaded resume PDF plus the profile/answer bank above."}
+{email_2fa_section}
 
 == CORE RULES ==
 1. Never pause and wait for a human. Either answer, skip safely, or fail with a clear RESULT code.
@@ -204,16 +296,17 @@ Resume PDF (upload this): {resume_path}
 - If a required question would force fabrication, output RESULT:FAILED:unknown_required_question.
 
 == PROCESS ==
-1. Start by listing tabs/windows and switch to the newest non-LinkedIn tab if one exists. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
+1. Start by listing tabs/windows and switch to the newest non-LinkedIn, non-mail tab if one exists. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
 2. If no external tab is already open, navigate directly to the external application URL as a fallback.
 3. Read the page with browser_snapshot. Use the visible page content/HTML structure to understand the form.
 4. Upload the resume PDF when asked.
 5. Fill all identifiable required fields from the provided profile.
 6. Answer screening questions using the question policy above.
-7. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
-8. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
-9. {submit_instruction}
-10. After submit, confirm success and output exactly one RESULT line.
+7. If the site requires account creation with email verification, complete it only when it can be done with the provided email address and, if needed, the mail-tab 2FA flow above.
+8. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
+9. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
+10. {submit_instruction}
+11. After submit, confirm success and output exactly one RESULT line.
 
 == RESULT CODES ==
 RESULT:APPLIED
@@ -685,7 +778,8 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
 def _run_external_application(job: dict, config_dict: dict, model: str, port: int, dry_run: bool) -> tuple[str, int]:
     """Run Claude Code against a single external application URL."""
     start = time.time()
-    prompt = _build_prompt(job, config_dict, dry_run=dry_run)
+    mailbox_url, _email = _mailbox_context(config_dict)
+    prompt = _build_prompt(job, config_dict, dry_run=dry_run, mailbox_url=mailbox_url)
 
     mcp_config_path = config.APP_DIR / ".mcp-linkedin-noneasy-0.json"
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
@@ -758,6 +852,37 @@ def _iter_result_cards(page):
     return page.query_selector_all("a.base-card__full-link, div.job-card-container a[href*='/jobs/view/']")
 
 
+def _ensure_mailbox_tab(context, config_dict: dict):
+    """Open or reuse the configured mailbox inbox tab in the current browser context."""
+    mailbox_url, email = _mailbox_context(config_dict)
+    if not mailbox_url:
+        return None
+
+    for page in context.pages:
+        try:
+            if page.is_closed():
+                continue
+            current = (page.url or "").strip()
+            if current.startswith(mailbox_url):
+                return page
+        except Exception:
+            continue
+
+    mailbox_page = context.new_page()
+    try:
+        mailbox_page.goto(mailbox_url, wait_until="domcontentloaded", timeout=60000)
+        _safe_wait_for_timeout(mailbox_page, 1500)
+        log.info("Opened mailbox tab for %s at %s", email or "<unknown email>", mailbox_url)
+        return mailbox_page
+    except Exception as exc:
+        log.warning("Could not open mailbox tab %s: %s", mailbox_url, exc)
+        try:
+            mailbox_page.close()
+        except Exception:
+            pass
+        return None
+
+
 def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
                                headless: bool = False, dry_run: bool = False) -> dict:
     """Process LinkedIn non-Easy-Apply jobs directly from search results."""
@@ -787,6 +912,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
 
     port = BASE_CDP_PORT
     chrome_proc = None
+    applied_job_keys = _load_applied_job_keys()
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
@@ -798,6 +924,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
             context = browser.contexts[0]
             search_page = context.pages[0] if context.pages else context.new_page()
             detail_page = context.new_page()
+            mailbox_page = _ensure_mailbox_tab(context, config_dict)
 
             try:
                 search_url = _search_url(config_dict)
@@ -885,6 +1012,21 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
                             "title": title_text or "Unknown title",
                             "company": company,
                         }
+                        job_key = _job_registry_key(job["title"], job["company"])
+                        if job_key in applied_job_keys:
+                            summary["skipped"] += 1
+                            log.info(
+                                "Skipping previously applied non-easy job: %s @ %s",
+                                job["title"],
+                                job["company"],
+                            )
+                            try:
+                                if application_page is not detail_page:
+                                    application_page.close()
+                            except Exception:
+                                pass
+                            continue
+
                         summary["jobs"].append(job)
                         summary["found"] += 1
                         log.info("Opened external application page: %s", application_url or "<unknown>")
@@ -898,6 +1040,9 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
                         )
                         if result == "applied":
                             summary["applied"] += 1
+                            if not dry_run:
+                                _record_applied_job(job)
+                                applied_job_keys.add(job_key)
                         else:
                             summary["failed"] += 1
                             log.info(
@@ -911,7 +1056,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
 
                         # Cleanup any external tabs opened during apply, but keep the LinkedIn pages alive.
                         for pg in list(context.pages):
-                            if pg is search_page or pg is detail_page:
+                            if pg is search_page or pg is detail_page or pg is mailbox_page:
                                 continue
                             try:
                                 pg.close()
@@ -937,6 +1082,11 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "haiku",
                     detail_page.close()
                 except Exception:
                     pass
+                if mailbox_page:
+                    try:
+                        mailbox_page.close()
+                    except Exception:
+                        pass
                 try:
                     search_page.close()
                 except Exception:

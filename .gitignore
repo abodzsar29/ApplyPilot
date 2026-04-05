@@ -3,6 +3,7 @@ profile.json
 resume.txt
 resume.pdf
 nextsteps.txt
+usage.txt
 *.env
 .env.*
 !.env.example
