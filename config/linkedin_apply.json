@@ -1,6 +1,6 @@
 {
-  "job_title": "CAD Engineer",
-  "location": "London",
+  "job_title": "Java Developer",
+  "location": "Manchester",
   "max_applications": 20,
   "title_keyword": "",
   "dry_run": false,
@@ -11,7 +11,7 @@
     "phone_country_code": "+44",
     "phone_number": "7951187345",
     "email": "miscel008@proton.me",
-    "city": "Berlin",
+    "city": "Nottingham",
     "postcode": "NG7 1JL"
   },
   "answers": {

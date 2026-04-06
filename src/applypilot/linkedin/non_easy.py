@@ -978,6 +978,71 @@ def _ensure_mailbox_tab(context, config_dict: dict):
         return None
 
 
+def _run_non_easy_setup_mode(config_dict: dict, headless: bool = False) -> dict:
+    """Open LinkedIn search and mailbox tabs, then idle until interrupted."""
+    job_title = config_dict.get("job_title", "")
+    location = config_dict.get("location", "")
+
+    if not job_title or not location:
+        raise ValueError("job_title and location are required")
+
+    summary = {
+        "found": 0,
+        "applied": 0,
+        "skipped": 0,
+        "failed": 0,
+        "search_stats": {
+            "candidate_urls": 0,
+            "easy_skipped": 0,
+            "no_external_url": 0,
+            "pages_scanned": 0,
+        },
+        "jobs": [],
+    }
+
+    port = BASE_CDP_PORT
+    chrome_proc = None
+
+    try:
+        chrome_proc = launch_chrome(0, port=port, headless=headless)
+
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+            if not browser.contexts:
+                raise RuntimeError("CDP browser has no contexts")
+            context = browser.contexts[0]
+            search_page = context.pages[0] if context.pages else context.new_page()
+            mailbox_page = _ensure_mailbox_tab(context, config_dict)
+
+            try:
+                search_url = _search_url(config_dict)
+                log.info("Setup mode: opening LinkedIn search page for %s in %s", job_title, location)
+                search_page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                search_page.wait_for_timeout(3000)
+                log.info("Setup mode ready. Browser will stay open until interrupted.")
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                log.info("Setup mode interrupted by user.")
+            finally:
+                if mailbox_page:
+                    try:
+                        mailbox_page.close()
+                    except Exception:
+                        pass
+                try:
+                    search_page.close()
+                except Exception:
+                    pass
+                browser.close()
+    finally:
+        if chrome_proc:
+            cleanup_worker(0, chrome_proc)
+        kill_all_chrome()
+
+    return summary
+
+
 def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                headless: bool = False, dry_run: bool = False) -> dict:
     """Process LinkedIn non-Easy-Apply jobs directly from search results."""
@@ -1210,6 +1275,8 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
 
 def run_non_easy_apply(config_dict: dict, model: str = "qwen-flash",
-                       headless: bool = False, dry_run: bool = False) -> dict:
+                       headless: bool = False, dry_run: bool = False, setup: bool = False) -> dict:
     """Backward-compatible shim."""
+    if setup:
+        return _run_non_easy_setup_mode(config_dict, headless=headless)
     return _run_non_easy_apply_direct(config_dict, model=model, headless=headless, dry_run=dry_run)

@@ -3,6 +3,10 @@ nextsteps.txt
 profile.json
 resume.txt
 resume.pdf
+usage.txt
+snapshot.md
+snapshot1.md
+snapshot2.md
 *.env
 .env.*
 !.env.example
@@ -44,4 +48,4 @@ Thumbs.db
 # Playwright MCP
 .playwright-mcp/
 
-usage.txt
+
