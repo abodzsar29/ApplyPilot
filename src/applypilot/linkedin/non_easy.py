@@ -26,6 +26,8 @@ from applypilot.qwen_mcp import QwenMCPAgent, get_effective_model_and_provider
 log = logging.getLogger(__name__)
 
 LINKEDIN_BASE_URL = "https://www.linkedin.com"
+PROTONMAIL_INBOX_URL = "https://mail.proton.me/u/0/inbox"
+DEFAULT_NONEASY_APPLIED_JOBS_FILE = Path("config/linkedin_noneasy_applied.json")
 
 
 def _make_mcp_config(cdp_port: int) -> dict:
@@ -79,7 +81,16 @@ def _answer_bank_summary(answers: dict) -> str:
     """Render recurring answers and experience years for the agent prompt."""
     lines: list[str] = []
 
-    for key in ("visa_sponsorship", "authorized_to_work", "onsite"):
+    for key in (
+        "visa_sponsorship",
+        "authorized_to_work",
+        "onsite",
+        "linkedin_profile",
+        "current_job_title",
+        "gender",
+        "current_salary",
+        "expected_salary",
+    ):
         value = answers.get(key)
         if value:
             lines.append(f"- {key}: {value}")
@@ -125,7 +136,108 @@ def _education_summary(answers: dict) -> str:
     return "\n".join(lines) if lines else "- none provided"
 
 
-def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
+def _mailbox_context(config_dict: dict) -> tuple[str | None, str]:
+    """Return inbox URL and applicant email for email-code retrieval flows."""
+    profile = config_dict.get("profile", {}) or {}
+    email = (profile.get("email", "") or "").strip()
+    inbox_url = (config_dict.get("mail_inbox_url", "") or "").strip()
+
+    if inbox_url:
+        return inbox_url, email
+
+    lowered = email.lower()
+    if lowered.endswith(("@proton.me", "@protonmail.com", "@pm.me")):
+        return PROTONMAIL_INBOX_URL, email
+
+    return None, email
+
+
+def _applied_jobs_registry_path(config_dict: dict) -> Path:
+    """Return the JSON file used to persist previously applied non-easy jobs."""
+    configured = (config_dict.get("applied_jobs_file", "") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_NONEASY_APPLIED_JOBS_FILE
+
+
+def _normalize_registry_value(value: str) -> str:
+    """Normalize title/company strings for stable duplicate detection."""
+    return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def _job_registry_key(title: str, company: str) -> str:
+    """Build a normalized registry key from title and company."""
+    return f"{_normalize_registry_value(title)}\t{_normalize_registry_value(company)}"
+
+
+def _normalize_registry_url(url: str) -> str:
+    """Normalize job URLs for stable duplicate detection."""
+    return (url or "").strip().rstrip("/").casefold()
+
+
+def _load_applied_jobs_registry(config_dict: dict) -> list[dict]:
+    """Load the JSON registry of previously applied non-easy jobs."""
+    path = _applied_jobs_registry_path(config_dict)
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.warning("Applied jobs registry is not valid JSON: %s", path)
+        return []
+    except Exception:
+        log.warning("Could not read applied jobs registry: %s", path, exc_info=True)
+        return []
+
+    return data if isinstance(data, list) else []
+
+
+def _registry_lookups(entries: list[dict]) -> tuple[set[str], set[str]]:
+    """Build duplicate-detection lookups from registry entries."""
+    title_company_keys: set[str] = set()
+    url_keys: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        title = entry.get("title", "")
+        company = entry.get("company", "")
+        if title or company:
+            title_company_keys.add(_job_registry_key(title, company))
+
+        for field in ("application_url", "linkedin_url"):
+            normalized_url = _normalize_registry_url(entry.get(field, ""))
+            if normalized_url:
+                url_keys.add(normalized_url)
+    return title_company_keys, url_keys
+
+
+def _write_applied_jobs_registry(config_dict: dict, entries: list[dict]) -> None:
+    """Persist the JSON registry of previously applied non-easy jobs."""
+    path = _applied_jobs_registry_path(config_dict)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def _record_applied_job(config_dict: dict, registry_entries: list[dict], job: dict) -> None:
+    """Append a successfully applied job to the JSON registry file."""
+    registry_entries.append({
+        "title": job.get("title", ""),
+        "company": job.get("company", ""),
+        "linkedin_url": job.get("linkedin_url", ""),
+        "application_url": job.get("application_url", ""),
+        "recorded_at": int(time.time()),
+    })
+    _write_applied_jobs_registry(config_dict, registry_entries)
+
+
+def _build_prompt(
+    job: dict,
+    config_dict: dict,
+    dry_run: bool = False,
+    mailbox_url: str | None = None,
+    session_started_at: str | None = None,
+) -> str:
     """Build an autonomous prompt for external non-Easy-Apply sites."""
     from applypilot.apply.prompt import _build_captcha_section
 
@@ -133,14 +245,16 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     answers = config_dict.get("answers", {}) or {}
     resume_path = Path(config_dict["resume_path"]).resolve()
     resume_text = _read_resume_text(resume_path)
+    applicant_email = (profile.get("email", "") or "").strip()
 
     profile_lines = [
         f"First name: {profile.get('first_name', '')}",
         f"Last name: {profile.get('last_name', '')}",
-        f"Email: {profile.get('email', '')}",
+        f"Email: {applicant_email}",
         f"Phone country code: {profile.get('phone_country_code', '')}",
         f"Phone number: {profile.get('phone_number', '')}",
         f"City: {profile.get('city', '')}",
+        f"Postcode: {profile.get('postcode', '')}",
     ]
     answer_bank = _answer_bank_summary(answers)
     screening_overrides = _screening_override_summary(answers)
@@ -151,6 +265,30 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
         if dry_run
         else "Submit the application after verifying all required fields are correct."
     )
+    email_2fa_section = ""
+    if mailbox_url:
+        email_2fa_section = f"""
+
+== EMAIL / 2FA ==
+- Applicant email address: {applicant_email or "not provided"}
+- Mail inbox tab should already be available at: {mailbox_url}
+- Current application session started at: {session_started_at or "unknown"}
+- Use the mail tab ONLY if the application flow visibly asks for an email verification code, OTP, passcode, one-time code, or 2FA code.
+- When such a code is required:
+  1. First note the employer / ATS name, the page domain, and that the code request is happening now for the current application.
+  2. Treat any older OTP / verification emails already sitting in the inbox as stale by default. Do NOT reuse a code from a previous session.
+  3. Only use an email if it clearly matches the current application by sender, employer name, ATS name, domain, or a timestamp that is newer than the current code request.
+  4. If the inbox already contains older verification emails, ignore them and wait for a newer matching email to arrive. Refresh/check again before opening a code email.
+  5. If needed, use a resend-code action on the application page, then wait for the new matching email.
+  6. Before submitting a code, verify it came from the current application flow rather than a previous job application.
+  7. If there is any ambiguity between an old code email and a new one, do NOT guess. Wait for the newer matching email or use resend.
+  8. Switch to the Proton Mail tab.
+  9. Wait briefly and refresh/check for the newest relevant email from the employer / ATS / verification sender.
+  10. Open the newest matching message, extract the verification code, copy it, and return to the application tab.
+  11. Paste the code into the blocking verification field and continue the registration/application flow.
+- If the site never requests an email code, ignore the mail tab completely.
+- If a visible email-code challenge is blocking progress and the mailbox cannot be accessed or no code arrives after reasonable retries, output RESULT:FAILED:email_2fa_unavailable.
+"""
 
     return f"""You are an autonomous browser agent completing a LinkedIn non-Easy-Apply job application.
 
@@ -179,16 +317,18 @@ Resume PDF (upload this): {resume_path}
 
 == RESUME TEXT ==
 {resume_text or "Not available as text. Use the uploaded resume PDF plus the profile/answer bank above."}
+{email_2fa_section}
 
 == CORE RULES ==
 1. Never pause and wait for a human. Either answer, skip safely, or fail with a clear RESULT code.
 2. Answer work authorization, sponsorship, citizenship, licenses, education credentials, criminal history, and security clearance truthfully from the provided profile/answers only.
 3. For common screening questions not explicitly listed, infer the best truthful answer from the profile, answer bank, resume text, and job page.
 4. For open-ended required questions, write concise factual answers. Use the job description and the candidate profile. Do not invent employers, projects, degrees, certifications, or years.
-5. If a question is optional and you lack enough truthful information, leave it blank.
-6. Never sign in through Google, Microsoft, Okta, Auth0, or any SSO provider. If required, output RESULT:FAILED:sso_required.
-7. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
-8. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
+5. Fill only mandatory fields by default. Treat fields as mandatory when they are marked with *, required, mandatory, aria-required, validation text, or when submission highlights them as missing.
+6. If a question is optional and you lack enough truthful information, leave it blank.
+7. Never sign in through Google, Microsoft, Okta, Auth0, or any SSO provider. If required, output RESULT:FAILED:sso_required.
+8. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
+9. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
 
 == QUESTION POLICY ==
 - FIRST: check SCREENING OVERRIDES. If the visible question text substantially matches an override, use that override answer exactly.
@@ -196,6 +336,12 @@ Resume PDF (upload this): {resume_path}
 - For location / commute / willing-to-work-onsite threshold questions, use answers.onsite when present.
 - For visa / sponsorship / work permit / require support questions, use answers.visa_sponsorship when present.
 - For authorized-to-work questions, use answers.authorized_to_work when present.
+- For postcode / zip / postal code questions, use the applicant profile postcode when present.
+- For LinkedIn profile / LinkedIn URL questions, use answers.linkedin_profile exactly, even if it is an empty string.
+- For current or previous job title questions, use answers.current_job_title when present.
+- For gender questions, use answers.gender when present.
+- For current salary or salary history questions, use answers.current_salary when present.
+- For expected salary or salary expectation questions, use answers.expected_salary when present.
 - For degree and field-of-study questions, use EDUCATION first. Treat that section as the source of truth for bachelor's, master's, highest education, and Computer Science field checks.
 - If EDUCATION provides explicit booleans such as computer_science_bachelors, computer_science_masters, or computer_science_bachelors_or_masters, use them directly for matching yes/no questions.
 - If EDUCATION provides bachelors_field or masters_field, use those exact fields when asked what subject the degree is in.
@@ -205,16 +351,22 @@ Resume PDF (upload this): {resume_path}
 - If a required question would force fabrication, output RESULT:FAILED:unknown_required_question.
 
 == PROCESS ==
-1. Start by listing tabs/windows and switch to the newest non-LinkedIn tab if one exists. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
+1. Start by listing tabs/windows and switch to the newest non-LinkedIn, non-mail tab if one exists. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
 2. If no external tab is already open, navigate directly to the external application URL as a fallback.
 3. Read the page with browser_snapshot. Use the visible page content/HTML structure to understand the form.
-4. Upload the resume PDF when asked.
-5. Fill all identifiable required fields from the provided profile.
-6. Answer screening questions using the question policy above.
-7. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
-8. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
-9. {submit_instruction}
-10. After submit, confirm success and output exactly one RESULT line.
+4. If the page says the job is unavailable, listing not available, job no longer exists, position closed, no longer accepting applications, 404-like vacancy text, or any equivalent closure/unavailable message, stop and output RESULT:EXPIRED.
+5. Upload the resume PDF when asked.
+6. Fill only identifiable mandatory fields from the provided profile and answer bank.
+7. Answer screening questions using the question policy above, but only when they are mandatory unless you intentionally choose to complete an optional field.
+8. If the site requires account creation with email verification, complete it only when it can be done with the provided email address and, if needed, the mail-tab 2FA flow above.
+9. If the site uses a magic link email instead of a code, stay in the current registration/application flow, switch to the mail tab, wait for the new matching email, open the magic link from that email, and continue the same application flow from the newly opened page/tab. Do NOT abandon the email wait and do NOT jump back prematurely before checking for the incoming magic-link email.
+10. Before final submission, do one validation pass focused on missing required fields only.
+11. If submit/review causes the page to jump back up, shows inline validation, red outlines, required-field messages, or highlights missing fields, fill those newly identified required fields and try again.
+12. If the form has mandatory consent controls near the end, such as privacy policy, data processing, terms, consent, or acknowledgment checkboxes/radios required to proceed, select/accept only the required ones so submission can continue.
+13. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
+14. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
+15. {submit_instruction}
+16. After submit, confirm success and output exactly one RESULT line.
 
 == RESULT CODES ==
 RESULT:APPLIED
@@ -228,6 +380,7 @@ RESULT:FAILED:reason
 == GIVE UP CONDITIONS ==
 - Same page after 3 attempts with no progress -> RESULT:FAILED:stuck
 - Job is closed or no longer accepting applications -> RESULT:EXPIRED
+- Listing unavailable / posting removed / job not available -> RESULT:EXPIRED
 - Broken page / unusable site -> RESULT:FAILED:page_error
 """
 
@@ -693,9 +846,17 @@ def _run_external_application(
     dry_run: bool,
 ) -> tuple[str, int]:
     """Run the configured browser agent against a single external application URL."""
+    mailbox_url, _email = _mailbox_context(config_dict)
+    session_started_at = time.strftime("%Y-%m-%d %H:%M:%S %Z")
     if provider == "claude":
         start = time.time()
-        prompt = _build_prompt(job, config_dict, dry_run=dry_run)
+        prompt = _build_prompt(
+            job,
+            config_dict,
+            dry_run=dry_run,
+            mailbox_url=mailbox_url,
+            session_started_at=session_started_at,
+        )
 
         mcp_config_path = config.APP_DIR / ".mcp-linkedin-noneasy-0.json"
         mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
@@ -759,7 +920,13 @@ def _run_external_application(
         raise RuntimeError(f"Provider '{provider}' requires an initialized MCP agent")
 
     start = time.time()
-    prompt = _build_prompt(job, config_dict, dry_run=dry_run)
+    prompt = _build_prompt(
+        job,
+        config_dict,
+        dry_run=dry_run,
+        mailbox_url=mailbox_url,
+        session_started_at=session_started_at,
+    )
 
     log_file = config.LOG_DIR / f"linkedin_noneasy_{provider}_{int(start)}.log"
     output = agent.run_prompt(prompt, log_path=log_file)
@@ -778,6 +945,37 @@ def _search_url(config_dict: dict) -> str:
 
 def _iter_result_cards(page):
     return page.query_selector_all("a.base-card__full-link, div.job-card-container a[href*='/jobs/view/']")
+
+
+def _ensure_mailbox_tab(context, config_dict: dict):
+    """Open or reuse the configured mailbox inbox tab in the current browser context."""
+    mailbox_url, email = _mailbox_context(config_dict)
+    if not mailbox_url:
+        return None
+
+    for page in context.pages:
+        try:
+            if page.is_closed():
+                continue
+            current = (page.url or "").strip()
+            if current.startswith(mailbox_url):
+                return page
+        except Exception:
+            continue
+
+    mailbox_page = context.new_page()
+    try:
+        mailbox_page.goto(mailbox_url, wait_until="domcontentloaded", timeout=60000)
+        _safe_wait_for_timeout(mailbox_page, 1500)
+        log.info("Opened mailbox tab for %s at %s", email or "<unknown email>", mailbox_url)
+        return mailbox_page
+    except Exception as exc:
+        log.warning("Could not open mailbox tab %s: %s", mailbox_url, exc)
+        try:
+            mailbox_page.close()
+        except Exception:
+            pass
+        return None
 
 
 def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
@@ -809,6 +1007,8 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
     port = BASE_CDP_PORT
     chrome_proc = None
+    registry_entries = _load_applied_jobs_registry(config_dict)
+    applied_job_keys, applied_job_urls = _registry_lookups(registry_entries)
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
@@ -825,6 +1025,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
             context = browser.contexts[0]
             search_page = context.pages[0] if context.pages else context.new_page()
             detail_page = context.new_page()
+            mailbox_page = _ensure_mailbox_tab(context, config_dict)
 
             try:
                 search_url = _search_url(config_dict)
@@ -912,6 +1113,26 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             "title": title_text or "Unknown title",
                             "company": company,
                         }
+                        job_key = _job_registry_key(job["title"], job["company"])
+                        job_urls = {
+                            _normalize_registry_url(job["application_url"]),
+                            _normalize_registry_url(job["linkedin_url"]),
+                        }
+                        job_urls.discard("")
+                        if job_key in applied_job_keys or any(url in applied_job_urls for url in job_urls):
+                            summary["skipped"] += 1
+                            log.info(
+                                "Skipping previously applied non-easy job: %s @ %s",
+                                job["title"],
+                                job["company"],
+                            )
+                            try:
+                                if application_page is not detail_page:
+                                    application_page.close()
+                            except Exception:
+                                pass
+                            continue
+
                         summary["jobs"].append(job)
                         summary["found"] += 1
                         log.info("Opened external application page: %s", application_url or "<unknown>")
@@ -927,6 +1148,10 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         )
                         if result == "applied":
                             summary["applied"] += 1
+                            if not dry_run:
+                                _record_applied_job(config_dict, registry_entries, job)
+                                applied_job_keys.add(job_key)
+                                applied_job_urls.update(job_urls)
                         else:
                             summary["failed"] += 1
                             log.info(
@@ -940,7 +1165,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
                         # Cleanup any external tabs opened during apply, but keep the LinkedIn pages alive.
                         for pg in list(context.pages):
-                            if pg is search_page or pg is detail_page:
+                            if pg is search_page or pg is detail_page or pg is mailbox_page:
                                 continue
                             try:
                                 pg.close()
@@ -966,6 +1191,11 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                     detail_page.close()
                 except Exception:
                     pass
+                if mailbox_page:
+                    try:
+                        mailbox_page.close()
+                    except Exception:
+                        pass
                 try:
                     search_page.close()
                 except Exception:
