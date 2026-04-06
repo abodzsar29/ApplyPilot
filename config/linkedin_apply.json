@@ -1,24 +1,33 @@
 {
-  "job_title": "Java Developer",
-  "location": "Manchester",
+  "job_title": "Junior Developer",
+  "location": "Berlin",
   "max_applications": 20,
   "title_keyword": "",
   "dry_run": false,
   "applied_jobs_file": "config/linkedin_noneasy_applied.json",
+  "ignored_companies": [
+    "Canonical",
+    "Bending Spoons",
+    "Joinrs"
+  ],
   "profile": {
     "first_name": "Jonathan",
     "last_name": "Smith",
     "phone_country_code": "+44",
     "phone_number": "7951187345",
     "email": "miscel008@proton.me",
-    "city": "Nottingham",
-    "postcode": "NG7 1JL"
+    "city": "Berlin",
+    "postcode": "10117",
+    "Country": "Germany",
+    "Earliest Starting Date": "1/6/26"
   },
   "answers": {
     "visa_sponsorship": "No",
     "authorized_to_work": "Yes",
     "onsite": "Yes",
-    "linkedin_profile": "",
+    "referral_source": "LinkedIn",
+    "cover_letter_policy": "Skip optional cover-letter fields and uploads unless the form makes them mandatory.",
+    "linkedin_profile": "https://www.linkedin.com/in/george-clooney-609b3a39/",
     "current_job_title": "Software Engineer",
     "gender": "Male/Man",
     "current_salary": "1",

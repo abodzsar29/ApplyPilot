@@ -80,6 +80,7 @@ def _read_resume_text(resume_path: Path) -> str:
 def _answer_bank_summary(answers: dict) -> str:
     """Render recurring answers and experience years for the agent prompt."""
     lines: list[str] = []
+    rendered_keys: set[str] = set()
 
     for key in (
         "visa_sponsorship",
@@ -90,14 +91,27 @@ def _answer_bank_summary(answers: dict) -> str:
         "gender",
         "current_salary",
         "expected_salary",
+        "referral_source",
+        "cover_letter_policy",
     ):
         value = answers.get(key)
-        if value:
+        if value not in (None, "", [], {}):
             lines.append(f"- {key}: {value}")
+            rendered_keys.add(key)
 
     for key, value in sorted(answers.items()):
+        if key in rendered_keys:
+            continue
         if key.endswith("_level") and value:
             lines.append(f"- {key}: {value}")
+            rendered_keys.add(key)
+
+    for key, value in sorted(answers.items()):
+        if key in rendered_keys:
+            continue
+        if isinstance(value, (dict, list)) or value in (None, ""):
+            continue
+        lines.append(f"- {key}: {value}")
 
     years_experience = answers.get("years_experience", {}) or {}
     if years_experience:
@@ -136,6 +150,119 @@ def _education_summary(answers: dict) -> str:
     return "\n".join(lines) if lines else "- none provided"
 
 
+def _profile_value(profile: dict, *keys: str) -> str:
+    """Return the first non-empty profile value across a set of key aliases."""
+    for key in keys:
+        value = profile.get(key)
+        if value in (None, "", [], {}):
+            continue
+        return str(value).strip()
+    return ""
+
+
+def _profile_summary(profile: dict) -> str:
+    """Render profile fields, including arbitrary extra fields, for the prompt."""
+    ordered_fields = [
+        ("First name", ("first_name", "First name", "firstName")),
+        ("Last name", ("last_name", "Last name", "lastName")),
+        ("Email", ("email", "Email")),
+        ("Phone country code", ("phone_country_code", "Phone country code")),
+        ("Phone number", ("phone_number", "Phone number")),
+        ("City", ("city", "City")),
+        ("Postcode", ("postcode", "Postcode", "postal_code", "Postal code", "zip", "ZIP")),
+        ("Country", ("country", "Country")),
+        ("Earliest starting date", ("earliest_start_date", "Earliest Starting Date", "Earliest starting date")),
+    ]
+
+    lines: list[str] = []
+    seen_keys: set[str] = set()
+    for label, aliases in ordered_fields:
+        value = _profile_value(profile, *aliases)
+        if not value:
+            continue
+        lines.append(f"{label}: {value}")
+        seen_keys.update(aliases)
+
+    for key, value in profile.items():
+        if key in seen_keys or value in (None, "", [], {}):
+            continue
+        lines.append(f"{key}: {value}")
+
+    return "\n".join(lines)
+
+
+def _job_board_name(url: str) -> str:
+    """Infer the external ATS/job board from the application URL."""
+    host = (urlparse(url).netloc or "").lower()
+    if "ashbyhq.com" in host:
+        return "Ashby"
+    if "greenhouse.io" in host:
+        return "Greenhouse"
+    if "join.com" in host:
+        return "JOIN"
+    if "lever.co" in host:
+        return "Lever"
+    if "adzuna" in host:
+        return "Adzuna"
+    if "workable.com" in host:
+        return "Workable"
+    if "hr4you" in host:
+        return "HR4YOU"
+    return "Generic"
+
+
+def _board_specific_instructions(job: dict, answers: dict) -> str:
+    """Return board-aware prompt instructions for known ATS providers."""
+    board = _job_board_name(job.get("application_url", ""))
+    referral_source = answers.get("referral_source") or "LinkedIn"
+    cover_letter_policy = answers.get("cover_letter_policy") or "Skip optional cover letters unless required."
+
+    instructions: dict[str, list[str]] = {
+        "Ashby": [
+            "- Ashby often opens on an Overview tab with a separate Application tab or 'Apply for this Job' button. If the form is not visible yet, click into the Application tab first.",
+            "- Ashby forms usually make CV/resume required and cover letter optional. Upload the resume PDF; follow cover-letter policy for optional cover letters.",
+            "- Ashby commonly uses dropdowns, radio groups, and typed answers for salary expectations or earliest start date. Use the provided profile/answers and select real options rather than leaving placeholders.",
+        ],
+        "Greenhouse": [
+            "- Greenhouse forms mark required fields with a visible ✱ and/or required attributes. Treat those as mandatory and leave optional fields blank unless needed.",
+            "- For 'How did you hear about this opportunity?' choose or enter the referral source '%s' when that option exists." % referral_source,
+            "- Greenhouse additional question cards often include dropdowns, radios, checkboxes, and textareas. Required yes/no and dropdown questions must be answered explicitly before submit.",
+        ],
+        "JOIN": [
+            "- JOIN application flows are commonly multi-step: email -> CV upload -> personal information -> LinkedIn -> optional cover letter -> review -> email verification. Progress through those steps in order.",
+            "- On JOIN, supply the email first, then upload the resume PDF when prompted. The LinkedIn field should use the configured LinkedIn profile value exactly.",
+            "- JOIN often has an optional cover-letter step. Follow cover-letter policy and skip it when optional.",
+            "- JOIN verification can require a confirmation email or magic link. Wait for the new matching email, open it, and continue the same application rather than abandoning the flow.",
+        ],
+        "Lever": [
+            "- Lever forms usually combine standard personal info with additional question cards. Required fields are marked with ✱ or required attributes; consent-for-future-opportunities is often optional.",
+            "- Lever frequently includes a resume upload plus optional cover letter/additional information. Upload the resume; leave optional cover letter blank unless required.",
+            "- For source/referral dropdowns on Lever, choose '%s' when a matching option is available." % referral_source,
+        ],
+        "Adzuna": [
+            "- Adzuna may start on an advert page before the actual application form. If the current page is still just the advert, click through to the real application form first.",
+            "- Once on the Adzuna application form, prioritize required personal details, resume/CV upload, and required consents only.",
+        ],
+        "Workable": [
+            "- Workable can place the full job advert above the application form on the same page. Scroll until the real application form is visible before deciding the page has no form.",
+            "- Workable often uses resume upload, structured profile fields, optional cover letter, and required consent checkboxes. Submit only after all required sections validate cleanly.",
+        ],
+        "HR4YOU": [
+            "- HR4YOU forms often use custom single-select widgets with hidden inputs plus explicit required consent checkboxes near the end of the form.",
+            "- If the form contains a required privacy acknowledgment such as 'Datenschutzhinweise' with a checkbox like 'Ich bestaetige den Erhalt der Datenschutzhinweise', that checkbox is mandatory and must be checked before submit.",
+            "- Leave optional talent-pool / Bewerberpool consent unchecked unless it is explicitly required for submission.",
+            "- On HR4YOU, submit only after confirming all visible required fields, required hidden-widget selections, and required privacy acknowledgments are satisfied.",
+        ],
+        "Generic": [
+            "- Use the visible page structure to determine the ATS flow. Prefer required fields, required consents, resume upload, and deterministic answers only.",
+        ],
+    }
+
+    lines = instructions.get(board, instructions["Generic"])
+    lines.append(f"- Optional cover-letter policy: {cover_letter_policy}")
+    return f"Detected board: {board}\n" + "\n".join(lines)
+
+
 def _mailbox_context(config_dict: dict) -> tuple[str | None, str]:
     """Return inbox URL and applicant email for email-code retrieval flows."""
     profile = config_dict.get("profile", {}) or {}
@@ -163,6 +290,35 @@ def _applied_jobs_registry_path(config_dict: dict) -> Path:
 def _normalize_registry_value(value: str) -> str:
     """Normalize title/company strings for stable duplicate detection."""
     return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+def _ignored_companies(config_dict: dict) -> set[str]:
+    """Return normalized company names that should be skipped entirely."""
+    companies = config_dict.get("ignored_companies", []) or []
+    normalized: set[str] = set()
+    for company in companies:
+        if not isinstance(company, str):
+            continue
+        cleaned = _normalize_registry_value(company)
+        if cleaned:
+            normalized.add(cleaned)
+    return normalized
+
+
+def _matches_ignored_company(company: str, title_text: str, ignored_companies: set[str]) -> bool:
+    """Return True when a job appears to belong to an ignored company."""
+    if not ignored_companies:
+        return False
+
+    normalized_company = _normalize_registry_value(company)
+    normalized_title_text = _normalize_registry_value(title_text)
+    haystacks = [normalized_company, normalized_title_text]
+
+    for ignored in ignored_companies:
+        for haystack in haystacks:
+            if haystack and ignored in haystack:
+                return True
+    return False
 
 
 def _job_registry_key(title: str, company: str) -> str:
@@ -245,20 +401,13 @@ def _build_prompt(
     answers = config_dict.get("answers", {}) or {}
     resume_path = Path(config_dict["resume_path"]).resolve()
     resume_text = _read_resume_text(resume_path)
-    applicant_email = (profile.get("email", "") or "").strip()
+    applicant_email = _profile_value(profile, "email", "Email")
 
-    profile_lines = [
-        f"First name: {profile.get('first_name', '')}",
-        f"Last name: {profile.get('last_name', '')}",
-        f"Email: {applicant_email}",
-        f"Phone country code: {profile.get('phone_country_code', '')}",
-        f"Phone number: {profile.get('phone_number', '')}",
-        f"City: {profile.get('city', '')}",
-        f"Postcode: {profile.get('postcode', '')}",
-    ]
+    profile_summary = _profile_summary(profile)
     answer_bank = _answer_bank_summary(answers)
     screening_overrides = _screening_override_summary(answers)
     education_summary = _education_summary(answers)
+    board_specific = _board_specific_instructions(job, answers)
     captcha_section = _build_captcha_section()
     submit_instruction = (
         "Do NOT click the final Submit/Apply button. Review the form, then output RESULT:APPLIED (dry run)."
@@ -304,7 +453,7 @@ Company: {job.get('company', 'Unknown')}
 Resume PDF (upload this): {resume_path}
 
 == APPLICANT PROFILE ==
-{chr(10).join(profile_lines)}
+{profile_summary}
 
 == STANDARD ANSWERS ==
 {answer_bank}
@@ -314,6 +463,9 @@ Resume PDF (upload this): {resume_path}
 
 == EDUCATION ==
 {education_summary}
+
+== BOARD-SPECIFIC GUIDANCE ==
+{board_specific}
 
 == RESUME TEXT ==
 {resume_text or "Not available as text. Use the uploaded resume PDF plus the profile/answer bank above."}
@@ -327,21 +479,27 @@ Resume PDF (upload this): {resume_path}
 5. Fill only mandatory fields by default. Treat fields as mandatory when they are marked with *, required, mandatory, aria-required, validation text, or when submission highlights them as missing.
 6. If a question is optional and you lack enough truthful information, leave it blank.
 7. Never sign in through Google, Microsoft, Okta, Auth0, or any SSO provider. If required, output RESULT:FAILED:sso_required.
-8. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
-9. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
+8. If the external site only offers application or account creation through LinkedIn, Google, or another third-party identity provider, do not attempt it. Treat that job as unsupported and output RESULT:FAILED:sso_required so the runner can move on to the next job.
+9. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
+10. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
 
 == QUESTION POLICY ==
 - FIRST: check SCREENING OVERRIDES. If the visible question text substantially matches an override, use that override answer exactly.
 - Prefer deterministic answers from the provided profile and answer bank.
 - For location / commute / willing-to-work-onsite threshold questions, use answers.onsite when present.
+- For city / location autocomplete inputs: after typing the city/location text, wait for the dropdown/autocomplete options and explicitly choose a matching option. Do not leave the field after typing only; treat it as incomplete until an option is selected and the value stays populated.
 - For visa / sponsorship / work permit / require support questions, use answers.visa_sponsorship when present.
 - For authorized-to-work questions, use answers.authorized_to_work when present.
+- For "How did you hear about us?", "source", or referral-source questions, use answers.referral_source when present, otherwise use LinkedIn because the application originated from LinkedIn.
 - For postcode / zip / postal code questions, use the applicant profile postcode when present.
+- For country questions, use the applicant profile country when present.
+- For earliest start date / notice period / available from questions, use the applicant profile earliest starting date when present.
 - For LinkedIn profile / LinkedIn URL questions, use answers.linkedin_profile exactly, even if it is an empty string.
 - For current or previous job title questions, use answers.current_job_title when present.
 - For gender questions, use answers.gender when present.
 - For current salary or salary history questions, use answers.current_salary when present.
 - For expected salary or salary expectation questions, use answers.expected_salary when present.
+- For optional cover letter, additional information, or motivation-letter sections: skip them unless they are clearly required or answers.cover_letter_policy explicitly says to fill them.
 - For degree and field-of-study questions, use EDUCATION first. Treat that section as the source of truth for bachelor's, master's, highest education, and Computer Science field checks.
 - If EDUCATION provides explicit booleans such as computer_science_bachelors, computer_science_masters, or computer_science_bachelors_or_masters, use them directly for matching yes/no questions.
 - If EDUCATION provides bachelors_field or masters_field, use those exact fields when asked what subject the degree is in.
@@ -357,16 +515,18 @@ Resume PDF (upload this): {resume_path}
 4. If the page says the job is unavailable, listing not available, job no longer exists, position closed, no longer accepting applications, 404-like vacancy text, or any equivalent closure/unavailable message, stop and output RESULT:EXPIRED.
 5. Upload the resume PDF when asked.
 6. Fill only identifiable mandatory fields from the provided profile and answer bank.
-7. Answer screening questions using the question policy above, but only when they are mandatory unless you intentionally choose to complete an optional field.
-8. If the site requires account creation with email verification, complete it only when it can be done with the provided email address and, if needed, the mail-tab 2FA flow above.
-9. If the site uses a magic link email instead of a code, stay in the current registration/application flow, switch to the mail tab, wait for the new matching email, open the magic link from that email, and continue the same application flow from the newly opened page/tab. Do NOT abandon the email wait and do NOT jump back prematurely before checking for the incoming magic-link email.
-10. Before final submission, do one validation pass focused on missing required fields only.
-11. If submit/review causes the page to jump back up, shows inline validation, red outlines, required-field messages, or highlights missing fields, fill those newly identified required fields and try again.
-12. If the form has mandatory consent controls near the end, such as privacy policy, data processing, terms, consent, or acknowledgment checkboxes/radios required to proceed, select/accept only the required ones so submission can continue.
-13. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
-14. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
-15. {submit_instruction}
-16. After submit, confirm success and output exactly one RESULT line.
+7. For city/location fields with autosuggest dropdowns, type the configured city/location and then select one of the offered dropdown options so the field does not clear itself.
+8. Answer screening questions using the question policy above, but only when they are mandatory unless you intentionally choose to complete an optional field.
+9. If the site requires account creation with email verification, complete it only when it can be done with the provided email address and, if needed, the mail-tab 2FA flow above.
+10. If the site uses a magic link email instead of a code, stay in the current registration/application flow, switch to the mail tab, wait for the new matching email, open the magic link from that email, and continue the same application flow from the newly opened page/tab. Do NOT abandon the email wait and do NOT jump back prematurely before checking for the incoming magic-link email.
+11. Before final submission, do one validation pass focused on missing required fields only.
+12. If submit/review causes the page to jump back up, shows inline validation, red outlines, required-field messages, or highlights missing fields, fill those newly identified required fields and try again.
+13. If the form has mandatory consent controls near the end, such as privacy policy, data processing, terms, consent, or acknowledgment checkboxes/radios required to proceed, select/accept only the required ones so submission can continue.
+14. If the only visible way to continue is "Apply with LinkedIn", "Sign in with LinkedIn", "Continue with Google", "Apply with Google", or any equivalent third-party identity-provider-only path, stop immediately and output RESULT:FAILED:sso_required.
+15. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
+16. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
+17. {submit_instruction}
+18. After submit, confirm success and output exactly one RESULT line.
 
 == RESULT CODES ==
 RESULT:APPLIED
@@ -439,6 +599,43 @@ def _find_apply_control(page):
         except Exception:
             continue
     return None
+
+
+def _extract_company_name(detail_page) -> str:
+    """Extract the visible company name from a LinkedIn job detail page."""
+    selectors = [
+        "a.topcard__org-name-link",
+        ".job-details-jobs-unified-top-card__company-name a",
+        ".job-details-jobs-unified-top-card__company-name",
+        "a[href*='/company/']",
+        "[aria-label^='Company,']",
+        "img[alt^='Company logo for,']",
+    ]
+
+    for selector in selectors:
+        try:
+            for elem in detail_page.query_selector_all(selector):
+                if not elem.is_visible():
+                    continue
+
+                candidates = [
+                    (elem.text_content() or "").strip(),
+                    (elem.get_attribute("aria-label") or "").strip(),
+                    (elem.get_attribute("alt") or "").strip(),
+                ]
+                for raw in candidates:
+                    text = raw.strip()
+                    if not text:
+                        continue
+                    text = re.sub(r"^Company,\s*", "", text, flags=re.IGNORECASE).strip()
+                    text = re.sub(r"^Company logo for,\s*", "", text, flags=re.IGNORECASE).strip()
+                    text = re.sub(r"[.,]\s*$", "", text).strip()
+                    if text and text.lower() not in {"company", "company logo"}:
+                        return text
+        except Exception:
+            continue
+
+    return "Unknown company"
 
 
 def _is_external_http_url(url: str) -> bool:
@@ -807,13 +1004,7 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
                         log.info("No external URL found: %s", candidate["linkedin_url"])
                         continue
 
-                    company = ""
-                    try:
-                        company_elem = detail_page.query_selector("a.topcard__org-name-link, .job-details-jobs-unified-top-card__company-name a, .job-details-jobs-unified-top-card__company-name")
-                        if company_elem:
-                            company = (company_elem.text_content() or "").strip()
-                    except Exception:
-                        pass
+                    company = _extract_company_name(detail_page)
 
                     found_jobs.append({
                         "linkedin_url": candidate["linkedin_url"],
@@ -1074,6 +1265,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     chrome_proc = None
     registry_entries = _load_applied_jobs_registry(config_dict)
     applied_job_keys, applied_job_urls = _registry_lookups(registry_entries)
+    ignored_companies = _ignored_companies(config_dict)
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
@@ -1153,17 +1345,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             log.info("Skipped Easy Apply job: %s", linkedin_url)
                             continue
 
-                        company = "Unknown company"
-                        try:
-                            company_elem = detail_page.query_selector(
-                                "a.topcard__org-name-link, "
-                                ".job-details-jobs-unified-top-card__company-name a, "
-                                ".job-details-jobs-unified-top-card__company-name"
-                            )
-                            if company_elem:
-                                company = (company_elem.text_content() or "").strip() or "Unknown company"
-                        except Exception:
-                            pass
+                        company = _extract_company_name(detail_page)
 
                         application_page, application_url = _open_external_application_page(detail_page)
                         if not application_page:
@@ -1178,6 +1360,19 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             "title": title_text or "Unknown title",
                             "company": company,
                         }
+                        if _matches_ignored_company(job["company"], title_text, ignored_companies):
+                            summary["skipped"] += 1
+                            log.info(
+                                "Skipping ignored company in non-easy apply: %s",
+                                job["company"],
+                            )
+                            try:
+                                if application_page is not detail_page:
+                                    application_page.close()
+                            except Exception:
+                                pass
+                            continue
+
                         job_key = _job_registry_key(job["title"], job["company"])
                         job_urls = {
                             _normalize_registry_url(job["application_url"]),

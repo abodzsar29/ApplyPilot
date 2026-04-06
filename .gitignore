@@ -10,7 +10,8 @@ snapshot2.md
 *.env
 .env.*
 !.env.example
-
+webpages/*
+data/jobpages/*
 # Runtime artifacts
 *.db
 tailored_resumes/
