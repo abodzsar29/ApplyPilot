@@ -19,14 +19,13 @@
     "jobboard.catch-talents.de"
   ],
   "profile": {
-    "first_name": "Andrew",
-    "last_name": "Bodzsar",
+    "first_name": "Jonathan",
+    "last_name": "Smith",
     "phone_country_code": "+44",
-    "phone_number": "7951187359",
-    "email": "andrewbodzsar@proton.me",
+    "phone_number": "7951187345",
+    "email": "miscel008@proton.me",
     "city": "Berlin",
-    "postcode": "10115",
-    "street address": "Chausseestr. 43",
+    "postcode": "10117",
     "Country": "Germany",
     "Earliest Starting Date": "1/6/26",
     "Salary/Compensation Expectations Yearly": 1,
@@ -38,8 +37,8 @@
     "onsite": "Yes",
     "referral_source": "LinkedIn",
     "cover_letter_policy": "Skip optional cover-letter fields and uploads unless the form makes them mandatory.",
-    "linkedin_profile": "https://linkedin.com/in/andrewbodzsar",
-    "current_job_title": "Data Scientist",
+    "linkedin_profile": "https://www.linkedin.com/in/george-clooney-609b3a39/",
+    "current_job_title": "Software Engineer",
     "gender": "Male/Man",
     "current_salary": "1",
     "expected_salary": "1",
@@ -179,5 +178,5 @@
     "Neovim": "2"
     }
   },
-  "resume_path": "data/AndrewBodzsarCV.pdf"
+  "resume_path": "data/resume.pdf"
 }

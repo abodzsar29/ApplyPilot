@@ -7,6 +7,9 @@ usage.txt
 snapshot.md
 snapshot1.md
 snapshot2.md
+config/linkedin_noneasy_applied.json
+config/linkedin_apply.json
+data/AndrewBodzsarCV.pdf
 *.env
 .env.*
 !.env.example

@@ -66,7 +66,58 @@ def _extract_result(output: str) -> str:
             reason = re.sub(r'[*`"]+$', "", reason).strip() or "unknown"
             return f"failed:{reason}"
 
+    inferred = _infer_transcript_failure(output)
+    if inferred:
+        return inferred
+
     return "failed:no_result_line"
+
+
+def _infer_transcript_failure(output: str) -> str | None:
+    """Best-effort fallback when the agent transcript ends without a RESULT line."""
+    lowered = output.lower()
+    tail = lowered[-4000:]
+
+    success_markers = (
+        "application was successfully submitted",
+        "application submitted successfully",
+        "your application was successfully submitted",
+        "application received",
+        "thank you for applying",
+        "great job on submitting your application",
+    )
+    if any(marker in lowered for marker in success_markers):
+        return "applied"
+
+    expired_markers = (
+        "no longer accepting applications",
+        "job no longer exists",
+        "listing not available",
+        "position closed",
+        "job is unavailable",
+    )
+    if any(marker in lowered for marker in expired_markers):
+        return "expired"
+
+    if "related modal state present" in lowered:
+        return "failed:file_upload_modal_required"
+    if "browser_file_upload" in lowered and "### error" in lowered:
+        return "failed:file_upload_error"
+    if "element is not a <select> element" in lowered and "combobox" in lowered:
+        return "failed:combobox_widget_error"
+    if "intercepts pointer events" in lowered:
+        return "failed:click_intercepted"
+    if "browserbackend.calltool: timeout" in lowered or "timeout 5000ms exceeded" in lowered:
+        return "failed:tool_timeout"
+    if "same page after 3 attempts" in lowered or "to be stuck" in lowered:
+        return "failed:stuck"
+    if (
+        ("submit the application" in tail or "click submit" in tail or "final submit" in tail)
+        and not any(marker in tail for marker in success_markers)
+    ):
+        return "failed:submit_not_confirmed"
+
+    return None
 
 
 def _read_resume_text(resume_path: Path) -> str:
@@ -305,6 +356,22 @@ def _ignored_companies(config_dict: dict) -> set[str]:
     return normalized
 
 
+def _ignored_application_domains(config_dict: dict) -> set[str]:
+    """Return normalized application-site domains that should be skipped."""
+    domains = config_dict.get("ignored_application_domains", []) or []
+    normalized: set[str] = set()
+    for domain in domains:
+        if not isinstance(domain, str):
+            continue
+        cleaned = domain.strip().casefold()
+        if cleaned.startswith("http://") or cleaned.startswith("https://"):
+            cleaned = urlparse(cleaned).netloc
+        cleaned = cleaned.lstrip(".")
+        if cleaned:
+            normalized.add(cleaned)
+    return normalized
+
+
 def _matches_ignored_company(company: str, title_text: str, ignored_companies: set[str]) -> bool:
     """Return True when a job appears to belong to an ignored company."""
     if not ignored_companies:
@@ -318,6 +385,26 @@ def _matches_ignored_company(company: str, title_text: str, ignored_companies: s
         for haystack in haystacks:
             if haystack and ignored in haystack:
                 return True
+    return False
+
+
+def _matches_ignored_application_domain(page, application_url: str, ignored_domains: set[str]) -> bool:
+    """Return True when the opened external application page matches a skipped domain."""
+    if not ignored_domains:
+        return False
+
+    host = (urlparse(application_url).netloc or "").strip().casefold()
+    title = ""
+    try:
+        title = (page.title() or "").strip().casefold()
+    except Exception:
+        title = ""
+
+    for ignored in ignored_domains:
+        if host and (host == ignored or host.endswith(f".{ignored}") or ignored in host):
+            return True
+        if title and ignored in title:
+            return True
     return False
 
 
@@ -422,6 +509,7 @@ def _build_prompt(
 - Applicant email address: {applicant_email or "not provided"}
 - Mail inbox tab should already be available at: {mailbox_url}
 - Current application session started at: {session_started_at or "unknown"}
+- Expected employer / company for this application: {job.get('company', 'Unknown')}
 - Use the mail tab ONLY if the application flow visibly asks for an email verification code, OTP, passcode, one-time code, or 2FA code.
 - When such a code is required:
   1. First note the employer / ATS name, the page domain, and that the code request is happening now for the current application.
@@ -432,9 +520,12 @@ def _build_prompt(
   6. Before submitting a code, verify it came from the current application flow rather than a previous job application.
   7. If there is any ambiguity between an old code email and a new one, do NOT guess. Wait for the newer matching email or use resend.
   8. Switch to the Proton Mail tab.
-  9. Wait briefly and refresh/check for the newest relevant email from the employer / ATS / verification sender.
-  10. Open the newest matching message, extract the verification code, copy it, and return to the application tab.
-  11. Paste the code into the blocking verification field and continue the registration/application flow.
+  9. In Proton Mail, click the "Inbox" section in the left sidebar to refresh the inbox view instead of assuming it has already updated.
+  10. After clicking Inbox, inspect the topmost / first email in the message list. Only open it if the sender clearly matches the expected employer name, ATS name, or verification sender for the current application.
+  11. If the first email does NOT match the expected employer / ATS for this application, wait briefly, click Inbox again to refresh, and re-check the first email. Repeat this refresh-check cycle until a clearly matching new email appears or until reasonable retries are exhausted.
+  12. Do NOT open unrelated newest emails from other companies just because they are on top.
+  13. Once the first matching email appears, open that newest matching message, extract the verification code or magic link, and return to the application tab.
+  14. Paste the code into the blocking verification field or open the magic link and continue the registration/application flow.
 - If the site never requests an email code, ignore the mail tab completely.
 - If a visible email-code challenge is blocking progress and the mailbox cannot be accessed or no code arrives after reasonable retries, output RESULT:FAILED:email_2fa_unavailable.
 """
@@ -482,6 +573,7 @@ Resume PDF (upload this): {resume_path}
 8. If the external site only offers application or account creation through LinkedIn, Google, or another third-party identity provider, do not attempt it. Treat that job as unsupported and output RESULT:FAILED:sso_required so the runner can move on to the next job.
 9. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
 10. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
+11. Never end your work without one of these outcomes: confirmed submission with RESULT:APPLIED, confirmed closure with RESULT:EXPIRED, or a specific blocking RESULT:FAILED:* / RESULT:LOGIN_ISSUE / RESULT:CAPTCHA. Do not silently stop after filling most of the form.
 
 == QUESTION POLICY ==
 - FIRST: check SCREENING OVERRIDES. If the visible question text substantially matches an override, use that override answer exactly.
@@ -508,6 +600,16 @@ Resume PDF (upload this): {resume_path}
 - For open text such as "Why are you interested?" or "Tell us about yourself": write 2-3 sentences grounded in the visible job description and the provided profile/resume.
 - If a required question would force fabrication, output RESULT:FAILED:unknown_required_question.
 
+== CUSTOM WIDGET RULES ==
+- Many ATS forms do NOT use normal HTML selects/inputs. Inspect the element type before acting.
+- If a field is a combobox / autocomplete / searchable dropdown, do NOT use select_option. Click or type into it, wait for the option list to appear, then click or keyboard-select the matching option and verify the chosen value remains visible.
+- If browser_select_option fails because the element is not a real select, switch immediately to the combobox flow above instead of repeating the same failing tool call.
+- For upload widgets, dropzones, avatar/file cards, or custom file pickers: first click the visible upload trigger, dropzone, "Choose file", "Select file", or similar control until the file chooser modal state exists, then call browser_file_upload.
+- If clicking a hidden file input or overlaid control is intercepted, click the visible wrapper/trigger element instead, then use browser_file_upload.
+- If checkbox/radio state is unclear, click it, then verify in a new snapshot that it is actually checked/selected.
+- For custom date pickers, first try typing the date in the format shown by the placeholder. If that fails, open the picker and choose the date visibly.
+- After interacting with any custom widget, verify the field value or selected state in the page snapshot before moving on.
+
 == PROCESS ==
 1. Start by listing tabs/windows and switch to the newest non-LinkedIn, non-mail tab if one exists. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
 2. If no external tab is already open, navigate directly to the external application URL as a fallback.
@@ -520,13 +622,24 @@ Resume PDF (upload this): {resume_path}
 9. If the site requires account creation with email verification, complete it only when it can be done with the provided email address and, if needed, the mail-tab 2FA flow above.
 10. If the site uses a magic link email instead of a code, stay in the current registration/application flow, switch to the mail tab, wait for the new matching email, open the magic link from that email, and continue the same application flow from the newly opened page/tab. Do NOT abandon the email wait and do NOT jump back prematurely before checking for the incoming magic-link email.
 11. Before final submission, do one validation pass focused on missing required fields only.
-12. If submit/review causes the page to jump back up, shows inline validation, red outlines, required-field messages, or highlights missing fields, fill those newly identified required fields and try again.
-13. If the form has mandatory consent controls near the end, such as privacy policy, data processing, terms, consent, or acknowledgment checkboxes/radios required to proceed, select/accept only the required ones so submission can continue.
-14. If the only visible way to continue is "Apply with LinkedIn", "Sign in with LinkedIn", "Continue with Google", "Apply with Google", or any equivalent third-party identity-provider-only path, stop immediately and output RESULT:FAILED:sso_required.
-15. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
-16. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
-17. {submit_instruction}
-18. After submit, confirm success and output exactly one RESULT line.
+12. If submit/review causes the page to jump back up, shows inline validation, red outlines, toast messages, aria-invalid changes, required-field messages, or highlights missing fields, stop and inspect the new page state carefully.
+13. After every Continue / Next / Review / Submit click, immediately do both:
+   a. browser_snapshot to capture new refs and visible validation text
+   b. browser_take_screenshot to detect red borders, highlighted fields, banners, and messages that may not be obvious from text alone
+14. When submit does NOT produce a success page, assume the page is telling you what is missing. Scan from top to bottom for:
+   a. red text, inline error text, banners, toasts, alerts, validation summaries
+   b. required checkboxes or consent controls near the end
+   c. fields with invalid/required styling, aria-invalid, or newly opened sections
+   d. newly visible dropdown/autocomplete requirements triggered by earlier answers
+15. Fix every newly revealed required item, then try again. Repeat this validation cycle up to 3 times before giving up.
+16. If you reach a review page or the form appears complete but submit still does not succeed, inspect the entire page again for hidden required acknowledgments, privacy consents, optional-looking but actually required dropdowns, and disabled submit reasons.
+17. If the form has mandatory consent controls near the end, such as privacy policy, data processing, terms, consent, or acknowledgment checkboxes/radios required to proceed, select/accept only the required ones so submission can continue.
+18. If submit appears to do nothing, check for CAPTCHA, hidden validation, disabled buttons, or a new popup/tab before concluding it failed.
+19. If the only visible way to continue is "Apply with LinkedIn", "Sign in with LinkedIn", "Continue with Google", "Apply with Google", or any equivalent third-party identity-provider-only path, stop immediately and output RESULT:FAILED:sso_required.
+20. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
+21. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
+22. {submit_instruction}
+23. After submit, confirm success and output exactly one RESULT line.
 
 == RESULT CODES ==
 RESULT:APPLIED
@@ -534,6 +647,7 @@ RESULT:EXPIRED
 RESULT:CAPTCHA
 RESULT:LOGIN_ISSUE
 RESULT:FAILED:reason
+Preferred specific FAILED reasons when applicable: sso_required, unknown_required_question, email_2fa_unavailable, file_upload_error, file_upload_modal_required, combobox_widget_error, click_intercepted, tool_timeout, submit_not_confirmed, page_error, stuck
 
 {captcha_section}
 
@@ -1266,6 +1380,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     registry_entries = _load_applied_jobs_registry(config_dict)
     applied_job_keys, applied_job_urls = _registry_lookups(registry_entries)
     ignored_companies = _ignored_companies(config_dict)
+    ignored_application_domains = _ignored_application_domains(config_dict)
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
@@ -1352,6 +1467,24 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             summary["skipped"] += 1
                             summary["search_stats"]["no_external_url"] += 1
                             log.info("No external application page opened after Apply click: %s", linkedin_url)
+                            continue
+
+                        if _matches_ignored_application_domain(
+                            application_page,
+                            application_url or "",
+                            ignored_application_domains,
+                        ):
+                            summary["skipped"] += 1
+                            log.info(
+                                "Skipping ignored application domain in non-easy apply: %s",
+                                application_url or "<unknown>",
+                            )
+                            try:
+                                application_page.close()
+                            except Exception:
+                                pass
+                            if application_page is detail_page:
+                                detail_page = context.new_page()
                             continue
 
                         job = {

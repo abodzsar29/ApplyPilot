@@ -38,6 +38,53 @@ from applypilot.apply.dashboard import (
 
 logger = logging.getLogger(__name__)
 
+
+def _infer_transcript_failure(output: str) -> str | None:
+    """Best-effort fallback when the agent transcript ends without a RESULT line."""
+    lowered = output.lower()
+    tail = lowered[-4000:]
+
+    success_markers = (
+        "application was successfully submitted",
+        "application submitted successfully",
+        "your application was successfully submitted",
+        "application received",
+        "thank you for applying",
+        "great job on submitting your application",
+    )
+    if any(marker in lowered for marker in success_markers):
+        return "applied"
+
+    expired_markers = (
+        "no longer accepting applications",
+        "job no longer exists",
+        "listing not available",
+        "position closed",
+        "job is unavailable",
+    )
+    if any(marker in lowered for marker in expired_markers):
+        return "expired"
+
+    if "related modal state present" in lowered:
+        return "failed:file_upload_modal_required"
+    if "browser_file_upload" in lowered and "### error" in lowered:
+        return "failed:file_upload_error"
+    if "element is not a <select> element" in lowered and "combobox" in lowered:
+        return "failed:combobox_widget_error"
+    if "intercepts pointer events" in lowered:
+        return "failed:click_intercepted"
+    if "browserbackend.calltool: timeout" in lowered or "timeout 5000ms exceeded" in lowered:
+        return "failed:tool_timeout"
+    if "same page after 3 attempts" in lowered or "to be stuck" in lowered:
+        return "failed:stuck"
+    if (
+        ("submit the application" in tail or "click submit" in tail or "final submit" in tail)
+        and not any(marker in tail for marker in success_markers)
+    ):
+        return "failed:submit_not_confirmed"
+
+    return None
+
 # Blocked sites loaded from config/sites.yaml
 def _load_blocked():
     from applypilot.config import load_blocked_sites
@@ -493,6 +540,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     return f"failed:{reason}", duration_ms
             return "failed:unknown", duration_ms
 
+        inferred = _infer_transcript_failure(output)
+        if inferred:
+            if inferred in {"applied", "expired"}:
+                add_event(f"[W{worker_id}] {inferred.upper()} ({elapsed}s): {job['title'][:30]}")
+                update_state(worker_id, status=inferred, last_action=f"{inferred.upper()} ({elapsed}s)")
+                return inferred, duration_ms
+            reason = inferred.split("failed:", 1)[-1]
+            add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
+            update_state(worker_id, status="failed", last_action=f"FAILED: {reason[:25]}")
+            return inferred, duration_ms
+
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
         return "failed:no_result_line", duration_ms
@@ -942,4 +1000,3 @@ def run_linkedin_apply(job_urls: list[str], config_dict: dict,
         "skipped": skipped_count,
         "failed": failed_count,
     }
-

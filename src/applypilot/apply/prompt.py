@@ -605,11 +605,17 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - Popup/new window opened? browser_tabs action "list" to see all tabs. browser_tabs action "select" with the tab index to switch. ALWAYS check for new tabs after clicking login/apply/sign-in buttons.
 - "Upload your resume" pre-fill page (Workday, Lever, etc.): This is NOT the application form yet. Click "Select file" or the upload area, then browser_file_upload with the resume PDF path. Wait for parsing to finish. Then click Next/Continue to reach the actual form.
 - File upload not working? Try: (1) browser_click the upload button/area, (2) browser_file_upload with the path. If still failing, look for a hidden file input or a "Select file" link and click that first.
+- Do not assume custom widgets are normal selects. If browser_select_option fails or the field is a combobox/autocomplete, click or type into it, wait for the options, then click or keyboard-select the right option and verify the chosen value stays visible.
 - Dropdown won't fill? browser_click to open it, then browser_click the option.
 - Checkbox won't check via fill_form? Use browser_click on it instead. Snapshot to verify.
 - Phone field with country prefix: just type digits {phone_digits}
 - Date fields: {datetime.now().strftime('%m/%d/%Y')}
 - Validation errors after submit? Take BOTH snapshot AND screenshot. Snapshot shows text errors, screenshot shows red-highlighted fields. Fix all, retry.
+- After any Continue / Next / Review / Submit click, inspect the page again before concluding anything worked. Many ATS forms reveal missing requirements only after the click.
+- If submit appears to do nothing, scan top-to-bottom for banners, toasts, red text, aria-invalid fields, disabled-button reasons, newly opened sections, and required consents near the end.
+- If the page jumps upward after submit, that usually means a validation error exists above. Re-snapshot, find the first invalid field/message, fix it, then retry.
+- Never stop after partially filling a form just because the next control is custom or awkward. Work around it using click, type, snapshot, screenshot, and value verification.
+- Never end without either confirming success or returning a specific RESULT:FAILED:* reason.
 - Honeypot fields (hidden, "leave blank"): skip them.
 - Format-sensitive fields: read the placeholder text, match it exactly.
 
