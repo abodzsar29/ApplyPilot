@@ -2,19 +2,46 @@
 
 import logging
 import re
+import time
 from playwright.sync_api import sync_playwright
 from applypilot import config
 
 log = logging.getLogger(__name__)
 
 
-def search_and_apply(config_dict: dict, max_applications: int = 1, title_keyword: str = "") -> dict:
+def _hold_setup_session_open(page, search_url: str) -> None:
+    """Keep the interactive LinkedIn browser session alive until manual abort."""
+    log.info("Opening LinkedIn setup session: %s", search_url)
+    page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(3000)
+    log.info("LinkedIn setup session is ready; waiting for manual abort")
+
+    try:
+        while True:
+            if page.is_closed():
+                break
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("LinkedIn setup session interrupted by user")
+
+
+def search_and_apply(
+    config_dict: dict,
+    max_applications: int = 1,
+    title_keyword: str = "",
+    headless: bool = False,
+    dry_run: bool = False,
+    setup: bool = False,
+) -> dict:
     """Search LinkedIn jobs and apply to them in a single browser session.
 
     Args:
         config_dict: Config with job_title, location, profile, answers, resume_path
         max_applications: Max number of jobs to apply to
         title_keyword: Filter jobs by this keyword (empty = apply to all)
+        headless: Whether to run the browser headlessly
+        dry_run: Whether to stop before the final submit step
+        setup: Whether to keep the browser session open for manual changes only
 
     Returns:
         Dict with applied, skipped, failed counts
@@ -39,12 +66,16 @@ def search_and_apply(config_dict: dict, max_applications: int = 1, title_keyword
             profile_dir = config.CHROME_WORKER_DIR / "linkedin-search"
             browser = p.chromium.launch_persistent_context(
                 str(profile_dir),
-                headless=False,
+                headless=headless,
             )
             page = browser.new_page()
 
             # Navigate to LinkedIn jobs search
             search_url = f"https://www.linkedin.com/jobs/search/?keywords={job_title}&location={location}&f_AL=true"
+            if setup:
+                _hold_setup_session_open(page, search_url)
+                return {"applied": 0, "skipped": 0, "failed": 0}
+
             log.info(f"Navigating to {search_url}")
             page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
@@ -135,7 +166,13 @@ def search_and_apply(config_dict: dict, max_applications: int = 1, title_keyword
                         page.wait_for_timeout(2000)
 
                         # Try to fill form (simplified version)
-                        result = _fill_and_submit_form(page, profile, answers, resume_path)
+                        result = _fill_and_submit_form(
+                            page,
+                            profile,
+                            answers,
+                            resume_path,
+                            dry_run=dry_run,
+                        )
 
                         if result == "APPLIED":
                             applied += 1
@@ -846,7 +883,13 @@ def _confirm_typeahead_input(page, input_elem, value: str) -> bool:
         return False
 
 
-def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str = "") -> str:
+def _fill_and_submit_form(
+    page,
+    profile: dict,
+    answers: dict,
+    resume_path: str = "",
+    dry_run: bool = False,
+) -> str:
     """Fill and submit the multi-step Easy Apply form.
 
     Returns:
@@ -1027,6 +1070,10 @@ def _fill_and_submit_form(page, profile: dict, answers: dict, resume_path: str =
                 or scope.query_selector("button:has-text('Finish')")
             )
             if submit_btn and submit_btn.is_enabled():
+                if dry_run:
+                    log.info("Dry run active; stopping before final submit")
+                    return "SKIPPED"
+
                 log.info(f"Clicking Submit button on step {step}")
                 if not _click_action_button(submit_btn):
                     log.warning(f"Could not click Submit button on step {step}")

@@ -1,16 +1,18 @@
 {
-  "job_title": "CAD Engineer",
-  "location": "London",
+  "job_title": "Junior Developer",
+  "location": "Berlin",
   "max_applications": 20,
   "title_keyword": "",
   "dry_run": false,
   "profile": {
-    "first_name": "Jonathan",
-    "last_name": "Smith",
+    "first_name": "Andrew",
+    "last_name": "Bodzsar",
     "phone_country_code": "+44",
-    "phone_number": "7951187345",
-    "email": "miscel008@proton.me",
-    "city": "Berlin"
+    "phone_number": "7951187359",
+    "email": "andrewbodzsar@proton.me",
+    "city": "Berlin",
+    "Landesvorwahl": "+44",
+    "Handynummer": 7951187359
   },
   "answers": {
     "visa_sponsorship": "No",
@@ -18,8 +20,10 @@
     "onsite": "Yes",
     "english_level": "Native or Bilingual",
     "german_level": "Conversational",
+    "Please select from the list below your proficiancy level in German":"B1",
     "screening_overrides": {
         "live in london, oxford, or within a 1-hour commute": "Yes",
+        "Are you based within a commutable distance of the office where this role is based / are willing to re-locate?": "Yes",
         "do you require visa support": "No",
         "bachelor’s or master’s in computer science": "Yes",
         "bachelors degree in computer science": "Yes"
@@ -152,5 +156,5 @@
     "Neovim": "2"
     }
   },
-  "resume_path": "data/resume.pdf"
+  "resume_path": "data/AndrewBodzsarCV.pdf"
 }

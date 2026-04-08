@@ -263,6 +263,11 @@ def linkedin_apply(
     model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
     headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    setup: bool = typer.Option(
+        False,
+        "--setup",
+        help="Open the LinkedIn session and keep it alive until Ctrl+C for manual browser changes.",
+    ),
 ) -> None:
     """Deterministic LinkedIn Easy Apply bot (no LLM tailoring, no cover letters)."""
     import json
@@ -311,10 +316,14 @@ def linkedin_apply(
     console.print(f"  Max:     {config.get('max_applications', 'N/A')}")
     console.print(f"  Model:   {model}")
     console.print(f"  Dry run: {dry_run}")
+    console.print(f"  Setup:   {setup}")
     console.print()
 
     # Run unified search and apply in single browser session
-    console.print("[cyan]Starting LinkedIn Easy Apply (search and apply in single session)...[/cyan]")
+    if setup:
+        console.print("[cyan]Starting LinkedIn Easy Apply setup session...[/cyan]")
+    else:
+        console.print("[cyan]Starting LinkedIn Easy Apply (search and apply in single session)...[/cyan]")
     from applypilot.linkedin.unified_apply import search_and_apply
 
     max_apps = config.get("max_applications", 1)
@@ -324,6 +333,9 @@ def linkedin_apply(
         config_dict=config,
         max_applications=max_apps,
         title_keyword=title_keyword,
+        headless=headless,
+        dry_run=dry_run,
+        setup=setup,
     )
 
     console.print(f"\n[bold]Summary:[/bold]")

@@ -40,6 +40,7 @@ applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment
 applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
+applypilot linkedin-apply --setup  # open LinkedIn session and keep it live until Ctrl+C
 ```
 
 > **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
