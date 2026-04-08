@@ -37,6 +37,13 @@ from applypilot.apply.dashboard import (
 )
 
 logger = logging.getLogger(__name__)
+PRESERVE_BROWSER_FAILURES = {
+    "failed:file_upload_error",
+    "failed:no_result_line",
+    "failed:submit_not_confirmed",
+    "failed:tool_timeout",
+    "failed:stuck",
+}
 
 
 def _transcript_shows_positive_progress(tool_names: list[str], output: str) -> bool:
@@ -513,9 +520,13 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
-        explicit_file_upload_error = "RESULT:FAILED:file_upload_error" in output
+        explicit_preserve_failure = any(
+            f"RESULT:{failure.upper()}" in output
+            for failure in PRESERVE_BROWSER_FAILURES
+        )
+        inferred_failure = _infer_transcript_failure(output)
         keep_browser_open = (
-            (explicit_file_upload_error or _infer_transcript_failure(output) == "failed:file_upload_error")
+            (explicit_preserve_failure or inferred_failure in PRESERVE_BROWSER_FAILURES)
             and _transcript_shows_positive_progress(tool_names, output)
         )
 
@@ -557,11 +568,11 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                     add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
                     update_state(worker_id, status="failed",
                                  last_action=f"FAILED: {reason[:25]}")
-                    keep_open = keep_browser_open and reason == "file_upload_error"
+                    keep_open = keep_browser_open and f"failed:{reason}" in PRESERVE_BROWSER_FAILURES
                     return f"failed:{reason}", duration_ms, keep_open
             return "failed:unknown", duration_ms, False
 
-        inferred = _infer_transcript_failure(output)
+        inferred = inferred_failure
         if inferred:
             if inferred in {"applied", "expired"}:
                 add_event(f"[W{worker_id}] {inferred.upper()} ({elapsed}s): {job['title'][:30]}")
@@ -570,7 +581,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             reason = inferred.split("failed:", 1)[-1]
             add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
             update_state(worker_id, status="failed", last_action=f"FAILED: {reason[:25]}")
-            keep_open = keep_browser_open and reason == "file_upload_error"
+            keep_open = keep_browser_open and inferred in PRESERVE_BROWSER_FAILURES
             return inferred, duration_ms, keep_open
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")

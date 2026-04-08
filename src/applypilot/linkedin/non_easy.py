@@ -29,6 +29,13 @@ log = logging.getLogger(__name__)
 LINKEDIN_BASE_URL = "https://www.linkedin.com"
 PROTONMAIL_INBOX_URL = "https://mail.proton.me/u/0/inbox"
 DEFAULT_NONEASY_APPLIED_JOBS_FILE = Path("config/linkedin_noneasy_applied.json")
+PRESERVE_BROWSER_FAILURES = {
+    "failed:file_upload_error",
+    "failed:no_result_line",
+    "failed:submit_not_confirmed",
+    "failed:tool_timeout",
+    "failed:stuck",
+}
 
 
 def _transcript_shows_positive_progress(output: str, tool_names: list[str]) -> bool:
@@ -1252,7 +1259,7 @@ def _run_external_application(
         status = _extract_result(output)
         duration_ms = int((time.time() - start) * 1000)
         keep_browser_open = (
-            status == "failed:file_upload_error"
+            status in PRESERVE_BROWSER_FAILURES
             and _transcript_shows_positive_progress(output, tool_names)
         )
         return status, duration_ms, keep_browser_open
@@ -1273,7 +1280,7 @@ def _run_external_application(
     output = agent.run_prompt(prompt, log_path=log_file)
     status = _extract_result(output)
     duration_ms = int((time.time() - start) * 1000)
-    keep_browser_open = status == "failed:file_upload_error"
+    keep_browser_open = status in PRESERVE_BROWSER_FAILURES
     return status, duration_ms, keep_browser_open
 
 
@@ -1415,6 +1422,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     port = BASE_CDP_PORT
     chrome_proc = None
     preserve_browser_session = False
+    detached_chrome = False
     registry_entries = _load_applied_jobs_registry(config_dict)
     applied_job_keys, applied_job_urls = _registry_lookups(registry_entries)
     ignored_companies = _ignored_companies(config_dict)
@@ -1436,6 +1444,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
             search_page = context.pages[0] if context.pages else context.new_page()
             detail_page = context.new_page()
             mailbox_page = _ensure_mailbox_tab(context, config_dict)
+            preserved_application_pages: set = set()
 
             try:
                 search_url = _search_url(config_dict)
@@ -1567,6 +1576,9 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         summary["jobs"].append(job)
                         summary["found"] += 1
                         log.info("Opened external application page: %s", application_url or "<unknown>")
+                        _record_applied_job(config_dict, registry_entries, job)
+                        applied_job_keys.add(job_key)
+                        applied_job_urls.update(job_urls)
 
                         result, _duration_ms, keep_browser_open = _run_external_application(
                             provider=provider,
@@ -1579,10 +1591,6 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         )
                         if result == "applied":
                             summary["applied"] += 1
-                            if not dry_run:
-                                _record_applied_job(config_dict, registry_entries, job)
-                                applied_job_keys.add(job_key)
-                                applied_job_urls.update(job_urls)
                         else:
                             summary["failed"] += 1
                             log.info(
@@ -1592,19 +1600,30 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             )
                             if keep_browser_open:
                                 preserve_browser_session = True
-                                detach_worker(0)
+                                if not detached_chrome:
+                                    detach_worker(0)
+                                    detached_chrome = True
+                                preserved_application_pages.add(application_page)
                                 log.info(
-                                    "Keeping browser open for manual recovery after upload failure on %s",
+                                    "Keeping browser open for manual recovery after %s on %s",
+                                    result,
                                     application_url or linkedin_url,
                                 )
-                                return summary
+                                if application_page is detail_page:
+                                    detail_page = context.new_page()
+                                continue
                             if result == "failed:provider_credit_low":
                                 log.error("Stopping non-easy apply run: provider credits are exhausted.")
                                 return summary
 
                         # Cleanup any external tabs opened during apply, but keep the LinkedIn pages alive.
                         for pg in list(context.pages):
-                            if pg is search_page or pg is detail_page or pg is mailbox_page:
+                            if (
+                                pg is search_page
+                                or pg is detail_page
+                                or pg is mailbox_page
+                                or pg in preserved_application_pages
+                            ):
                                 continue
                             try:
                                 pg.close()
