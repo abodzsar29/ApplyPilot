@@ -28,7 +28,7 @@ from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree,
+    reset_worker_dir, cleanup_on_exit, _kill_process_tree, detach_worker,
     BASE_CDP_PORT,
 )
 from applypilot.apply.dashboard import (
@@ -37,6 +37,19 @@ from applypilot.apply.dashboard import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _transcript_shows_positive_progress(tool_names: list[str], output: str) -> bool:
+    """Return True when the agent progressed through the form before failing."""
+    lowered_tools = [name.lower() for name in tool_names]
+    lowered_output = output.lower()
+
+    filled_fields = any(name == "browser_fill_form" for name in lowered_tools)
+    clicked_or_selected = any(
+        name in {"browser_click", "browser_select_option"} for name in lowered_tools
+    )
+    chose_custom_value = "combobox" in lowered_output or "dropdown" in lowered_output or "autocomplete" in lowered_output
+    return filled_fields and (clicked_or_selected or chose_custom_value)
 
 
 def _infer_transcript_failure(output: str) -> str | None:
@@ -342,11 +355,11 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
+            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int, bool]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
-        Tuple of (status_string, duration_ms). Status is one of:
+        Tuple of (status_string, duration_ms, keep_browser_open). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
@@ -434,6 +447,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc.stdin.close()
 
         text_parts: list[str] = []
+        tool_names: list[str] = []
         with open(worker_log, "a", encoding="utf-8") as lf:
             lf.write(log_header)
 
@@ -456,6 +470,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                                     .replace("mcp__playwright__", "")
                                     .replace("mcp__gmail__", "gmail:")
                                 )
+                                tool_names.append(name)
                                 inp = block.get("input", {})
                                 if "url" in inp:
                                     desc = f"{name} {inp['url'][:60]}"
@@ -493,11 +508,16 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc = None
 
         if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
+            return "skipped", int((time.time() - start) * 1000), False
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
         duration_ms = int((time.time() - start) * 1000)
+        explicit_file_upload_error = "RESULT:FAILED:file_upload_error" in output
+        keep_browser_open = (
+            (explicit_file_upload_error or _infer_transcript_failure(output) == "failed:file_upload_error")
+            and _transcript_shows_positive_progress(tool_names, output)
+        )
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
@@ -517,7 +537,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
+                return result_status.lower(), duration_ms, False
 
         if "RESULT:FAILED" in output:
             for out_line in output.split("\n"):
@@ -533,39 +553,41 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
                         update_state(worker_id, status=reason,
                                      last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
+                        return reason, duration_ms, False
                     add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
                     update_state(worker_id, status="failed",
                                  last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
+                    keep_open = keep_browser_open and reason == "file_upload_error"
+                    return f"failed:{reason}", duration_ms, keep_open
+            return "failed:unknown", duration_ms, False
 
         inferred = _infer_transcript_failure(output)
         if inferred:
             if inferred in {"applied", "expired"}:
                 add_event(f"[W{worker_id}] {inferred.upper()} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=inferred, last_action=f"{inferred.upper()} ({elapsed}s)")
-                return inferred, duration_ms
+                return inferred, duration_ms, False
             reason = inferred.split("failed:", 1)[-1]
             add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
             update_state(worker_id, status="failed", last_action=f"FAILED: {reason[:25]}")
-            return inferred, duration_ms
+            keep_open = keep_browser_open and reason == "file_upload_error"
+            return inferred, duration_ms, keep_open
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
+        return "failed:no_result_line", duration_ms, False
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        return "failed:timeout", duration_ms, False
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        return f"failed:{str(e)[:100]}", duration_ms, False
     finally:
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
@@ -655,12 +677,18 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         empty_polls = 0
 
         chrome_proc = None
+        keep_browser_open = False
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
+            result, duration_ms, keep_browser_open = run_job(
+                job,
+                port=port,
+                worker_id=worker_id,
+                model=model,
+                dry_run=dry_run,
+            )
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -679,6 +707,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
+                if keep_browser_open:
+                    detach_worker(worker_id)
+                    add_event(f"[W{worker_id}] Preserving browser for upload failure review")
+                    update_state(worker_id, last_action="browser left open for upload debug")
+                    break
 
         except KeyboardInterrupt:
             release_lock(job["url"])
@@ -693,7 +726,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
-            if chrome_proc:
+            if chrome_proc and not keep_browser_open:
                 cleanup_worker(worker_id, chrome_proc)
 
         jobs_done += 1

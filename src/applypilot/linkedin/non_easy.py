@@ -17,6 +17,7 @@ from applypilot import config
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
     cleanup_worker,
+    detach_worker,
     kill_all_chrome,
     launch_chrome,
     reset_worker_dir,
@@ -28,6 +29,23 @@ log = logging.getLogger(__name__)
 LINKEDIN_BASE_URL = "https://www.linkedin.com"
 PROTONMAIL_INBOX_URL = "https://mail.proton.me/u/0/inbox"
 DEFAULT_NONEASY_APPLIED_JOBS_FILE = Path("config/linkedin_noneasy_applied.json")
+
+
+def _transcript_shows_positive_progress(output: str, tool_names: list[str]) -> bool:
+    """Return True when the agent made meaningful form progress before failing."""
+    lowered_output = output.lower()
+    lowered_tools = [name.lower() for name in tool_names]
+
+    filled_fields = any(name.endswith("browser_fill_form") or name == "browser_fill_form" for name in lowered_tools)
+    clicked_or_selected = any(
+        name.endswith("browser_click")
+        or name == "browser_click"
+        or name.endswith("browser_select_option")
+        or name == "browser_select_option"
+        for name in lowered_tools
+    )
+    chose_custom_value = "combobox" in lowered_output or "dropdown" in lowered_output or "autocomplete" in lowered_output
+    return filled_fields and (clicked_or_selected or chose_custom_value)
 
 
 def _make_mcp_config(cdp_port: int) -> dict:
@@ -496,6 +514,17 @@ def _build_prompt(
     education_summary = _education_summary(answers)
     board_specific = _board_specific_instructions(job, answers)
     captcha_section = _build_captcha_section()
+    fill_mandatory_fields_only = config_dict.get("fill_mandatory_fields_only", True)
+    field_scope_rule = (
+        "5. Start with a mandatory-only pass. Treat fields as mandatory when they are marked with *, required, mandatory, aria-required, validation text, or when submission highlights them as missing."
+        if fill_mandatory_fields_only
+        else "5. Prioritize mandatory fields first, but you may complete optional fields when it clearly helps the application."
+    )
+    optional_field_rule = (
+        "6. If a question is optional and you lack enough truthful information, leave it blank."
+        if fill_mandatory_fields_only
+        else "6. If a question is optional and you lack enough truthful information, leave it blank rather than guessing."
+    )
     submit_instruction = (
         "Do NOT click the final Submit/Apply button. Review the form, then output RESULT:APPLIED (dry run)."
         if dry_run
@@ -567,8 +596,8 @@ Resume PDF (upload this): {resume_path}
 2. Answer work authorization, sponsorship, citizenship, licenses, education credentials, criminal history, and security clearance truthfully from the provided profile/answers only.
 3. For common screening questions not explicitly listed, infer the best truthful answer from the profile, answer bank, resume text, and job page.
 4. For open-ended required questions, write concise factual answers. Use the job description and the candidate profile. Do not invent employers, projects, degrees, certifications, or years.
-5. Fill only mandatory fields by default. Treat fields as mandatory when they are marked with *, required, mandatory, aria-required, validation text, or when submission highlights them as missing.
-6. If a question is optional and you lack enough truthful information, leave it blank.
+{field_scope_rule}
+{optional_field_rule}
 7. Never sign in through Google, Microsoft, Okta, Auth0, or any SSO provider. If required, output RESULT:FAILED:sso_required.
 8. If the external site only offers application or account creation through LinkedIn, Google, or another third-party identity provider, do not attempt it. Treat that job as unsupported and output RESULT:FAILED:sso_required so the runner can move on to the next job.
 9. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
@@ -616,7 +645,7 @@ Resume PDF (upload this): {resume_path}
 3. Read the page with browser_snapshot. Use the visible page content/HTML structure to understand the form.
 4. If the page says the job is unavailable, listing not available, job no longer exists, position closed, no longer accepting applications, 404-like vacancy text, or any equivalent closure/unavailable message, stop and output RESULT:EXPIRED.
 5. Upload the resume PDF when asked.
-6. Fill only identifiable mandatory fields from the provided profile and answer bank.
+6. Start with a required-fields pass. Fill only identifiable mandatory fields from the provided profile and answer bank.
 7. For city/location fields with autosuggest dropdowns, type the configured city/location and then select one of the offered dropdown options so the field does not clear itself.
 8. Answer screening questions using the question policy above, but only when they are mandatory unless you intentionally choose to complete an optional field.
 9. If the site requires account creation with email verification, complete it only when it can be done with the provided email address and, if needed, the mail-tab 2FA flow above.
@@ -1149,7 +1178,7 @@ def _run_external_application(
     config_dict: dict,
     port: int,
     dry_run: bool,
-) -> tuple[str, int]:
+) -> tuple[str, int, bool]:
     """Run the configured browser agent against a single external application URL."""
     mailbox_url, _email = _mailbox_context(config_dict)
     session_started_at = time.strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -1194,6 +1223,7 @@ def _run_external_application(
         proc.stdin.close()
 
         text_parts: list[str] = []
+        tool_names: list[str] = []
         log_file = config.LOG_DIR / f"linkedin_noneasy_claude_{int(start)}.log"
         with open(log_file, "w", encoding="utf-8") as lf:
             assert proc.stdout is not None
@@ -1209,6 +1239,8 @@ def _run_external_application(
                             if block.get("type") == "text":
                                 text_parts.append(block["text"])
                                 lf.write(block["text"] + "\n")
+                            elif block.get("type") == "tool_use":
+                                tool_names.append(block.get("name", ""))
                     elif msg_type == "result":
                         text_parts.append(msg.get("result", ""))
                 except json.JSONDecodeError:
@@ -1219,7 +1251,11 @@ def _run_external_application(
         output = "\n".join(text_parts)
         status = _extract_result(output)
         duration_ms = int((time.time() - start) * 1000)
-        return status, duration_ms
+        keep_browser_open = (
+            status == "failed:file_upload_error"
+            and _transcript_shows_positive_progress(output, tool_names)
+        )
+        return status, duration_ms, keep_browser_open
 
     if agent is None:
         raise RuntimeError(f"Provider '{provider}' requires an initialized MCP agent")
@@ -1237,7 +1273,8 @@ def _run_external_application(
     output = agent.run_prompt(prompt, log_path=log_file)
     status = _extract_result(output)
     duration_ms = int((time.time() - start) * 1000)
-    return status, duration_ms
+    keep_browser_open = status == "failed:file_upload_error"
+    return status, duration_ms, keep_browser_open
 
 
 def _search_url(config_dict: dict) -> str:
@@ -1377,6 +1414,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
     port = BASE_CDP_PORT
     chrome_proc = None
+    preserve_browser_session = False
     registry_entries = _load_applied_jobs_registry(config_dict)
     applied_job_keys, applied_job_urls = _registry_lookups(registry_entries)
     ignored_companies = _ignored_companies(config_dict)
@@ -1530,7 +1568,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         summary["found"] += 1
                         log.info("Opened external application page: %s", application_url or "<unknown>")
 
-                        result, _duration_ms = _run_external_application(
+                        result, _duration_ms, keep_browser_open = _run_external_application(
                             provider=provider,
                             model=effective_model,
                             agent=agent,
@@ -1552,6 +1590,14 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 application_url or linkedin_url,
                                 result,
                             )
+                            if keep_browser_open:
+                                preserve_browser_session = True
+                                detach_worker(0)
+                                log.info(
+                                    "Keeping browser open for manual recovery after upload failure on %s",
+                                    application_url or linkedin_url,
+                                )
+                                return summary
                             if result == "failed:provider_credit_low":
                                 log.error("Stopping non-easy apply run: provider credits are exhausted.")
                                 return summary
@@ -1580,24 +1626,26 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                     except Exception:
                         break
             finally:
-                try:
-                    detail_page.close()
-                except Exception:
-                    pass
-                if mailbox_page:
+                if not preserve_browser_session:
                     try:
-                        mailbox_page.close()
+                        detail_page.close()
                     except Exception:
                         pass
-                try:
-                    search_page.close()
-                except Exception:
-                    pass
-                browser.close()
+                    if mailbox_page:
+                        try:
+                            mailbox_page.close()
+                        except Exception:
+                            pass
+                    try:
+                        search_page.close()
+                    except Exception:
+                        pass
+                    browser.close()
     finally:
-        if chrome_proc:
+        if chrome_proc and not preserve_browser_session:
             cleanup_worker(0, chrome_proc)
-        kill_all_chrome()
+        if not preserve_browser_session:
+            kill_all_chrome()
 
     return summary
 

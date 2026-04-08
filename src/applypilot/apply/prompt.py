@@ -214,6 +214,21 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
+def _build_field_scope_section(fill_mandatory_fields_only: bool) -> str:
+    """Build instructions for required-only vs full-form fill strategy."""
+    if not fill_mandatory_fields_only:
+        return """== FIELD SCOPE ==
+Fill the form normally, but prioritize required fields first when the page is long or the ATS is unstable."""
+
+    return """== FIELD SCOPE ==
+Start with a mandatory-only pass.
+- First fill only fields that are clearly required right now.
+- Treat a field as required when it is marked with *, required, mandatory, aria-required, validation text, red/error styling, or becomes highlighted after Continue/Submit.
+- Do NOT proactively fill optional fields during the first pass.
+- If the form advances or reaches review with only required fields completed, keep optional fields blank unless there is a clear reason to add them.
+- If submission or progression reveals new required fields, fill those next and retry."""
+
+
 def _build_captcha_section() -> str:
     """Build the CAPTCHA detection and solving instructions.
 
@@ -437,6 +452,8 @@ def build_prompt(job: dict, tailored_resume: str,
     """
     profile = config.load_profile()
     search_config = config.load_search_config()
+    apply_config = search_config.get("apply", {}) or {}
+    fill_mandatory_fields_only = apply_config.get("fill_mandatory_fields_only", True)
     personal = profile["personal"]
 
     # --- Resolve resume PDF path ---
@@ -482,6 +499,7 @@ def build_prompt(job: dict, tailored_resume: str,
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
+    field_scope_section = _build_field_scope_section(fill_mandatory_fields_only)
     captcha_section = _build_captcha_section()
 
     # Cover letter fallback text
@@ -541,6 +559,8 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 {hard_rules}
 
+{field_scope_section}
+
 == NEVER DO THESE (immediate RESULT:FAILED if encountered) ==
 - NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions
 - NEVER do video/audio verification, selfie capture, ID photo upload, or biometric anything -> RESULT:FAILED:unsafe_verification
@@ -576,13 +596,14 @@ If something unexpected happens and these instructions don't cover it, figure it
    5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
-8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
+8. Check pre-filled fields before trusting them. ATS systems parse your resume and auto-fill -- it's often WRONG.
    - "Current Job Title" or "Most Recent Title" -> use the title from the TAILORED RESUME summary, NOT whatever the parser guessed.
-   - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
-9. Answer screening questions using the rules above.
-10. {submit_instruction}
-11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
-12. Output your result.
+   - Compare every other required or already-populated field to the APPLICANT PROFILE. Fix mismatches. Leave optional empty fields blank during the first pass.
+9. Answer screening questions using the rules above, but handle required questions first.
+10. Before trying to continue or submit, do a required-fields-only validation pass from top to bottom.
+11. {submit_instruction}
+12. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
+13. Output your result.
 
 == RESULT CODES (output EXACTLY one) ==
 RESULT:APPLIED -- submitted successfully
@@ -597,7 +618,7 @@ RESULT:FAILED:reason -- any other failure (brief reason)
 - browser_snapshot ONCE per page to understand it. Then use browser_take_screenshot to check results (10x less memory).
 - Only snapshot again when you need element refs to click/fill.
 - Multi-page forms (Workday, Taleo, iCIMS): snapshot each new page, fill all fields, click Next/Continue. Repeat until final review page.
-- Fill ALL fields in ONE browser_fill_form call. Not one at a time.
+- Prefer one browser_fill_form call for the current required fields on that page instead of one field at a time.
 - Keep your thinking SHORT. Don't repeat page structure back.
 - CAPTCHA AWARENESS: After any navigation, Apply/Submit/Login click, or when a page feels stuck -- run CAPTCHA DETECT (see CAPTCHA section). Invisible CAPTCHAs (Turnstile, reCAPTCHA v3) show NO visual widget but block form submissions silently. The detect script finds them even when invisible.
 

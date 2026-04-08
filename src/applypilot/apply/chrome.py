@@ -23,6 +23,7 @@ BASE_CDP_PORT = 9222
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
 _chrome_lock = threading.Lock()
+_detached_ports: set[int] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +231,9 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if port is None:
         port = BASE_CDP_PORT + worker_id
 
+    with _chrome_lock:
+        _detached_ports.discard(port)
+
     profile_dir = setup_worker_profile(worker_id)
 
     # Kill any zombie Chrome from a previous run on this port
@@ -290,7 +294,16 @@ def cleanup_worker(worker_id: int, process: subprocess.Popen | None) -> None:
         _kill_process_tree(process.pid)
     with _chrome_lock:
         _chrome_procs.pop(worker_id, None)
+        _detached_ports.discard(BASE_CDP_PORT + worker_id)
     logger.info("[worker-%d] Chrome cleaned up", worker_id)
+
+
+def detach_worker(worker_id: int) -> None:
+    """Stop tracking a worker Chrome process without killing it."""
+    with _chrome_lock:
+        _chrome_procs.pop(worker_id, None)
+        _detached_ports.add(BASE_CDP_PORT + worker_id)
+    logger.info("[worker-%d] Chrome detached from automatic cleanup", worker_id)
 
 
 def kill_all_chrome() -> None:
@@ -301,14 +314,18 @@ def kill_all_chrome() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
         _chrome_procs.clear()
+        detached_ports = set(_detached_ports)
 
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
+        port = BASE_CDP_PORT + wid
+        if port not in detached_ports:
+            _kill_on_port(port)
 
     # Sweep base port in case of zombies
-    _kill_on_port(BASE_CDP_PORT)
+    if BASE_CDP_PORT not in detached_ports:
+        _kill_on_port(BASE_CDP_PORT)
 
 
 def reset_worker_dir(worker_id: int) -> Path:
@@ -338,11 +355,15 @@ def cleanup_on_exit() -> None:
     with _chrome_lock:
         procs = dict(_chrome_procs)
         _chrome_procs.clear()
+        detached_ports = set(_detached_ports)
 
     for wid, proc in procs.items():
         if proc.poll() is None:
             _kill_process_tree(proc.pid)
-        _kill_on_port(BASE_CDP_PORT + wid)
+        port = BASE_CDP_PORT + wid
+        if port not in detached_ports:
+            _kill_on_port(port)
 
     # Sweep base port for any orphan
-    _kill_on_port(BASE_CDP_PORT)
+    if BASE_CDP_PORT not in detached_ports:
+        _kill_on_port(BASE_CDP_PORT)

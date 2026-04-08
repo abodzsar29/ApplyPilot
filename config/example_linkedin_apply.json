@@ -4,6 +4,7 @@
   "max_applications": 20,
   "title_keyword": "",
   "dry_run": false,
+  "fill_mandatory_fields_only": true,
   "applied_jobs_file": "config/linkedin_noneasy_applied.json",
   "ignored_companies": [
     "Canonical",
