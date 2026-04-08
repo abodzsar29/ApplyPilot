@@ -1,6 +1,6 @@
 {
-  "job_title": "Junior Developer",
-  "location": "Berlin",
+  "job_title": "Junior C++",
+  "location": "London",
   "max_applications": 20,
   "title_keyword": "",
   "dry_run": false,
@@ -12,7 +12,9 @@
     "email": "andrewbodzsar@proton.me",
     "city": "Berlin",
     "Landesvorwahl": "+44",
-    "Handynummer": 7951187359
+    "Landesvorwahl": "Vereignites Konigreich",
+    "Handynummer": 7951187359,
+    "Country Code": "+44"
   },
   "answers": {
     "visa_sponsorship": "No",

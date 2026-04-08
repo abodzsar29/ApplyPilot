@@ -1,8 +1,10 @@
 """Unified LinkedIn search and apply in a single browser session."""
 
 import logging
+import random
 import re
 import time
+import unicodedata
 from playwright.sync_api import sync_playwright
 from applypilot import config
 
@@ -402,6 +404,65 @@ def _extract_field_label(scope, input_elem) -> str:
     return placeholder.strip()
 
 
+def _scope_text(scope) -> str:
+    """Best-effort lowercase text snapshot for the current modal step."""
+    try:
+        return " ".join((scope.text_content() or "").lower().split())
+    except Exception:
+        return ""
+
+
+def _is_review_submit_step(scope) -> bool:
+    """Return True when the Easy Apply modal is on the final review step."""
+    scope_text = _scope_text(scope)
+    if "review your application" not in scope_text:
+        return False
+
+    selectors = [
+        "button[aria-label='Submit application']",
+        "[data-live-test-easy-apply-submit-button]",
+        "button:has-text('Submit application')",
+    ]
+    for selector in selectors:
+        try:
+            btn = scope.query_selector(selector)
+            if btn and btn.is_visible() and btn.is_enabled():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _uncheck_follow_company_checkbox(scope) -> bool:
+    """Uncheck the follow-company checkbox on the review step."""
+    checkboxes = scope.query_selector_all("input[type='checkbox']")
+    for checkbox in checkboxes:
+        try:
+            checkbox_id = checkbox.get_attribute("id") or ""
+            label_text = ""
+            label = None
+            if checkbox_id:
+                label = scope.query_selector(f"label[for='{checkbox_id}']")
+                if label:
+                    label_text = (label.text_content() or "").strip()
+
+            label_lower = " ".join(label_text.lower().split())
+            if "follow" not in label_lower:
+                continue
+            if "stay up to date" not in label_lower and "page" not in label_lower:
+                continue
+
+            if checkbox.is_checked():
+                if checkbox_id and label and label.is_visible():
+                    label.click(timeout=1000)
+                else:
+                    checkbox.uncheck(timeout=1000, force=True)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _match_experience_years(label_lower: str, answers: dict) -> str | None:
     years_experience = answers.get("years_experience", {}) or {}
     for tech, years in sorted(years_experience.items(), key=lambda item: len(item[0]), reverse=True):
@@ -458,23 +519,71 @@ def _safe_years_value(years: str | None) -> float | None:
         return None
 
 
+def _normalize_lookup_text(value: str) -> str:
+    """Normalize labels/config keys for loose localized matching."""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).lower()
+    normalized = normalized.replace("_", " ").replace("-", " ")
+    normalized = re.sub(r"[^\w\s+]", " ", normalized)
+    return " ".join(normalized.split())
+
+
+def _lookup_direct_mapping(label_text: str, mapping: dict) -> str | None:
+    """Return a scalar config value when the field label matches a config key."""
+    label_norm = _normalize_lookup_text(label_text)
+    if not label_norm:
+        return None
+
+    best_value = None
+    best_score = -1
+    for key, value in (mapping or {}).items():
+        if isinstance(value, (dict, list)) or value in (None, ""):
+            continue
+
+        key_norm = _normalize_lookup_text(key)
+        if not key_norm:
+            continue
+
+        score = -1
+        if label_norm == key_norm:
+            score = 300 + len(key_norm)
+        elif key_norm in label_norm:
+            score = 200 + len(key_norm)
+        elif label_norm in key_norm:
+            score = 100 + len(label_norm)
+
+        if score > best_score:
+            best_score = score
+            best_value = str(value)
+
+    return best_value if best_score >= 0 else None
+
+
 def _infer_question_answer(label_text: str, profile: dict, answers: dict) -> str | None:
     """Infer an answer from config for common LinkedIn screening questions."""
     label_lower = " ".join(label_text.lower().split())
 
-    if any(x in label_lower for x in ["country code", "dial code"]) or (
-        "phone" in label_lower and "country" in label_lower
+    direct_profile_value = _lookup_direct_mapping(label_text, profile)
+    if direct_profile_value is not None:
+        return direct_profile_value
+
+    direct_answer_value = _lookup_direct_mapping(label_text, answers)
+    if direct_answer_value is not None:
+        return direct_answer_value
+
+    if any(x in label_lower for x in ["country code", "dial code", "landesvorwahl"]) or (
+        any(x in label_lower for x in ["phone", "telefon", "mobile", "handy"])
+        and any(x in label_lower for x in ["country", "code", "dial", "vorwahl"])
     ):
         return str(profile.get("phone_country_code", "+44"))
-    if any(x in label_lower for x in ["phone", "mobile", "contact number"]) and "city" not in label_lower:
+    if any(x in label_lower for x in ["phone", "mobile", "contact number", "telefonnummer", "handynummer", "mobilnummer"]) and "city" not in label_lower:
         return profile.get("phone_number")
-    if any(x in label_lower for x in ["first name", "given name"]):
+    if any(x in label_lower for x in ["first name", "given name", "vorname"]):
         return profile.get("first_name")
-    if any(x in label_lower for x in ["last name", "family name", "surname"]):
+    if any(x in label_lower for x in ["last name", "family name", "surname", "nachname"]):
         return profile.get("last_name")
     if any(x in label_lower for x in ["email", "e-mail"]):
         return profile.get("email")
-    if any(x in label_lower for x in ["city", "current location", "current city", "where are you located"]) and "phone" not in label_lower:
+    if any(x in label_lower for x in ["city", "current location", "current city", "where are you located", "stadt", "wohnort"]) and "phone" not in label_lower:
         return profile.get("city")
     if "visa" in label_lower or "sponsorship" in label_lower:
         return answers.get("visa_sponsorship", "No")
@@ -548,6 +657,76 @@ def _collect_select_candidates(input_elem) -> list[tuple[str, str]]:
             continue
         candidates.append((text, value or text))
     return candidates
+
+
+def _select_random_dropdown_value(input_elem, label_text: str) -> str | None:
+    """Randomly choose a non-placeholder option from a dropdown."""
+    candidates = _collect_select_candidates(input_elem)
+    if not candidates:
+        return None
+    chosen_text, chosen_value = random.choice(candidates)
+    log.info(f"Randomly selected dropdown '{label_text}' = '{chosen_text}'")
+    return chosen_value
+
+
+def _fill_text_input(input_elem, text_value: str) -> str:
+    """Fill a text input, retrying with '1' when the default 'a' is rejected."""
+    try:
+        input_elem.fill(text_value, timeout=1000)
+        return text_value
+    except Exception:
+        if text_value != "a":
+            raise
+
+    input_elem.fill("1", timeout=1000)
+    return "1"
+
+
+def _rewrite_default_a_fields_to_four(scope) -> int:
+    """Replace fallback 'a' values with '4' for visible text-like inputs."""
+    rewritten = 0
+    candidates = scope.query_selector_all("input, textarea")
+    for input_elem in candidates:
+        try:
+            input_type = (input_elem.get_attribute("type") or "text").lower()
+            if input_type in {"hidden", "checkbox", "radio", "file", "submit", "button"}:
+                continue
+            if not input_elem.is_visible() or input_elem.is_disabled():
+                continue
+            current_value = _element_current_text(input_elem).strip()
+            if current_value != "a":
+                continue
+            input_elem.fill("4", timeout=1000)
+            rewritten += 1
+        except Exception:
+            continue
+    return rewritten
+
+
+def _retry_numeric_validation_with_four(page, previous_scope_text: str, button, button_name: str) -> bool:
+    """Retry the current step when it appears blocked by a 0..99 numeric validation."""
+    modal = _get_active_modal(page)
+    scope = modal or page
+    current_scope_text = _scope_text(scope)
+    if current_scope_text != previous_scope_text:
+        return False
+    if "0" not in current_scope_text or "99" not in current_scope_text:
+        return False
+
+    rewritten = _rewrite_default_a_fields_to_four(scope)
+    if rewritten <= 0:
+        return False
+
+    log.info(
+        "Step unchanged after %s and 0/99 validation detected; rewrote %d field(s) from 'a' to '4'",
+        button_name,
+        rewritten,
+    )
+    page.wait_for_timeout(300)
+    if not _click_action_button(button):
+        return False
+    page.wait_for_timeout(2000)
+    return True
 
 
 def _score_option(label_text: str, option_text: str, inferred_value: str | None, profile: dict, answers: dict) -> int:
@@ -939,6 +1118,10 @@ def _fill_and_submit_form(
                 except Exception as e:
                     log.warning(f"Could not upload resume: {e}")
 
+            if _is_review_submit_step(scope):
+                if _uncheck_follow_company_checkbox(scope):
+                    log.info("Unchecked follow-company checkbox on review step")
+
             processed_choice_groups = set()
 
             # Fill fields
@@ -990,13 +1173,14 @@ def _fill_and_submit_form(
                             processed_choice_groups.add(group_name)
                             log.info(f"Selected checkbox answer for '{label_text}'")
                     elif tag_name == "select":
-                        if not value:
-                            value = _fallback_select_value(input_elem, label_text, profile, answers)
-                            if not value:
-                                continue
                         current_text = _element_current_text(input_elem).lower()
                         if "email" in label_lower and current_text:
                             log.info(f"Leaving prefilled email dropdown unchanged: '{current_text}'")
+                            continue
+
+                        value = _select_random_dropdown_value(input_elem, label_text)
+                        if not value:
+                            log.warning(f"Could not find selectable options for dropdown '{label_text}'")
                             continue
 
                         log.info(f"Attempting to fill dropdown '{label_text}' with value '{value}'")
@@ -1020,7 +1204,7 @@ def _fill_and_submit_form(
                             used_typeahead = _confirm_typeahead_input(page, input_elem, text_value)
 
                         if not used_typeahead:
-                            input_elem.fill(text_value, timeout=1000)
+                            text_value = _fill_text_input(input_elem, text_value)
                         log.debug(f"Filled: {label_text[:30]} = {text_value[:20]}")
 
                 except Exception as e:
@@ -1045,6 +1229,8 @@ def _fill_and_submit_form(
             except Exception:
                 pass
 
+            scope_text_before_action = _scope_text(scope)
+
             # Look for Next/Continue/Review button to go to next step.
             next_btn = scope.query_selector(
                 "button:has-text('Next'), button:has-text('Continue'), "
@@ -1056,6 +1242,12 @@ def _fill_and_submit_form(
                     log.warning(f"Could not click Next button on step {step}")
                     return "FAILED"
                 page.wait_for_timeout(2000)
+                _retry_numeric_validation_with_four(
+                    page,
+                    scope_text_before_action,
+                    next_btn,
+                    "Next",
+                )
                 continue
 
             # Look for final Submit/Apply button
@@ -1079,6 +1271,12 @@ def _fill_and_submit_form(
                     log.warning(f"Could not click Submit button on step {step}")
                     return "FAILED"
                 page.wait_for_timeout(2000)
+                _retry_numeric_validation_with_four(
+                    page,
+                    scope_text_before_action,
+                    submit_btn,
+                    "Submit",
+                )
 
                 # Check for success message
                 page.wait_for_timeout(1000)
