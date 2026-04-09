@@ -1,20 +1,22 @@
 {
-  "job_title": "Junior C++",
-  "location": "London",
+  "job_title": "Python Developer",
+  "location": "Zurich, Switzerland",
   "max_applications": 20,
   "title_keyword": "",
+  "company_blacklist": [
+    "Crossing Hurdles"
+  ],
   "dry_run": false,
   "profile": {
     "first_name": "Andrew",
     "last_name": "Bodzsar",
+    "phone_country": "United Kingdom",
     "phone_country_code": "+44",
-    "phone_number": "7951187359",
+    "phone_number": "87359",
     "email": "andrewbodzsar@proton.me",
-    "city": "Berlin",
-    "Landesvorwahl": "+44",
-    "Landesvorwahl": "Vereignites Konigreich",
-    "Handynummer": 7951187359,
-    "Country Code": "+44"
+    "city": "Winterthur",
+    "Phone": 59,
+    "Phone Country Code": "+44"
   },
   "answers": {
     "visa_sponsorship": "No",
