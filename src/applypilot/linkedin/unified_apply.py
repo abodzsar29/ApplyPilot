@@ -1,7 +1,6 @@
 """Unified LinkedIn search and apply in a single browser session."""
 
 import logging
-import random
 import re
 import time
 import unicodedata
@@ -33,6 +32,38 @@ def _normalize_location_text(value: str) -> str:
     ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
     lowered = ascii_only.lower()
     return re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+
+
+def _normalize_company_name(value: str) -> str:
+    """Normalize company names for blacklist matching."""
+    return _normalize_location_text(value)
+
+
+def _extract_company_name(card, page) -> str:
+    """Best-effort company extraction from the job card or detail panel."""
+    selectors = [
+        ".artdeco-entity-lockup__subtitle span[aria-hidden='true']",
+        ".job-card-container__company-name",
+        ".job-card-container__primary-description",
+        ".job-details-jobs-unified-top-card__company-name a",
+        ".job-details-jobs-unified-top-card__company-name",
+        ".jobs-unified-top-card__company-name a",
+        ".jobs-unified-top-card__company-name",
+    ]
+
+    for scope in (card, page):
+        for selector in selectors:
+            try:
+                elem = scope.query_selector(selector)
+                if not elem:
+                    continue
+                text = (elem.text_content() or "").strip()
+                if text:
+                    return text
+            except Exception:
+                continue
+
+    return ""
 
 
 def _apply_exact_location_filter(page, location: str) -> bool:
@@ -192,6 +223,12 @@ def search_and_apply(
     profile = config_dict.get("profile", {})
     answers = config_dict.get("answers", {})
     resume_path = config_dict.get("resume_path", "")
+    company_blacklist = config_dict.get("company_blacklist", [])
+    blacklisted_companies = {
+        _normalize_company_name(company)
+        for company in company_blacklist
+        if isinstance(company, str) and _normalize_company_name(company)
+    }
 
     if not job_title or not location:
         log.error("job_title and location are required")
@@ -270,6 +307,17 @@ def search_and_apply(
                         # Click on job to open it
                         job_link.click()
                         page.wait_for_timeout(3000)
+
+                        company_name = _extract_company_name(card, page)
+                        normalized_company = _normalize_company_name(company_name)
+                        if normalized_company and normalized_company in blacklisted_companies:
+                            log.info(
+                                "Card %s: Skipping blacklisted company '%s'",
+                                idx,
+                                company_name,
+                            )
+                            skipped += 1
+                            continue
 
                         # Look for Easy Apply button in the job detail panel (not the filter)
                         # Try multiple selectors to find the button on the job detail, not in the sidebar
@@ -782,6 +830,89 @@ def _country_code_option_matches(candidate: str, option_text: str, option_value:
     return False
 
 
+def _extract_country_code_digits(value: str) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _extract_country_name(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\(\+\d+\)", "", text).strip()
+    return _normalize_lookup_text(text)
+
+
+def _country_code_profile_candidates(profile: dict) -> list[str]:
+    keys = [
+        "phone_country_dropdown",
+        "phone_country",
+        "phone_country_name",
+        "phone_country_code",
+        "Country Code",
+        "Phone Country",
+        "Phone Country Code",
+        "Landesvorwahl",
+    ]
+    values: list[str] = []
+    for key in keys:
+        value = profile.get(key)
+        if not value:
+            continue
+        value_str = str(value).strip()
+        if value_str and value_str not in values:
+            values.append(value_str)
+    return values
+
+
+def _resolve_country_code_option(input_elem, profile: dict) -> str | None:
+    candidates = _collect_select_candidates(input_elem)
+    if not candidates:
+        return None
+
+    profile_values = _country_code_profile_candidates(profile)
+    if not profile_values:
+        return None
+
+    exact_targets = {_normalize_lookup_text(value) for value in profile_values if value}
+    name_targets = {_extract_country_name(value) for value in profile_values if _extract_country_name(value)}
+    digit_targets = {_extract_country_code_digits(value) for value in profile_values if _extract_country_code_digits(value)}
+
+    # 1. Exact full-option match, e.g. "United Kingdom (+44)".
+    for text, value in candidates:
+        option_targets = {
+            _normalize_lookup_text(text),
+            _normalize_lookup_text(value),
+        }
+        if option_targets & exact_targets:
+            return value
+
+    # 2. Exact country-name match, e.g. "United Kingdom".
+    name_matches: list[str] = []
+    for text, value in candidates:
+        option_name = _extract_country_name(text) or _extract_country_name(value)
+        if option_name and option_name in name_targets:
+            name_matches.append(value)
+    if len(name_matches) == 1:
+        return name_matches[0]
+
+    # 3. Dial-code-only match, but only when unambiguous.
+    digit_matches: list[str] = []
+    for text, value in candidates:
+        if any(_country_code_option_matches(digits, text, value) for digits in digit_targets):
+            digit_matches.append(value)
+    unique_digit_matches = list(dict.fromkeys(digit_matches))
+    if len(unique_digit_matches) == 1:
+        return unique_digit_matches[0]
+
+    if unique_digit_matches:
+        log.warning(
+            "Phone country code is ambiguous for config values %s; matching options: %s. "
+            "Set profile.phone_country to the exact country name or full dropdown label.",
+            profile_values,
+            [text for text, value in candidates if value in unique_digit_matches],
+        )
+
+    return None
+
+
 def _collect_select_candidates(input_elem) -> list[tuple[str, str]]:
     candidates: list[tuple[str, str]] = []
     try:
@@ -801,14 +932,29 @@ def _collect_select_candidates(input_elem) -> list[tuple[str, str]]:
     return candidates
 
 
-def _select_random_dropdown_value(input_elem, label_text: str) -> str | None:
-    """Randomly choose a non-placeholder option from a dropdown."""
+def _choose_dropdown_value(input_elem, label_text: str, profile: dict, answers: dict) -> str | None:
+    """Choose a deterministic dropdown value from config or scoring heuristics."""
+    label_lower = label_text.lower()
     candidates = _collect_select_candidates(input_elem)
     if not candidates:
         return None
-    chosen_text, chosen_value = random.choice(candidates)
-    log.info(f"Randomly selected dropdown '{label_text}' = '{chosen_text}'")
-    return chosen_value
+
+    if any(x in label_lower for x in ["country code", "dial code"]) or (
+        "phone" in label_lower and "country" in label_lower
+    ):
+        resolved = _resolve_country_code_option(input_elem, profile)
+        if resolved:
+            return resolved
+
+    inferred_value = _infer_question_answer(label_text, profile, answers)
+    if inferred_value:
+        inferred_lower = str(inferred_value).lower().strip()
+        for text, value in candidates:
+            haystack = f"{text} {value}".lower()
+            if inferred_lower and inferred_lower in haystack:
+                return value
+
+    return _fallback_select_value(input_elem, label_text, profile, answers)
 
 
 def _fill_text_input(input_elem, text_value: str) -> str:
@@ -1320,7 +1466,7 @@ def _fill_and_submit_form(
                             log.info(f"Leaving prefilled email dropdown unchanged: '{current_text}'")
                             continue
 
-                        value = _select_random_dropdown_value(input_elem, label_text)
+                        value = _choose_dropdown_value(input_elem, label_text, profile, answers)
                         if not value:
                             log.warning(f"Could not find selectable options for dropdown '{label_text}'")
                             continue

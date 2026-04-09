@@ -127,6 +127,9 @@ Job search queries, target titles, locations, boards. Run multiple searches with
 ### `.env`
 API keys and runtime config: `NON_EASY_PROVIDER`, `NON_EASY_MODEL`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `QWEN_MODEL`, `DASHSCOPE_API_KEY`, `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
 
+### `config/linkedin_apply.json`
+LinkedIn Easy Apply config. Supports `company_blacklist`, a list of company names to skip before the bot clicks `Easy Apply`. For phone dropdowns, set `profile.phone_country` to the country name LinkedIn shows, for example `United Kingdom`.
+
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
 - `config/sites.yaml` - Direct career sites (30+), blocked sites, base URLs, manual ATS domains
