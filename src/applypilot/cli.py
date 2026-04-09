@@ -263,6 +263,11 @@ def linkedin_apply(
     model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
     headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    exactlocation: bool = typer.Option(
+        False,
+        "--exactlocation",
+        help="Open LinkedIn filters and select the exact configured location before processing jobs.",
+    ),
     setup: bool = typer.Option(
         False,
         "--setup",
@@ -316,6 +321,7 @@ def linkedin_apply(
     console.print(f"  Max:     {config.get('max_applications', 'N/A')}")
     console.print(f"  Model:   {model}")
     console.print(f"  Dry run: {dry_run}")
+    console.print(f"  Exact location: {exactlocation}")
     console.print(f"  Setup:   {setup}")
     console.print()
 
@@ -335,6 +341,7 @@ def linkedin_apply(
         title_keyword=title_keyword,
         headless=headless,
         dry_run=dry_run,
+        exact_location=exactlocation,
         setup=setup,
     )
 

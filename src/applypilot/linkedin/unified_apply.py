@@ -27,12 +27,151 @@ def _hold_setup_session_open(page, search_url: str) -> None:
         log.info("LinkedIn setup session interrupted by user")
 
 
+def _normalize_location_text(value: str) -> str:
+    """Normalize location labels for resilient text matching."""
+    normalized = unicodedata.normalize("NFKD", value or "")
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+    lowered = ascii_only.lower()
+    return re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+
+
+def _apply_exact_location_filter(page, location: str) -> bool:
+    """Open LinkedIn filters and select the exact configured location."""
+    target = _normalize_location_text(location)
+    if not target:
+        return False
+
+    try:
+        all_filters_btn = page.locator(
+            "button[aria-label*='Show all filters'], "
+            "button.search-reusables__all-filters-pill-button"
+        ).first
+        all_filters_btn.wait_for(state="visible", timeout=10000)
+        all_filters_btn.click()
+
+        location_fieldset = page.locator(
+            "fieldset",
+            has=page.locator("h3:has-text('Location'), legend:has-text('Location')")
+        ).first
+        location_fieldset.wait_for(state="visible", timeout=10000)
+        match_result = location_fieldset.evaluate(
+            """(fieldset, target) => {
+                const normalize = (value) => (value || "")
+                    .normalize("NFKD")
+                    .replace(/[\\u0300-\\u036f]/g, "")
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, " ")
+                    .trim();
+
+                const options = [...fieldset.querySelectorAll("input[type='checkbox'][name='location-filter-value']")]
+                    .map((input) => {
+                        const label = input.id ? fieldset.querySelector(`label[for="${input.id}"]`) : null;
+                        const text = normalize(label ? label.textContent : input.value);
+                        return {
+                            id: input.id || "",
+                            text,
+                            rawText: label ? (label.textContent || "").trim() : (input.value || ""),
+                            checked: Boolean(input.checked),
+                        };
+                    });
+
+                const match = options.find((option) => option.text === target)
+                    || options.find((option) => option.text.includes(target) || target.includes(option.text));
+
+                if (!match) {
+                    return {
+                        ok: false,
+                        reason: "option_not_found",
+                        options: options.map((option) => option.rawText).filter(Boolean).slice(0, 20),
+                    };
+                }
+
+                const input = match.id ? fieldset.querySelector(`input#${match.id}`) : null;
+                const label = match.id ? fieldset.querySelector(`label[for="${match.id}"]`) : null;
+                if (!input) {
+                    return { ok: false, reason: "input_not_found", label: match.rawText };
+                }
+
+                if (label) {
+                    label.scrollIntoView({ block: "center" });
+                    label.click();
+                } else {
+                    input.scrollIntoView({ block: "center" });
+                    input.click();
+                }
+
+                return {
+                    ok: true,
+                    label: match.rawText,
+                    checked: Boolean(input.checked),
+                };
+            }""",
+            target,
+        )
+
+        if not match_result.get("ok"):
+            options = ", ".join(match_result.get("options", []))
+            log.warning(
+                "Exact location filter '%s' was not found in LinkedIn filters (%s). Options seen: %s",
+                location,
+                match_result.get("reason", "unknown"),
+                options or "none",
+            )
+            close_btn = page.locator("button[aria-label*='Dismiss'], button[aria-label*='Close']").first
+            if close_btn.count():
+                close_btn.click()
+            return False
+
+        page.wait_for_timeout(500)
+
+        verified = location_fieldset.evaluate(
+            """(fieldset, target) => {
+                const normalize = (value) => (value || "")
+                    .normalize("NFKD")
+                    .replace(/[\\u0300-\\u036f]/g, "")
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]+/g, " ")
+                    .trim();
+
+                return [...fieldset.querySelectorAll("input[type='checkbox'][name='location-filter-value']")]
+                    .some((input) => {
+                        const label = input.id ? fieldset.querySelector(`label[for="${input.id}"]`) : null;
+                        return normalize(label ? label.textContent : input.value) === target && input.checked;
+                    });
+            }""",
+            target,
+        )
+
+        if not verified:
+            log.warning("LinkedIn location filter '%s' was clicked but not checked", location)
+            return False
+
+        show_results_btn = page.locator(
+            "button:has-text('Show results'), button[aria-label*='Apply current filters']"
+        ).first
+        show_results_btn.wait_for(state="visible", timeout=10000)
+        show_results_btn.click()
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)
+
+        log.info(
+            "Applied exact LinkedIn location filter: %s (matched '%s')",
+            location,
+            match_result.get("label", location),
+        )
+        return True
+    except Exception as exc:
+        log.warning("Failed to apply exact LinkedIn location filter '%s': %s", location, exc)
+        return False
+
+
 def search_and_apply(
     config_dict: dict,
     max_applications: int = 1,
     title_keyword: str = "",
     headless: bool = False,
     dry_run: bool = False,
+    exact_location: bool = False,
     setup: bool = False,
 ) -> dict:
     """Search LinkedIn jobs and apply to them in a single browser session.
@@ -81,6 +220,9 @@ def search_and_apply(
             log.info(f"Navigating to {search_url}")
             page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
+
+            if exact_location:
+                _apply_exact_location_filter(page, location)
 
             # Process jobs on current page
             while applied < max_applications:
