@@ -1,6 +1,6 @@
 {
-  "job_title": "Python Developer",
-  "location": "Zurich, Switzerland",
+  "job_title": "Developer",
+  "location": "London",
   "max_applications": 20,
   "title_keyword": "",
   "company_blacklist": [
@@ -12,11 +12,12 @@
     "last_name": "Bodzsar",
     "phone_country": "United Kingdom",
     "phone_country_code": "+44",
-    "phone_number": "87359",
+    "phone_number": "7951187359",
     "email": "andrewbodzsar@proton.me",
-    "city": "Winterthur",
-    "Phone": 59,
-    "Phone Country Code": "+44"
+    "city": "London",
+    "Phone": 7951187359,
+    "Phone Country Code": "+44",
+    "Wie gut beherrschen Sie Deutsch?":"Verhandlungssicher"
   },
   "answers": {
     "visa_sponsorship": "No",
