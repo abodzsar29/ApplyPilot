@@ -18,6 +18,7 @@ from applypilot.apply.chrome import (
     BASE_CDP_PORT,
     cleanup_worker,
     detach_worker,
+    detach_all_workers,
     kill_all_chrome,
     launch_chrome,
     reset_worker_dir,
@@ -1351,6 +1352,7 @@ def _run_non_easy_setup_mode(config_dict: dict, headless: bool = False) -> dict:
 
     port = BASE_CDP_PORT
     chrome_proc = None
+    detach_browser_on_exit = False
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
@@ -1374,20 +1376,15 @@ def _run_non_easy_setup_mode(config_dict: dict, headless: bool = False) -> dict:
             except KeyboardInterrupt:
                 log.info("Setup mode interrupted by user.")
             finally:
-                if mailbox_page:
-                    try:
-                        mailbox_page.close()
-                    except Exception:
-                        pass
-                try:
-                    search_page.close()
-                except Exception:
-                    pass
-                browser.close()
+                detach_browser_on_exit = True
     finally:
-        if chrome_proc:
+        if chrome_proc and detach_browser_on_exit:
+            detach_worker(0)
+        if detach_browser_on_exit:
+            detach_all_workers()
+        elif chrome_proc:
             cleanup_worker(0, chrome_proc)
-        kill_all_chrome()
+            kill_all_chrome()
 
     return summary
 
@@ -1421,7 +1418,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
     port = BASE_CDP_PORT
     chrome_proc = None
-    preserve_browser_session = False
+    preserve_browser_session = True
     detached_chrome = False
     registry_entries = _load_applied_jobs_registry(config_dict)
     applied_job_keys, applied_job_urls = _registry_lookups(registry_entries)
@@ -1661,10 +1658,10 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         pass
                     browser.close()
     finally:
-        if chrome_proc and not preserve_browser_session:
-            cleanup_worker(0, chrome_proc)
-        if not preserve_browser_session:
-            kill_all_chrome()
+        if chrome_proc:
+            if not detached_chrome:
+                detach_worker(0)
+            detach_all_workers()
 
     return summary
 

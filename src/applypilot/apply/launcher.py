@@ -28,7 +28,7 @@ from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
-    reset_worker_dir, cleanup_on_exit, _kill_process_tree, detach_worker,
+    reset_worker_dir, cleanup_on_exit, _kill_process_tree, detach_worker, detach_all_workers,
     BASE_CDP_PORT,
 )
 from applypilot.apply.dashboard import (
@@ -811,7 +811,7 @@ def main(limit: int = 1, target_url: str | None = None,
                 for wid, cproc in list(_claude_procs.items()):
                     if cproc.poll() is None:
                         _kill_process_tree(cproc.pid)
-            kill_all_chrome()
+            detach_all_workers()
             raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _sigint_handler)
@@ -893,7 +893,7 @@ def main(limit: int = 1, target_url: str | None = None,
         pass
     finally:
         _stop_event.set()
-        kill_all_chrome()
+        detach_all_workers()
 
 
 # ---------------------------------------------------------------------------
@@ -1036,8 +1036,8 @@ def run_linkedin_apply(job_urls: list[str], config_dict: dict,
     finally:
         _stop_event.set()
         if chrome_proc:
-            cleanup_worker(0, chrome_proc)
-        kill_all_chrome()
+            detach_worker(0)
+        detach_all_workers()
 
     return {
         "applied": applied_count,

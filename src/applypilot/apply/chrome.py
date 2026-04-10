@@ -306,6 +306,17 @@ def detach_worker(worker_id: int) -> None:
     logger.info("[worker-%d] Chrome detached from automatic cleanup", worker_id)
 
 
+def detach_all_workers() -> None:
+    """Stop tracking all worker Chrome processes without killing them."""
+    with _chrome_lock:
+        worker_ids = list(_chrome_procs.keys())
+        _chrome_procs.clear()
+        for worker_id in worker_ids:
+            _detached_ports.add(BASE_CDP_PORT + worker_id)
+    if worker_ids:
+        logger.info("Detached %d Chrome worker(s) from automatic cleanup", len(worker_ids))
+
+
 def kill_all_chrome() -> None:
     """Kill all Chrome instances and any port zombies.
 
