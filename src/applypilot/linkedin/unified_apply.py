@@ -10,6 +10,45 @@ from applypilot import config
 log = logging.getLogger(__name__)
 
 
+_PHONE_COUNTRY_LABEL_TOKENS = (
+    "country code",
+    "dial code",
+    "phone country",
+    "code pays",
+    "indicatif",
+    "landesvorwahl",
+)
+
+_PHONE_NUMBER_LABEL_TOKENS = (
+    "phone",
+    "mobile",
+    "contact number",
+    "telephone",
+    "telefon",
+    "telefonnummer",
+    "handynummer",
+    "mobilnummer",
+)
+
+_FOLLOW_COMPANY_LABEL_TOKENS = (
+    "follow",
+    "suivre",
+    "abonnieren",
+    "folgen",
+)
+
+_SELECT_PLACEHOLDER_TEXTS = {
+    "select an option",
+    "select",
+    "choose",
+    "choose one",
+    "selectionnez une option",
+    "sélectionnez une option",
+    "option auswahlen",
+    "option auswählen",
+}
+
+
 def _hold_setup_session_open(page, search_url: str) -> None:
     """Keep the interactive LinkedIn browser session alive until manual abort."""
     log.info("Opening LinkedIn setup session: %s", search_url)
@@ -433,7 +472,7 @@ def _smart_select_option(select_elem, value: str, label: str, log) -> bool:
             pass
 
         # For phone country codes, try without the + sign
-        if "country" in label.lower() or "dial" in label.lower():
+        if any(token in label.lower() for token in _PHONE_COUNTRY_LABEL_TOKENS):
             value_str = str(value).replace("+", "")
             try:
                 select_elem.select_option(value_str)
@@ -459,7 +498,7 @@ def _smart_select_option(select_elem, value: str, label: str, log) -> bool:
                     pass
 
             # Try partial match for country codes
-            if "country" in label.lower() or "dial" in label.lower():
+            if any(token in label.lower() for token in _PHONE_COUNTRY_LABEL_TOKENS):
                 if value_lower.replace("+", "") in opt_value or value_lower.replace("+", "") in opt_text:
                     try:
                         select_elem.select_option(opt.get_attribute("value") or opt_text)
@@ -521,6 +560,38 @@ def _close_easy_apply_modal(page) -> None:
         page.wait_for_timeout(500)
     except Exception:
         pass
+
+
+def _is_safety_reminder_modal(scope) -> bool:
+    """Return True when LinkedIn shows the pre-apply safety reminder modal."""
+    scope_text = _normalize_lookup_text(_scope_text(scope))
+    return (
+        "job search safety reminder" in scope_text
+        or "safety reminder" in scope_text
+        or ("continue applying" in scope_text and "review job post" in scope_text)
+    )
+
+
+def _continue_past_safety_reminder(scope, page) -> bool:
+    """Click through LinkedIn's pre-apply safety reminder modal."""
+    if not _is_safety_reminder_modal(scope):
+        return False
+
+    selectors = [
+        "#jobs-apply-button-id",
+        "button[aria-label*='continue the apply process']",
+        "button:has-text('Continue applying')",
+    ]
+    for selector in selectors:
+        try:
+            button = scope.query_selector(selector)
+            if button and button.is_visible() and button.is_enabled():
+                if _click_action_button(button):
+                    page.wait_for_timeout(1500)
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def _element_current_text(element) -> str:
@@ -605,13 +676,25 @@ def _scope_text(scope) -> str:
 def _is_review_submit_step(scope) -> bool:
     """Return True when the Easy Apply modal is on the final review step."""
     scope_text = _scope_text(scope)
-    if "review your application" not in scope_text:
+    if not any(
+        text in scope_text
+        for text in [
+            "review your application",
+            "review application",
+            "vérifiez votre candidature",
+            "verifiez votre candidature",
+            "bewerbung überprüfen",
+            "bewerbung uberprufen",
+        ]
+    ):
         return False
 
     selectors = [
         "button[aria-label='Submit application']",
         "[data-live-test-easy-apply-submit-button]",
         "button:has-text('Submit application')",
+        "button:has-text('Envoyer la candidature')",
+        "button:has-text('Bewerbung absenden')",
     ]
     for selector in selectors:
         try:
@@ -629,6 +712,7 @@ def _uncheck_follow_company_checkbox(scope) -> bool:
     for checkbox in checkboxes:
         try:
             checkbox_id = checkbox.get_attribute("id") or ""
+            checkbox_name = (checkbox.get_attribute("name") or "").strip().lower()
             label_text = ""
             label = None
             if checkbox_id:
@@ -637,9 +721,8 @@ def _uncheck_follow_company_checkbox(scope) -> bool:
                     label_text = (label.text_content() or "").strip()
 
             label_lower = " ".join(label_text.lower().split())
-            if "follow" not in label_lower:
-                continue
-            if "stay up to date" not in label_lower and "page" not in label_lower:
+            should_uncheck = checkbox_id == "follow-company-checkbox" or checkbox_name == "follow-company"
+            if not should_uncheck and not any(token in label_lower for token in _FOLLOW_COMPANY_LABEL_TOKENS):
                 continue
 
             if checkbox.is_checked():
@@ -760,20 +843,20 @@ def _infer_question_answer(label_text: str, profile: dict, answers: dict) -> str
     if direct_answer_value is not None:
         return direct_answer_value
 
-    if any(x in label_lower for x in ["country code", "dial code", "landesvorwahl"]) or (
-        any(x in label_lower for x in ["phone", "telefon", "mobile", "handy"])
-        and any(x in label_lower for x in ["country", "code", "dial", "vorwahl"])
+    if any(x in label_lower for x in _PHONE_COUNTRY_LABEL_TOKENS) or (
+        any(x in label_lower for x in _PHONE_NUMBER_LABEL_TOKENS)
+        and any(x in label_lower for x in ["country", "code", "dial", "vorwahl", "pays", "indicatif"])
     ):
         return str(profile.get("phone_country_code", "+44"))
-    if any(x in label_lower for x in ["phone", "mobile", "contact number", "telefonnummer", "handynummer", "mobilnummer"]) and "city" not in label_lower:
+    if any(x in label_lower for x in _PHONE_NUMBER_LABEL_TOKENS) and "city" not in label_lower:
         return profile.get("phone_number")
-    if any(x in label_lower for x in ["first name", "given name", "vorname"]):
+    if any(x in label_lower for x in ["first name", "given name", "vorname", "prénom", "prenom"]):
         return profile.get("first_name")
-    if any(x in label_lower for x in ["last name", "family name", "surname", "nachname"]):
+    if any(x in label_lower for x in ["last name", "family name", "surname", "nachname", "nom"]):
         return profile.get("last_name")
     if any(x in label_lower for x in ["email", "e-mail"]):
         return profile.get("email")
-    if any(x in label_lower for x in ["city", "current location", "current city", "where are you located", "stadt", "wohnort"]) and "phone" not in label_lower:
+    if any(x in label_lower for x in ["city", "current location", "current city", "where are you located", "stadt", "wohnort", "ville"]) and "phone" not in label_lower:
         return profile.get("city")
     if "visa" in label_lower or "sponsorship" in label_lower:
         return answers.get("visa_sponsorship", "No")
@@ -926,7 +1009,9 @@ def _collect_select_candidates(input_elem) -> list[tuple[str, str]]:
         normalized = text.lower()
         if not text:
             continue
-        if "select an option" in normalized or normalized in {"select", "choose", "choose one"}:
+        if normalized in _SELECT_PLACEHOLDER_TEXTS or any(
+            placeholder in normalized for placeholder in _SELECT_PLACEHOLDER_TEXTS
+        ):
             continue
         candidates.append((text, value or text))
     return candidates
@@ -939,7 +1024,7 @@ def _choose_dropdown_value(input_elem, label_text: str, profile: dict, answers: 
     if not candidates:
         return None
 
-    if any(x in label_lower for x in ["country code", "dial code"]) or (
+    if any(x in label_lower for x in _PHONE_COUNTRY_LABEL_TOKENS) or (
         "phone" in label_lower and "country" in label_lower
     ):
         resolved = _resolve_country_code_option(input_elem, profile)
@@ -1046,7 +1131,7 @@ def _score_option(label_text: str, option_text: str, inferred_value: str | None,
         if "berlin" in city and ("berlin" in option_lower or "germany" in option_lower):
             score += 80
 
-    if any(x in label_lower for x in ["country code", "dial code"]) or ("phone" in label_lower and "country" in label_lower):
+    if any(x in label_lower for x in _PHONE_COUNTRY_LABEL_TOKENS) or ("phone" in label_lower and "country" in label_lower):
         if _country_code_option_matches(phone_country, option_text, option_text):
             score += 120
 
@@ -1250,7 +1335,7 @@ def _try_fill_select(input_elem, value: str, label_text: str) -> bool:
     label_lower = label_text.lower()
 
     if current_text:
-        if any(x in label_lower for x in ["country code", "dial code"]) or (
+        if any(x in label_lower for x in _PHONE_COUNTRY_LABEL_TOKENS) or (
             "phone" in label_lower and "country" in label_lower
         ):
             if _country_code_option_matches(str(value), current_text, ""):
@@ -1284,7 +1369,7 @@ def _try_fill_select(input_elem, value: str, label_text: str) -> bool:
         try:
             opt_text = (opt.text_content() or "").strip()
             opt_value = (opt.get_attribute("value") or "").strip()
-            if any(x in label_lower for x in ["country code", "dial code"]) or (
+            if any(x in label_lower for x in _PHONE_COUNTRY_LABEL_TOKENS) or (
                 "phone" in label_lower and "country" in label_lower
             ):
                 if not _country_code_option_matches(str(value), opt_text, opt_value):
@@ -1381,6 +1466,10 @@ def _fill_and_submit_form(
                 log.warning("Easy Apply modal is no longer visible")
                 return "FAILED"
 
+            if _continue_past_safety_reminder(scope, page):
+                log.info("Dismissed LinkedIn safety reminder and continued applying")
+                continue
+
             # Find all input fields on this step
             inputs = scope.query_selector_all("input, select, textarea")
             log.info(f"Found {len(inputs)} form fields on step {step}")
@@ -1406,9 +1495,11 @@ def _fill_and_submit_form(
                 except Exception as e:
                     log.warning(f"Could not upload resume: {e}")
 
-            if _is_review_submit_step(scope):
-                if _uncheck_follow_company_checkbox(scope):
+            if _uncheck_follow_company_checkbox(scope):
+                if _is_review_submit_step(scope):
                     log.info("Unchecked follow-company checkbox on review step")
+                else:
+                    log.info("Unchecked follow-company checkbox")
 
             processed_choice_groups = set()
 
@@ -1504,6 +1595,7 @@ def _fill_and_submit_form(
                 follow_checkbox = scope.query_selector("input[type='checkbox']")
                 if follow_checkbox and follow_checkbox.is_checked():
                     label_text = ""
+                    checkbox_id = ""
                     try:
                         checkbox_id = follow_checkbox.get_attribute("id") or ""
                         if checkbox_id:
@@ -1512,7 +1604,9 @@ def _fill_and_submit_form(
                                 label_text = (label.text_content() or "").lower()
                     except Exception:
                         pass
-                    if "follow" in label_text:
+                    if checkbox_id == "follow-company-checkbox" or any(
+                        token in label_text for token in _FOLLOW_COMPANY_LABEL_TOKENS
+                    ):
                         follow_checkbox.uncheck()
             except Exception:
                 pass
@@ -1522,7 +1616,10 @@ def _fill_and_submit_form(
             # Look for Next/Continue/Review button to go to next step.
             next_btn = scope.query_selector(
                 "button:has-text('Next'), button:has-text('Continue'), "
-                "button:has-text('Review'), button[aria-label*='Next']"
+                "button:has-text('Review'), button:has-text('Suivant'), "
+                "button:has-text('Continuer'), button:has-text('Weiter'), "
+                "button:has-text('Überprüfen'), button:has-text('Uberprufen'), "
+                "button[aria-label*='Next'], button[aria-label*='Continue']"
             )
             if next_btn and next_btn.is_enabled():
                 log.info(f"Clicking Next button on step {step}")
@@ -1543,6 +1640,8 @@ def _fill_and_submit_form(
                 scope.query_selector("button[aria-label='Submit application']")
                 or scope.query_selector("[data-live-test-easy-apply-submit-button]")
                 or scope.query_selector("button:has-text('Submit application')")
+                or scope.query_selector("button:has-text('Envoyer la candidature')")
+                or scope.query_selector("button:has-text('Bewerbung absenden')")
                 or scope.query_selector("button:has-text('Submit')")
                 or scope.query_selector("button:has-text('Apply')")
                 or scope.query_selector("button:has-text('Send')")
