@@ -6,6 +6,9 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+config/linkedin_apply.json
+config/linkedin_noneasy_applied.json
+config/linkedin_apply_anabell.json
 
 # Runtime artifacts
 *.db
