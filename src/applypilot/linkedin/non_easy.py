@@ -385,6 +385,11 @@ def _ignored_companies(config_dict: dict) -> set[str]:
 def _ignored_application_domains(config_dict: dict) -> set[str]:
     """Return normalized application-site domains that should be skipped."""
     domains = config_dict.get("ignored_application_domains", []) or []
+    return _normalize_domain_values(domains)
+
+
+def _normalize_domain_values(domains) -> set[str]:
+    """Normalize a domain collection into comparable host fragments."""
     normalized: set[str] = set()
     for domain in domains:
         if not isinstance(domain, str):
@@ -396,6 +401,18 @@ def _ignored_application_domains(config_dict: dict) -> set[str]:
         if cleaned:
             normalized.add(cleaned)
     return normalized
+
+
+def _allowed_jobboard_domains(config_dict: dict) -> set[str]:
+    """Return normalized job-board domains allowed for --jobboards runs."""
+    jobboards = config_dict.get("jobboards", {}) or {}
+    if isinstance(jobboards, dict):
+        domains = jobboards.get("domains", []) or []
+    elif isinstance(jobboards, list):
+        domains = jobboards
+    else:
+        domains = []
+    return _normalize_domain_values(domains)
 
 
 def _matches_ignored_company(company: str, title_text: str, ignored_companies: set[str]) -> bool:
@@ -430,6 +447,26 @@ def _matches_ignored_application_domain(page, application_url: str, ignored_doma
         if host and (host == ignored or host.endswith(f".{ignored}") or ignored in host):
             return True
         if title and ignored in title:
+            return True
+    return False
+
+
+def _matches_allowed_jobboard_domain(page, application_url: str, allowed_domains: set[str]) -> bool:
+    """Return True when the opened external page matches a configured job board domain."""
+    if not allowed_domains:
+        return False
+
+    host = (urlparse(application_url).netloc or "").strip().casefold()
+    title = ""
+    try:
+        title = (page.title() or "").strip().casefold()
+    except Exception:
+        title = ""
+
+    for allowed in allowed_domains:
+        if host and (host == allowed or host.endswith(f".{allowed}") or allowed in host):
+            return True
+        if title and allowed in title:
             return True
     return False
 
@@ -1390,7 +1427,8 @@ def _run_non_easy_setup_mode(config_dict: dict, headless: bool = False) -> dict:
 
 
 def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
-                               headless: bool = False, dry_run: bool = False) -> dict:
+                               headless: bool = False, dry_run: bool = False,
+                               jobboards_only: bool = False) -> dict:
     """Process LinkedIn non-Easy-Apply jobs directly from search results."""
     job_title = config_dict.get("job_title", "")
     location = config_dict.get("location", "")
@@ -1424,6 +1462,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     applied_job_keys, applied_job_urls = _registry_lookups(registry_entries)
     ignored_companies = _ignored_companies(config_dict)
     ignored_application_domains = _ignored_application_domains(config_dict)
+    allowed_jobboard_domains = _allowed_jobboard_domains(config_dict)
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
@@ -1521,6 +1560,24 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             summary["skipped"] += 1
                             log.info(
                                 "Skipping ignored application domain in non-easy apply: %s",
+                                application_url or "<unknown>",
+                            )
+                            try:
+                                application_page.close()
+                            except Exception:
+                                pass
+                            if application_page is detail_page:
+                                detail_page = context.new_page()
+                            continue
+
+                        if jobboards_only and not _matches_allowed_jobboard_domain(
+                            application_page,
+                            application_url or "",
+                            allowed_jobboard_domains,
+                        ):
+                            summary["skipped"] += 1
+                            log.info(
+                                "Skipping non-jobboard application domain in non-easy apply: %s",
                                 application_url or "<unknown>",
                             )
                             try:
@@ -1667,8 +1724,15 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
 
 def run_non_easy_apply(config_dict: dict, model: str = "qwen-flash",
-                       headless: bool = False, dry_run: bool = False, setup: bool = False) -> dict:
+                       headless: bool = False, dry_run: bool = False, setup: bool = False,
+                       jobboards_only: bool = False) -> dict:
     """Backward-compatible shim."""
     if setup:
         return _run_non_easy_setup_mode(config_dict, headless=headless)
-    return _run_non_easy_apply_direct(config_dict, model=model, headless=headless, dry_run=dry_run)
+    return _run_non_easy_apply_direct(
+        config_dict,
+        model=model,
+        headless=headless,
+        dry_run=dry_run,
+        jobboards_only=jobboards_only,
+    )

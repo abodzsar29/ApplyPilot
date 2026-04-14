@@ -340,6 +340,11 @@ def linkedin_noneasy(
     headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     setup: bool = typer.Option(False, "--setup", help="Open LinkedIn + mailbox and stay idle until terminated."),
+    jobboards: bool = typer.Option(
+        False,
+        "--jobboards",
+        help="Only apply to external jobs whose opened URL matches a configured job board domain.",
+    ),
 ) -> None:
     """Search LinkedIn for non-Easy-Apply jobs and apply only to external ATS sites."""
     import json
@@ -387,6 +392,7 @@ def linkedin_noneasy(
     console.print(f"  Model:    {effective_model}")
     console.print(f"  Dry run:  {dry_run}")
     console.print(f"  Setup:    {setup}")
+    console.print(f"  Jobboards only: {jobboards}")
     console.print()
 
     result = run_non_easy_apply(
@@ -395,6 +401,7 @@ def linkedin_noneasy(
         headless=headless,
         dry_run=dry_run,
         setup=setup,
+        jobboards_only=jobboards,
     )
 
     if setup:
