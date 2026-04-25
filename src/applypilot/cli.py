@@ -319,6 +319,7 @@ def linkedin_apply(
     console.print(f"  Location: {config.get('location', 'N/A')}")
     console.print(f"  Keyword: {config.get('title_keyword', 'N/A')}")
     console.print(f"  Max:     {config.get('max_applications', 'N/A')}")
+    console.print(f"  Delay:   {config.get('delay', 0)}s")
     console.print(f"  Model:   {model}")
     console.print(f"  Dry run: {dry_run}")
     console.print(f"  Exact location: {exactlocation}")

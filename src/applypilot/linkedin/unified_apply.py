@@ -48,6 +48,15 @@ _SELECT_PLACEHOLDER_TEXTS = {
     "option auswählen",
 }
 
+_NUMERIC_RANGE_VALIDATION_TEXTS = (
+    "enter a whole number between 0 and 99",
+)
+
+_UPLOAD_FORMAT_ERROR_TEXTS = (
+    "please upload an acceptable document format (jpg, jpeg, gif, png). change file",
+    "please upload an acceptable document format",
+)
+
 
 def _hold_setup_session_open(page, search_url: str) -> None:
     """Keep the interactive LinkedIn browser session alive until manual abort."""
@@ -263,11 +272,18 @@ def search_and_apply(
     answers = config_dict.get("answers", {})
     resume_path = config_dict.get("resume_path", "")
     company_blacklist = config_dict.get("company_blacklist", [])
+    raw_delay = config_dict.get("delay", 0)
     blacklisted_companies = {
         _normalize_company_name(company)
         for company in company_blacklist
         if isinstance(company, str) and _normalize_company_name(company)
     }
+
+    try:
+        apply_delay_seconds = max(0.0, float(raw_delay))
+    except (TypeError, ValueError):
+        log.warning("Invalid LinkedIn apply delay %r; defaulting to 0 seconds", raw_delay)
+        apply_delay_seconds = 0.0
 
     if not job_title or not location:
         log.error("job_title and location are required")
@@ -418,6 +434,13 @@ def search_and_apply(
                         _close_easy_apply_modal(page)
                         page.wait_for_timeout(1000)
 
+                        if apply_delay_seconds > 0:
+                            log.info(
+                                "Waiting %.2f seconds before processing the next job",
+                                apply_delay_seconds,
+                            )
+                            page.wait_for_timeout(int(apply_delay_seconds * 1000))
+
                     except Exception as e:
                         log.error(f"Error processing card {idx}: {e}")
                         failed += 1
@@ -514,12 +537,37 @@ def _smart_select_option(select_elem, value: str, label: str, log) -> bool:
         return False
 
 
+def _find_discard_confirmation_modal(page):
+    """Return the visible top-layer discard-confirmation modal when present."""
+    selectors = [
+        "[data-test-modal-id='data-test-easy-apply-discard-confirmation']",
+        ".artdeco-modal-overlay--layer-confirmation[aria-hidden='false']",
+        ".artdeco-modal-overlay--is-top-layer [role='alertdialog']",
+        ".artdeco-modal[role='alertdialog']",
+        "[role='alertdialog']",
+    ]
+    for selector in selectors:
+        try:
+            for modal in page.query_selector_all(selector):
+                if modal.is_visible():
+                    return modal
+        except Exception:
+            continue
+    return None
+
+
 def _get_active_modal(page):
     """Return the visible Easy Apply modal/dialog if one is open."""
+    discard_modal = _find_discard_confirmation_modal(page)
+    if discard_modal:
+        return discard_modal
+
     selectors = [
         "div.jobs-easy-apply-modal",
         ".artdeco-modal[role='dialog']",
+        ".artdeco-modal[role='alertdialog']",
         "[role='dialog']",
+        "[role='alertdialog']",
         "dialog",
     ]
     for selector in selectors:
@@ -534,8 +582,42 @@ def _get_active_modal(page):
 
 def _close_easy_apply_modal(page) -> None:
     """Dismiss the Easy Apply modal if it is still open."""
+    def _discard_confirmation_if_present() -> bool:
+        modal = _find_discard_confirmation_modal(page)
+        if not modal:
+            return False
+
+        try:
+            modal_text = _normalize_lookup_text(_scope_text(modal))
+        except Exception:
+            modal_text = ""
+
+        if "save this application" not in modal_text and "application will be discarded" not in modal_text:
+            return False
+
+        selectors = [
+            "button[data-control-name='discard_application_confirm_btn']",
+            "button[data-test-dialog-secondary-btn]",
+            "button:has-text('Discard')",
+        ]
+        for selector in selectors:
+            try:
+                btn = modal.query_selector(selector) or page.query_selector(selector)
+                if btn and btn.is_visible() and btn.is_enabled():
+                    if not _click_action_button(btn):
+                        continue
+                    page.wait_for_timeout(500)
+                    return True
+            except Exception:
+                continue
+
+        return False
+
     modal = _get_active_modal(page)
     if not modal:
+        return
+
+    if _discard_confirmation_if_present():
         return
 
     selectors = [
@@ -549,8 +631,11 @@ def _close_easy_apply_modal(page) -> None:
         try:
             btn = modal.query_selector(selector)
             if btn and btn.is_visible():
-                btn.click()
+                if not _click_action_button(btn):
+                    continue
                 page.wait_for_timeout(500)
+                if _discard_confirmation_if_present():
+                    return
                 return
         except Exception:
             continue
@@ -558,6 +643,7 @@ def _close_easy_apply_modal(page) -> None:
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(500)
+        _discard_confirmation_if_present()
     except Exception:
         pass
 
@@ -671,6 +757,12 @@ def _scope_text(scope) -> str:
         return " ".join((scope.text_content() or "").lower().split())
     except Exception:
         return ""
+
+
+def _has_upload_format_error(scope) -> bool:
+    """Return True when the current step shows the resume upload format error."""
+    scope_text = _scope_text(scope)
+    return any(text in scope_text for text in _UPLOAD_FORMAT_ERROR_TEXTS)
 
 
 def _is_review_submit_step(scope) -> bool:
@@ -1076,6 +1168,72 @@ def _rewrite_default_a_fields_to_four(scope) -> int:
     return rewritten
 
 
+def _rewrite_range_validation_fields_to_four(scope) -> int:
+    """Replace values in visible inputs that are blocked by 0..99 validation feedback."""
+    rewritten = 0
+    candidates = scope.query_selector_all("input, textarea")
+    for input_elem in candidates:
+        try:
+            input_type = (input_elem.get_attribute("type") or "text").lower()
+            if input_type in {"hidden", "checkbox", "radio", "file", "submit", "button"}:
+                continue
+            if not input_elem.is_visible() or input_elem.is_disabled():
+                continue
+
+            validation_text = input_elem.evaluate(
+                """(node) => {
+                    const wrappers = [
+                        node.closest('.fb-dash-form-element'),
+                        node.closest('.jobs-easy-apply-form-section__grouping'),
+                        node.closest('.artdeco-text-input'),
+                        node.closest('fieldset'),
+                        node.parentElement,
+                    ].filter(Boolean);
+
+                    const texts = [];
+                    const describedByIds = (node.getAttribute('aria-describedby') || '')
+                        .split(/\\s+/)
+                        .map((value) => value.trim())
+                        .filter(Boolean);
+
+                    for (const id of describedByIds) {
+                        const describedBy = node.ownerDocument.getElementById(id);
+                        if (describedBy && describedBy.innerText) {
+                            texts.push(describedBy.innerText);
+                        }
+                    }
+
+                    const errorMessageId = node.getAttribute('aria-errormessage');
+                    if (errorMessageId) {
+                        const errorMessage = node.ownerDocument.getElementById(errorMessageId);
+                        if (errorMessage && errorMessage.innerText) {
+                            texts.push(errorMessage.innerText);
+                        }
+                    }
+
+                    for (const wrapper of wrappers) {
+                        if (wrapper.innerText) {
+                            texts.push(wrapper.innerText);
+                        }
+                    }
+
+                    return texts.join('\\n').toLowerCase();
+                }"""
+            )
+            if not any(text in validation_text for text in _NUMERIC_RANGE_VALIDATION_TEXTS):
+                continue
+
+            current_value = _element_current_text(input_elem).strip()
+            if current_value == "4":
+                continue
+
+            input_elem.fill("4", timeout=1000)
+            rewritten += 1
+        except Exception:
+            continue
+    return rewritten
+
+
 def _retry_numeric_validation_with_four(page, previous_scope_text: str, button, button_name: str) -> bool:
     """Retry the current step when it appears blocked by a 0..99 numeric validation."""
     modal = _get_active_modal(page)
@@ -1086,12 +1244,14 @@ def _retry_numeric_validation_with_four(page, previous_scope_text: str, button, 
     if "0" not in current_scope_text or "99" not in current_scope_text:
         return False
 
-    rewritten = _rewrite_default_a_fields_to_four(scope)
+    rewritten = _rewrite_range_validation_fields_to_four(scope)
+    if rewritten <= 0:
+        rewritten = _rewrite_default_a_fields_to_four(scope)
     if rewritten <= 0:
         return False
 
     log.info(
-        "Step unchanged after %s and 0/99 validation detected; rewrote %d field(s) from 'a' to '4'",
+        "Step unchanged after %s and 0/99 validation detected; rewrote %d field(s) to '4'",
         button_name,
         rewritten,
     )
@@ -1470,6 +1630,10 @@ def _fill_and_submit_form(
                 log.info("Dismissed LinkedIn safety reminder and continued applying")
                 continue
 
+            if _has_upload_format_error(scope):
+                log.info("Upload format validation is visible; skipping this job")
+                return "SKIPPED"
+
             # Find all input fields on this step
             inputs = scope.query_selector_all("input, select, textarea")
             log.info(f"Found {len(inputs)} form fields on step {step}")
@@ -1492,6 +1656,9 @@ def _fill_and_submit_form(
                 try:
                     resume_input.set_input_files(resume_path)
                     page.wait_for_timeout(2000)
+                    if _has_upload_format_error(scope):
+                        log.info("Resume upload triggered format validation; skipping this job")
+                        return "SKIPPED"
                 except Exception as e:
                     log.warning(f"Could not upload resume: {e}")
 
@@ -1612,6 +1779,10 @@ def _fill_and_submit_form(
                 pass
 
             scope_text_before_action = _scope_text(scope)
+
+            if _has_upload_format_error(scope):
+                log.info("Upload format validation is still visible before proceeding; skipping this job")
+                return "SKIPPED"
 
             # Look for Next/Continue/Review button to go to next step.
             next_btn = scope.query_selector(
