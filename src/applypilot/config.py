@@ -75,6 +75,48 @@ def get_chrome_path() -> str:
     )
 
 
+def get_brave_path() -> str:
+    """Auto-detect Brave executable path, cross-platform.
+
+    Override with BRAVE_PATH environment variable.
+    """
+    env_path = os.environ.get("BRAVE_PATH")
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    system = platform.system()
+
+    if system == "Windows":
+        candidates = [
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "BraveSoftware/Brave-Browser/Application/brave.exe",
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "BraveSoftware/Brave-Browser/Application/brave.exe",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "BraveSoftware/Brave-Browser/Application/brave.exe",
+        ]
+    elif system == "Darwin":
+        candidates = [
+            Path("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+        ]
+    else:  # Linux
+        candidates = []
+        for name in ("brave-browser", "brave-browser-stable", "brave"):
+            found = shutil.which(name)
+            if found:
+                candidates.append(Path(found))
+
+    for c in candidates:
+        if c and c.exists():
+            return str(c)
+
+    for name in ("brave-browser", "brave-browser-stable", "brave"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    raise FileNotFoundError(
+        "Brave not found. Install Brave or set BRAVE_PATH environment variable."
+    )
+
+
 def get_chrome_user_data() -> Path:
     """Default Chrome user data directory, cross-platform."""
     system = platform.system()

@@ -235,19 +235,31 @@ RESULT:FAILED:reason
 def _is_easy_apply(page) -> bool:
     """Return True if the LinkedIn job detail page exposes Easy Apply."""
     selectors = [
+        "[data-sdui-screen*='JobDetails'] a[href*='/jobs/view/'][href*='/apply/']",
+        "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label*='Easy Apply']",
+        "main a[href*='/jobs/view/'][href*='/apply/'][href*='openSDUIApplyFlow=true']",
+        "a[aria-label='Easy Apply to this job']",
+        "a[aria-label*='Easy Apply'][href*='/apply/']",
         ".job-details-top-card button:has-text('Easy Apply')",
         "[data-test-id='jobs-details'] button:has-text('Easy Apply')",
         ".jobs-detail__main-content button:has-text('Easy Apply')",
         "button[aria-label='Easy Apply job']",
+        "button[aria-label*='Easy Apply']",
         "button:has-text('Easy Apply')",
     ]
     for selector in selectors:
         try:
-            for btn in page.query_selector_all(selector):
-                if not btn.is_visible():
+            for elem in page.query_selector_all(selector):
+                if not elem.is_visible():
                     continue
-                text = ((btn.text_content() or "") + " " + (btn.get_attribute("aria-label") or "")).lower()
-                if "easy apply" in text:
+                text = (
+                    (elem.text_content() or "")
+                    + " "
+                    + (elem.get_attribute("aria-label") or "")
+                    + " "
+                    + (elem.get_attribute("href") or "")
+                ).lower()
+                if "easy apply" in text or "/apply/" in text:
                     return True
         except Exception:
             continue
@@ -277,10 +289,15 @@ def _find_apply_control(page):
                 href = (elem.get_attribute("href") or "").strip()
                 cls = (elem.get_attribute("class") or "").strip().lower()
                 combined = f"{text} {aria}"
+                href_lower = href.lower()
                 if "apply" not in combined and "company website" not in combined:
-                    if "apply" not in cls and "apply" not in href.lower():
+                    if "apply" not in cls and "apply" not in href_lower:
                         continue
-                if "easy apply" in combined:
+                if "easy apply" in combined or (
+                    "linkedin.com" in href_lower
+                    and "/jobs/view/" in href_lower
+                    and "/apply/" in href_lower
+                ):
                     continue
                 return elem
         except Exception:

@@ -9,6 +9,15 @@ resume.pdf
 config/linkedin_apply.json
 config/linkedin_noneasy_applied.json
 config/linkedin_apply_anabell.json
+NON_EASY_APPLY_PLAN.md
+application_success.png
+data/Anabell_Oeynhausen_Lebenslauf.pdf
+data/AndrewBodzsarCV.pdf
+entirepages/windowforlocation.html
+snapshot-2026-04-13T13-02-00.000Z.md
+snapshot.md
+
+
 
 # Runtime artifacts
 *.db
@@ -21,6 +30,9 @@ logs/
 
 # MCP configs (per-machine)
 .mcp*.json
+.playwright-mcp/
+.codex
+
 
 # Python
 __pycache__/

@@ -59,6 +59,11 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
 
                 # Look for Easy Apply button with multiple selectors
                 easy_apply_selectors = [
+                    "[data-sdui-screen*='JobDetails'] a[href*='/jobs/view/'][href*='/apply/']",
+                    "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label*='Easy Apply']",
+                    "main a[href*='/jobs/view/'][href*='/apply/'][href*='openSDUIApplyFlow=true']",
+                    "a[aria-label='Easy Apply to this job']",
+                    "a[aria-label*='Easy Apply'][href*='/apply/']",
                     "button:has-text('Easy Apply')",
                     "button[aria-label*='Easy Apply']",
                     ".jobs-apply-button",
@@ -68,9 +73,23 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
                 easy_apply_btn = None
                 for selector in easy_apply_selectors:
                     try:
-                        easy_apply_btn = page.query_selector(selector)
+                        for candidate in page.query_selector_all(selector):
+                            if not candidate.is_visible():
+                                continue
+                            href = (candidate.get_attribute("href") or "").lower()
+                            text = (
+                                (candidate.text_content() or "")
+                                + " "
+                                + (candidate.get_attribute("aria-label") or "")
+                                + " "
+                                + href
+                            ).lower()
+                            if "easy apply" not in text and "/apply/" not in href:
+                                continue
+                            easy_apply_btn = candidate
+                            log.info(f"Found Easy Apply control with selector: {selector}")
+                            break
                         if easy_apply_btn:
-                            log.info(f"Found Easy Apply button with selector: {selector}")
                             break
                     except:
                         continue

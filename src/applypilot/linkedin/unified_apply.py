@@ -4,6 +4,7 @@ import logging
 import re
 import time
 import unicodedata
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from playwright.sync_api import sync_playwright
 from applypilot import config
 
@@ -74,6 +75,244 @@ def _hold_setup_session_open(page, search_url: str) -> None:
         log.info("LinkedIn setup session interrupted by user")
 
 
+def _build_linkedin_search_url(config_dict: dict) -> str:
+    """Build the LinkedIn Easy Apply search URL from config."""
+    explicit_url = str(config_dict.get("search_url", "") or "").strip()
+    search_params = dict(config_dict.get("search_params") or {})
+    job_title = str(config_dict.get("job_title", "") or "").strip()
+    location = str(config_dict.get("location", "") or "").strip()
+    if explicit_url and config_dict.get("old_url") is True:
+        parsed = urlsplit(explicit_url)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        replaced_keywords = False
+        updated_query_items = []
+        for key, value in query_items:
+            if key == "keywords":
+                updated_query_items.append((key, job_title))
+                replaced_keywords = True
+            else:
+                updated_query_items.append((key, value))
+        if not replaced_keywords:
+            updated_query_items.append(("keywords", job_title))
+        return urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(updated_query_items, quote_via=quote),
+            parsed.fragment,
+        ))
+
+    stale_location_params = {
+        "currentJobId",
+        "distance",
+        "geoId",
+        "locationId",
+        "origin",
+        "refresh",
+        "spellCorrectionEnabled",
+    }
+
+    if explicit_url:
+        parsed = urlsplit(explicit_url)
+        path = parsed.path.rstrip("/") or "/jobs/search"
+        if not path.startswith("/jobs/search"):
+            path = "/jobs/search-results"
+        url_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        url_params = {
+            key: value
+            for key, value in url_params.items()
+            if key not in stale_location_params and key not in {"keywords", "location", "f_AL"}
+        }
+    else:
+        use_search_results = config_dict.get("use_search_results_url") is True
+        path = "/jobs/search-results" if use_search_results else "/jobs/search"
+        url_params = {}
+
+    params = url_params | {
+        "keywords": job_title,
+        "location": location,
+        "f_AL": "true",
+    }
+    # search_params is the intentional override surface. Stale fields copied in
+    # search_url are ignored so the config location remains authoritative.
+    params.update(search_params)
+    params.pop("currentJobId", None)
+
+    return f"https://www.linkedin.com{path}/?{urlencode(params)}"
+
+
+def _browser_launch_options(config_dict: dict) -> dict:
+    """Build Playwright launch options for the configured browser."""
+    options = {}
+
+    browser_name = str(config_dict.get("browser", "") or "").strip().lower()
+    if browser_name == "brave":
+        brave_path = config.get_brave_path()
+        log.info("Using Brave browser executable: %s", brave_path)
+        options["executable_path"] = brave_path
+    elif browser_name == "chrome":
+        chrome_path = config.get_chrome_path()
+        log.info("Using Chrome browser executable: %s", chrome_path)
+        options["executable_path"] = chrome_path
+
+    for config_key, option_key in (
+        ("locale", "locale"),
+        ("timezone_id", "timezone_id"),
+        ("user_agent", "user_agent"),
+        ("device_scale_factor", "device_scale_factor"),
+        ("geolocation", "geolocation"),
+        ("permissions", "permissions"),
+        ("viewport", "viewport"),
+    ):
+        value = config_dict.get(config_key)
+        if value not in (None, "", [], {}):
+            options[option_key] = value
+
+    headers = dict(config_dict.get("extra_http_headers") or {})
+    accept_language = config_dict.get("accept_language")
+    if accept_language:
+        headers["Accept-Language"] = accept_language
+    if headers:
+        options["extra_http_headers"] = headers
+
+    return options
+
+
+def _extract_job_id_from_componentkey(value: str | None) -> str:
+    """Extract a LinkedIn job id from newer SDUI job-card component keys."""
+    match = re.search(r"job-card-component-ref-(\d+)", value or "")
+    return match.group(1) if match else ""
+
+
+def _normalize_linkedin_job_url(url: str) -> str:
+    """Return an absolute LinkedIn URL for job links found in cards."""
+    if not url:
+        return ""
+    if url.startswith("/"):
+        return f"https://www.linkedin.com{url}"
+    return url
+
+
+def _find_linkedin_job_cards(page) -> list:
+    """Find job cards across LinkedIn's legacy and newer jobs layouts."""
+    selectors = [
+        "[componentkey^='job-card-component-ref-']",
+        "div.job-card-container",
+    ]
+    cards = []
+    seen = set()
+
+    for selector in selectors:
+        try:
+            for card in page.query_selector_all(selector):
+                component_key = card.get_attribute("componentkey") or ""
+                job_id = _extract_job_id_from_componentkey(component_key)
+                key = job_id or f"{selector}:{id(card)}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                cards.append(card)
+        except Exception:
+            continue
+
+    return cards
+
+
+def _extract_job_url_from_card(card) -> str:
+    """Extract the LinkedIn job detail URL from a legacy or SDUI job card."""
+    try:
+        job_link = card.query_selector("a[href*='/jobs/view/']")
+        if job_link:
+            url = _normalize_linkedin_job_url(job_link.get_attribute("href") or "")
+            if url:
+                return url
+    except Exception:
+        pass
+
+    try:
+        job_id = _extract_job_id_from_componentkey(card.get_attribute("componentkey"))
+        if job_id:
+            return f"https://www.linkedin.com/jobs/view/{job_id}/"
+    except Exception:
+        pass
+
+    try:
+        child = card.query_selector("[componentkey^='job-card-component-ref-']")
+        if child:
+            job_id = _extract_job_id_from_componentkey(child.get_attribute("componentkey"))
+            if job_id:
+                return f"https://www.linkedin.com/jobs/view/{job_id}/"
+    except Exception:
+        pass
+
+    return ""
+
+
+def _click_linkedin_job_card(card) -> None:
+    """Open a job from either a legacy anchor card or a newer clickable card."""
+    job_link = card.query_selector("a[href*='/jobs/view/']")
+    if job_link:
+        job_link.click()
+        return
+
+    card.click()
+
+
+def _find_easy_apply_control(page):
+    """Find the visible Easy Apply control in LinkedIn's job detail pane.
+
+    LinkedIn's newer SDUI layout renders Easy Apply as an anchor whose href
+    points at /jobs/view/<id>/apply/?openSDUIApplyFlow=true rather than as the
+    legacy button. Prefer that stable URL shape, then fall back to legacy
+    button selectors.
+    """
+    selectors = [
+        "[data-sdui-screen*='JobDetails'] a[href*='/jobs/view/'][href*='/apply/']",
+        "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label*='Easy Apply']",
+        "main a[href*='/jobs/view/'][href*='/apply/'][href*='openSDUIApplyFlow=true']",
+        "a[aria-label='Easy Apply to this job']",
+        "a[aria-label*='Easy Apply'][href*='/apply/']",
+        ".job-details-top-card button:has-text('Easy Apply')",
+        "[data-test-id='jobs-details'] button:has-text('Easy Apply')",
+        ".jobs-detail__main-content button:has-text('Easy Apply')",
+        ".jobs-apply-button",
+        "button[aria-label='Easy Apply job']",
+        "button[aria-label*='Easy Apply']",
+        "button:has-text('Easy Apply')",
+    ]
+
+    for selector in selectors:
+        try:
+            for elem in page.query_selector_all(selector):
+                if not elem.is_visible():
+                    continue
+                try:
+                    if not elem.is_enabled():
+                        continue
+                except Exception:
+                    pass
+
+                text = (elem.text_content() or "").strip().lower()
+                aria = (elem.get_attribute("aria-label") or "").strip().lower()
+                href = (elem.get_attribute("href") or "").strip().lower()
+                combined = f"{text} {aria} {href}"
+
+                if "easy apply" not in combined and "/apply/" not in href:
+                    continue
+                if "search-results" in href and "/jobs/view/" not in href:
+                    continue
+
+                bounding_box = elem.bounding_box()
+                if not bounding_box:
+                    continue
+
+                return elem
+        except Exception:
+            continue
+
+    return None
+
+
 def _normalize_location_text(value: str) -> str:
     """Normalize location labels for resilient text matching."""
     normalized = unicodedata.normalize("NFKD", value or "")
@@ -87,9 +326,33 @@ def _normalize_company_name(value: str) -> str:
     return _normalize_location_text(value)
 
 
+def _is_blacklisted_company(company_name: str, blacklisted_companies: tuple[str, ...]) -> bool:
+    """Return True when the company matches any configured blacklist entry."""
+    normalized_company = _normalize_company_name(company_name)
+    if not normalized_company:
+        return False
+    return any(
+        blocked == normalized_company
+        or blocked in normalized_company
+        or normalized_company in blocked
+        for blocked in blacklisted_companies
+    )
+
+
+def _company_name_from_aria_label(value: str | None) -> str:
+    """Extract the company name from labels like 'Company, Reonic.'."""
+    label = (value or "").strip()
+    match = re.search(r"\bcompany\s*,\s*(.+?)[\s.]*$", label, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
 def _extract_company_name(card, page) -> str:
     """Best-effort company extraction from the job card or detail panel."""
     selectors = [
+        "[aria-label^='Company,']",
+        "[aria-label*='Company,']",
+        "[componentkey^='auto-binding-'][aria-label*='Company,']",
+        "[data-sdui-screen*='JobDetails'] [aria-label*='Company,']",
         ".artdeco-entity-lockup__subtitle span[aria-hidden='true']",
         ".job-card-container__company-name",
         ".job-card-container__primary-description",
@@ -105,6 +368,9 @@ def _extract_company_name(card, page) -> str:
                 elem = scope.query_selector(selector)
                 if not elem:
                     continue
+                company_from_aria = _company_name_from_aria_label(elem.get_attribute("aria-label"))
+                if company_from_aria:
+                    return company_from_aria
                 text = (elem.text_content() or "").strip()
                 if text:
                     return text
@@ -112,6 +378,333 @@ def _extract_company_name(card, page) -> str:
                 continue
 
     return ""
+
+
+def _active_linkedin_search_keyword(page) -> str:
+    """Read the visible LinkedIn semantic search input value."""
+    selectors = [
+        "input[data-testid='typeahead-input'][placeholder='Describe the job you want']",
+        "input[componentkey='semanticSearchBox']",
+        "input[aria-autocomplete='list'][placeholder*='job']",
+    ]
+    for selector in selectors:
+        try:
+            elem = page.query_selector(selector)
+            if not elem:
+                continue
+            value = (elem.input_value() or elem.get_attribute("value") or "").strip()
+            if value:
+                return value
+        except Exception:
+            continue
+    return ""
+
+
+def _active_linkedin_search_location(page) -> str:
+    """Read the visible LinkedIn location label in the new jobs layout."""
+    try:
+        location_text = page.evaluate(
+            """() => {
+                const marker = document.querySelector('svg#location-marker-small');
+                const container = marker && marker.closest('div');
+                const text = container && container.querySelector('p');
+                return text ? (text.textContent || '').trim() : '';
+            }"""
+        )
+        if location_text:
+            return str(location_text).strip()
+    except Exception:
+        pass
+
+    selectors = [
+        "button[aria-label*='Location']",
+        "[aria-label*='Location'] p",
+    ]
+    for selector in selectors:
+        try:
+            elem = page.query_selector(selector)
+            if not elem:
+                continue
+            text = (elem.text_content() or "").strip()
+            if text:
+                return text
+        except Exception:
+            continue
+    return ""
+
+
+def _log_active_linkedin_search_state(page, job_title: str, location: str) -> None:
+    """Log whether LinkedIn rendered the configured search terms."""
+    active_keyword = _active_linkedin_search_keyword(page)
+    active_location = _active_linkedin_search_location(page)
+
+    if active_keyword and _normalize_location_text(job_title) not in _normalize_location_text(active_keyword):
+        log.warning(
+            "LinkedIn search input shows '%s', expected job_title '%s'",
+            active_keyword,
+            job_title,
+        )
+    elif active_keyword:
+        log.info("LinkedIn search input: %s", active_keyword)
+
+    if active_location and _normalize_location_text(active_location) != _normalize_location_text(location):
+        log.warning(
+            "LinkedIn location shows '%s', expected config location '%s'",
+            active_location,
+            location,
+        )
+    elif active_location:
+        log.info("LinkedIn location: %s", active_location)
+
+
+def _dismiss_recruiter_upsell_if_present(page) -> bool:
+    """Close LinkedIn's recruiter upsell overlay if it blocks the jobs page."""
+    try:
+        result = page.evaluate(
+            """() => {
+                const normalize = (value) => (value || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                const text = normalize(document.body && document.body.innerText);
+                if (!text.includes("hire top talent faster")) return { ok: false };
+
+                const candidates = [
+                    ...document.querySelectorAll("button[aria-label*='Dismiss'], button[aria-label*='Close']"),
+                    ...document.querySelectorAll("button")
+                ];
+                const closeButton = candidates.find((button) => {
+                    const label = normalize(button.getAttribute("aria-label"));
+                    const buttonText = normalize(button.textContent);
+                    const rect = button.getBoundingClientRect();
+                    const style = window.getComputedStyle(button);
+                    if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none") {
+                        return false;
+                    }
+                    return label.includes("dismiss")
+                        || label.includes("close")
+                        || buttonText === "x"
+                        || button.querySelector("svg#close-medium, svg#close-small");
+                });
+                if (!closeButton) return { ok: false, reason: "close_not_found" };
+                closeButton.click();
+                return { ok: true };
+            }"""
+        )
+        if result.get("ok"):
+            log.info("Dismissed LinkedIn recruiter upsell overlay")
+            page.wait_for_timeout(500)
+            return True
+    except Exception as exc:
+        log.debug("Could not dismiss LinkedIn recruiter upsell overlay: %s", exc)
+    return False
+
+
+def _ensure_active_linkedin_search_keyword(page, job_title: str, *, force_dropdown: bool = False) -> bool:
+    """Set the visible LinkedIn search keyword when an old copied URL was used."""
+    target = (job_title or "").strip()
+    if not target:
+        return False
+
+    active_keyword = _active_linkedin_search_keyword(page)
+    if not force_dropdown and active_keyword and _normalize_location_text(target) in _normalize_location_text(active_keyword):
+        return True
+
+    selectors = [
+        "input[data-testid='typeahead-input'][placeholder='Describe the job you want']",
+        "input[componentkey='semanticSearchBox']",
+        "input[aria-autocomplete='list'][placeholder*='job']",
+    ]
+    for selector in selectors:
+        try:
+            field = page.locator(selector).first
+            field.wait_for(state="visible", timeout=3000)
+            field.click()
+            if force_dropdown:
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                page.keyboard.type(target, delay=20)
+            else:
+                field.fill(target)
+            page.wait_for_timeout(500)
+
+            selected = page.evaluate(
+                """() => {
+                    const anchors = [...document.querySelectorAll("a[href*='/jobs/search-results/'][href*='keywords=']")];
+                    const option = anchors.find((anchor) => {
+                        if (anchor.closest("[componentkey='semanticSearchBoxLocationList']")) return false;
+                        const rect = anchor.getBoundingClientRect();
+                        const style = window.getComputedStyle(anchor);
+                        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+                    });
+                    if (!option) return { ok: false };
+                    const text = (option.textContent || "").trim();
+                    option.click();
+                    return { ok: true, text };
+                }"""
+            )
+            if selected.get("ok"):
+                log.info("Selecting top LinkedIn keyword result: %s", selected.get("text") or "<unknown>")
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception as exc:
+                    log.debug("LinkedIn keyword selection did not trigger a normal page load: %s", exc)
+                page.wait_for_timeout(1500)
+                return True
+
+            updated_keyword = _active_linkedin_search_keyword(page)
+            if _normalize_location_text(target) in _normalize_location_text(updated_keyword):
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _ensure_easy_apply_search_filter(page) -> bool:
+    """Click the jobs search Easy Apply filter pill when it is visible and unchecked."""
+    try:
+        result = page.evaluate(
+            """() => {
+                const normalize = (value) => (value || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+                };
+
+                const candidates = [
+                    ...document.querySelectorAll("[componentkey*='APPLY_WITH_LINKEDIN_Easy Apply']"),
+                    ...document.querySelectorAll("[aria-label='Filter by Easy Apply']"),
+                    ...[...document.querySelectorAll("label")].filter((label) => normalize(label.textContent) === "easy apply"),
+                ];
+
+                for (const candidate of candidates) {
+                    const pill = candidate.closest("[role='radio'], [role='button']") || candidate;
+                    if (!visible(pill)) continue;
+                    const input = pill.querySelector("input[type='checkbox']") || candidate.querySelector?.("input[type='checkbox']");
+                    if (pill.getAttribute("aria-checked") === "true" || (input && input.checked)) {
+                        return { ok: true, already: true };
+                    }
+                    const clickable = pill.querySelector("label") || pill;
+                    clickable.scrollIntoView({ block: "center", inline: "center" });
+                    clickable.click();
+                    return { ok: true, clicked: true };
+                }
+
+                return { ok: false };
+            }"""
+        )
+        if result.get("clicked"):
+            log.info("Clicked LinkedIn Easy Apply search filter")
+            page.wait_for_timeout(1500)
+        return bool(result.get("ok"))
+    except Exception as exc:
+        log.debug("Could not click LinkedIn Easy Apply search filter: %s", exc)
+        return False
+
+
+def _fill_location_contenteditable(page, location: str) -> bool:
+    """Fill LinkedIn's newer contenteditable location popover."""
+    editor_selector = (
+        "[componentkey='LocationTypeahead_TextEditor'][contenteditable='true'], "
+        "[contenteditable='true'][aria-label='Location']"
+    )
+
+    try:
+        editor = page.locator(editor_selector).first
+        editor.wait_for(state="visible", timeout=3000)
+        editor.click()
+        try:
+            editor.fill(location, timeout=1000)
+        except Exception:
+            page.keyboard.press("Control+A")
+            page.keyboard.type(location, delay=20)
+        page.wait_for_timeout(700)
+
+        top_result = page.locator(
+            "[componentkey='semanticSearchBoxLocationList'] a[href*='/jobs/search-results/']"
+        ).first
+        try:
+            top_result.wait_for(state="visible", timeout=5000)
+            result_text = (top_result.text_content(timeout=500) or "").strip()
+            log.info("Selecting top LinkedIn location result: %s", result_text or "<unknown>")
+            top_result.click(timeout=2000)
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+            page.wait_for_timeout(1500)
+            return True
+        except Exception as exc:
+            log.debug("Could not select top LinkedIn location result: %s", exc)
+
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(1500)
+        return True
+    except Exception as exc:
+        log.debug("Could not fill LinkedIn contenteditable location popover: %s", exc)
+        return False
+
+
+def _ensure_active_linkedin_search_location(page, location: str, *, contenteditable: bool = False) -> bool:
+    """Set the visible LinkedIn search location when an old copied URL was used."""
+    target = (location or "").strip()
+    if not target:
+        return False
+
+    active_location = _active_linkedin_search_location(page)
+    if active_location and _normalize_location_text(active_location) == _normalize_location_text(target):
+        return True
+
+    try:
+        clicked = page.evaluate(
+            """() => {
+                const marker = document.querySelector('svg#location-marker-small');
+                let clickable = marker && marker.closest('[role="button"], button, a');
+                if (!clickable && marker) {
+                    let node = marker.parentElement;
+                    while (node && node !== document.body) {
+                        if (node.querySelector('svg#location-marker-small') && node.querySelector('p')) {
+                            clickable = node;
+                            break;
+                        }
+                        node = node.parentElement;
+                    }
+                }
+                if (!clickable) return false;
+                clickable.scrollIntoView({ block: 'center', inline: 'center' });
+                clickable.click();
+                return true;
+            }"""
+        )
+        if not clicked:
+            return False
+
+        page.wait_for_timeout(500)
+        if contenteditable and _fill_location_contenteditable(page, target):
+            updated_location = _active_linkedin_search_location(page)
+            if not updated_location or _normalize_location_text(updated_location) == _normalize_location_text(target):
+                return True
+
+        inputs = [
+            "input[aria-label*='Location']",
+            "input[placeholder*='Location']",
+            "input[placeholder*='location']",
+            "input[role='combobox']",
+            "input[type='text']",
+        ]
+        for selector in inputs:
+            try:
+                field = page.locator(selector).last
+                field.wait_for(state="visible", timeout=2000)
+                field.fill(target)
+                page.wait_for_timeout(300)
+                page.keyboard.press("Enter")
+                page.wait_for_load_state("domcontentloaded", timeout=15000)
+                page.wait_for_timeout(2000)
+                return _normalize_location_text(_active_linkedin_search_location(page)) == _normalize_location_text(target)
+            except Exception:
+                continue
+    except Exception as exc:
+        log.warning("Failed to update LinkedIn search location to '%s': %s", target, exc)
+
+    return False
 
 
 def _apply_exact_location_filter(page, location: str) -> bool:
@@ -273,11 +866,11 @@ def search_and_apply(
     resume_path = config_dict.get("resume_path", "")
     company_blacklist = config_dict.get("company_blacklist", [])
     raw_delay = config_dict.get("delay", 0)
-    blacklisted_companies = {
+    blacklisted_companies = tuple(
         _normalize_company_name(company)
         for company in company_blacklist
         if isinstance(company, str) and _normalize_company_name(company)
-    }
+    )
 
     try:
         apply_delay_seconds = max(0.0, float(raw_delay))
@@ -300,11 +893,12 @@ def search_and_apply(
             browser = p.chromium.launch_persistent_context(
                 str(profile_dir),
                 headless=headless,
+                **_browser_launch_options(config_dict),
             )
             page = browser.new_page()
 
             # Navigate to LinkedIn jobs search
-            search_url = f"https://www.linkedin.com/jobs/search/?keywords={job_title}&location={location}&f_AL=true"
+            search_url = _build_linkedin_search_url(config_dict)
             if setup:
                 _hold_setup_session_open(page, search_url)
                 return {"applied": 0, "skipped": 0, "failed": 0}
@@ -312,16 +906,42 @@ def search_and_apply(
             log.info(f"Navigating to {search_url}")
             page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
+            _log_active_linkedin_search_state(page, job_title, location)
+            use_old_url = config_dict.get("old_url") is True
+            if use_old_url and not _ensure_active_linkedin_search_location(
+                page,
+                location,
+                contenteditable=True,
+            ):
+                active_location = _active_linkedin_search_location(page)
+                if active_location:
+                    log.warning(
+                        "LinkedIn location remained '%s' after correction attempt; expected '%s'",
+                        active_location,
+                        location,
+                    )
+            if use_old_url:
+                _ensure_easy_apply_search_filter(page)
+            _log_active_linkedin_search_state(page, job_title, location)
 
             if exact_location:
                 _apply_exact_location_filter(page, location)
+                if use_old_url:
+                    _ensure_active_linkedin_search_location(page, location, contenteditable=True)
+                _log_active_linkedin_search_state(page, job_title, location)
+
+            if _dismiss_recruiter_upsell_if_present(page) and use_old_url:
+                _ensure_easy_apply_search_filter(page)
 
             # Process jobs on current page
             while applied < max_applications:
+                if _dismiss_recruiter_upsell_if_present(page) and use_old_url:
+                    _ensure_easy_apply_search_filter(page)
                 log.info(f"Looking for jobs (applied: {applied}/{max_applications})")
 
-                # Find job cards
-                job_cards = page.query_selector_all("div.job-card-container")
+                # Find job cards. LinkedIn has both legacy card containers and
+                # newer SDUI button-like cards keyed as job-card-component-ref-*.
+                job_cards = _find_linkedin_job_cards(page)
                 log.info(f"Found {len(job_cards)} job cards on page")
 
                 if not job_cards:
@@ -334,13 +954,9 @@ def search_and_apply(
 
                     try:
                         # Get job URL
-                        job_link = card.query_selector("a[href*='/jobs/view/']")
-                        if not job_link:
-                            log.debug(f"Card {idx}: No job link found")
-                            continue
-
-                        job_url = job_link.get_attribute("href") or ""
+                        job_url = _extract_job_url_from_card(card)
                         if not job_url:
+                            log.debug(f"Card {idx}: No job URL found")
                             continue
 
                         # Check title if keyword filter is active
@@ -360,12 +976,11 @@ def search_and_apply(
                         log.info(f"Card {idx}: Found job {job_url}")
 
                         # Click on job to open it
-                        job_link.click()
+                        _click_linkedin_job_card(card)
                         page.wait_for_timeout(3000)
 
                         company_name = _extract_company_name(card, page)
-                        normalized_company = _normalize_company_name(company_name)
-                        if normalized_company and normalized_company in blacklisted_companies:
+                        if _is_blacklisted_company(company_name, blacklisted_companies):
                             log.info(
                                 "Card %s: Skipping blacklisted company '%s'",
                                 idx,
@@ -374,41 +989,17 @@ def search_and_apply(
                             skipped += 1
                             continue
 
-                        # Look for Easy Apply button in the job detail panel (not the filter)
-                        # Try multiple selectors to find the button on the job detail, not in the sidebar
-                        easy_apply_btn = None
-                        selectors = [
-                            ".job-details-top-card button:has-text('Easy Apply')",
-                            "[data-test-id='jobs-details'] button:has-text('Easy Apply')",
-                            ".jobs-detail__main-content button:has-text('Easy Apply')",
-                            ".jobs-apply-button",
-                            "button[aria-label='Easy Apply job']",
-                            # Last resort: any Easy Apply button that's visible and enabled
-                            "button:has-text('Easy Apply')",
-                        ]
-
-                        for selector in selectors:
-                            try:
-                                btns = page.query_selector_all(selector)
-                                # Filter to buttons that are actually visible (not in sidebar)
-                                for btn in btns:
-                                    # Check if button is in the main content area, not sidebar
-                                    bounding_box = btn.bounding_box()
-                                    if bounding_box and bounding_box['x'] > 300:  # Job detail is typically to the right
-                                        easy_apply_btn = btn
-                                        log.info(f"Card {idx}: Found Easy Apply button with selector: {selector}")
-                                        break
-                                if easy_apply_btn:
-                                    break
-                            except:
-                                continue
+                        # Look for Easy Apply in the job detail panel. Newer
+                        # LinkedIn SDUI pages render this as an <a> with an
+                        # /apply/ href rather than a legacy <button>.
+                        easy_apply_btn = _find_easy_apply_control(page)
 
                         if not easy_apply_btn:
-                            log.info(f"Card {idx}: No Easy Apply button found in job detail")
+                            log.info(f"Card {idx}: No Easy Apply control found in job detail")
                             skipped += 1
                             continue
 
-                        log.info(f"Card {idx}: Clicking Easy Apply button")
+                        log.info(f"Card {idx}: Clicking Easy Apply control")
                         easy_apply_btn.click()
                         page.wait_for_timeout(2000)
 
@@ -448,7 +1039,12 @@ def search_and_apply(
 
                 # Try to go to next page if we haven't reached max
                 if applied < max_applications:
-                    next_btn = page.query_selector("button[aria-label*='View next page'], button:has-text('Next')")
+                    next_btn = page.query_selector(
+                        "button[data-testid='pagination-controls-next-button-visible'], "
+                        "button[aria-label*='View next page'], "
+                        "button[aria-label*='next'], "
+                        "button:has-text('Next')"
+                    )
                     if next_btn and next_btn.is_enabled():
                         log.info("Going to next page")
                         next_btn.click()

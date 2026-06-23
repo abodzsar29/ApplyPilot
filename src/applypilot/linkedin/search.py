@@ -3,14 +3,177 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from playwright.sync_api import sync_playwright
 
 from applypilot import config as app_config
 
 log = logging.getLogger(__name__)
+
+
+def _extract_job_id_from_componentkey(value: str | None) -> str:
+    match = re.search(r"job-card-component-ref-(\d+)", value or "")
+    return match.group(1) if match else ""
+
+
+def _normalize_linkedin_job_url(url: str) -> str:
+    if not url:
+        return ""
+    if url.startswith("/"):
+        return f"https://www.linkedin.com{url}"
+    return url
+
+
+def _extract_job_url_from_card(card) -> str:
+    url = _normalize_linkedin_job_url(card.get_attribute("href") or "")
+    if url and "/jobs/" in url:
+        return url
+
+    link = card.query_selector("a[href*='/jobs/view/']")
+    if link:
+        url = _normalize_linkedin_job_url(link.get_attribute("href") or "")
+        if url:
+            return url
+
+    job_id = _extract_job_id_from_componentkey(card.get_attribute("componentkey"))
+    if job_id:
+        return f"https://www.linkedin.com/jobs/view/{job_id}/"
+
+    child = card.query_selector("[componentkey^='job-card-component-ref-']")
+    if child:
+        job_id = _extract_job_id_from_componentkey(child.get_attribute("componentkey"))
+        if job_id:
+            return f"https://www.linkedin.com/jobs/view/{job_id}/"
+
+    return ""
+
+
+def _find_linkedin_job_cards(page) -> list:
+    selectors = [
+        "[componentkey^='job-card-component-ref-']",
+        "ul.jobs-search__results-list li a.base-card__full-link",
+        "a.base-card__full-link",
+        "div.job-card-container",
+        "div[data-job-id] a",
+    ]
+    cards = []
+    seen = set()
+
+    for selector in selectors:
+        try:
+            for card in page.query_selector_all(selector):
+                url = _extract_job_url_from_card(card)
+                component_key = card.get_attribute("componentkey") or ""
+                job_id = _extract_job_id_from_componentkey(component_key)
+                key = job_id or url or f"{selector}:{id(card)}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                cards.append(card)
+        except Exception as e:
+            log.debug(f"Selector '{selector}' not found: {e}")
+
+    return cards
+
+
+def _browser_launch_options(config: dict) -> dict:
+    options = {}
+
+    browser_name = str(config.get("browser", "") or "").strip().lower()
+    if browser_name == "brave":
+        brave_path = app_config.get_brave_path()
+        log.info("Using Brave browser executable: %s", brave_path)
+        options["executable_path"] = brave_path
+    elif browser_name == "chrome":
+        chrome_path = app_config.get_chrome_path()
+        log.info("Using Chrome browser executable: %s", chrome_path)
+        options["executable_path"] = chrome_path
+
+    for config_key, option_key in (
+        ("locale", "locale"),
+        ("timezone_id", "timezone_id"),
+        ("user_agent", "user_agent"),
+        ("device_scale_factor", "device_scale_factor"),
+        ("geolocation", "geolocation"),
+        ("permissions", "permissions"),
+        ("viewport", "viewport"),
+    ):
+        value = config.get(config_key)
+        if value not in (None, "", [], {}):
+            options[option_key] = value
+
+    headers = dict(config.get("extra_http_headers") or {})
+    accept_language = config.get("accept_language")
+    if accept_language:
+        headers["Accept-Language"] = accept_language
+    if headers:
+        options["extra_http_headers"] = headers
+
+    return options
+
+
+def _build_linkedin_search_url(config: dict) -> str:
+    explicit_url = str(config.get("search_url", "") or "").strip()
+    job_title = str(config.get("job_title", "") or "").strip()
+    location = str(config.get("location", "") or "").strip()
+    if explicit_url and config.get("old_url") is True:
+        parsed = urlsplit(explicit_url)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        replaced_keywords = False
+        updated_query_items = []
+        for key, value in query_items:
+            if key == "keywords":
+                updated_query_items.append((key, job_title))
+                replaced_keywords = True
+            else:
+                updated_query_items.append((key, value))
+        if not replaced_keywords:
+            updated_query_items.append(("keywords", job_title))
+        return urlunsplit((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            urlencode(updated_query_items, quote_via=quote),
+            parsed.fragment,
+        ))
+
+    stale_location_params = {
+        "currentJobId",
+        "distance",
+        "geoId",
+        "locationId",
+        "origin",
+        "refresh",
+        "spellCorrectionEnabled",
+    }
+
+    if explicit_url:
+        parsed = urlsplit(explicit_url)
+        path = parsed.path.rstrip("/") or "/jobs/search"
+        if not path.startswith("/jobs/search"):
+            path = "/jobs/search-results"
+        url_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        url_params = {
+            key: value
+            for key, value in url_params.items()
+            if key not in stale_location_params and key not in {"keywords", "location", "f_AL"}
+        }
+    else:
+        use_search_results = config.get("use_search_results_url") is True
+        path = "/jobs/search-results" if use_search_results else "/jobs/search"
+        url_params = {}
+
+    params = url_params | {
+        "keywords": job_title,
+        "location": location,
+        "f_AL": "true",
+    }
+    params.update(config.get("search_params") or {})
+    params.pop("currentJobId", None)
+    return f"https://www.linkedin.com{path}/?{urlencode(params)}"
 
 
 def get_linkedin_jobs(config: dict, headless: bool = False) -> list[str]:
@@ -38,12 +201,7 @@ def get_linkedin_jobs(config: dict, headless: bool = False) -> list[str]:
         return []
 
     # Build search URL with Easy Apply filter (f_AL=true)
-    search_url = (
-        f"https://www.linkedin.com/jobs/search/"
-        f"?keywords={quote(job_title)}"
-        f"&location={quote(location)}"
-        f"&f_AL=true"  # Easy Apply filter
-    )
+    search_url = _build_linkedin_search_url(config)
 
     log.info(f"Searching LinkedIn: {job_title} in {location}")
     log.info(f"Search URL: {search_url}")
@@ -62,6 +220,7 @@ def get_linkedin_jobs(config: dict, headless: bool = False) -> list[str]:
         browser = p.chromium.launch_persistent_context(
             str(profile_dir),
             headless=headless,
+            **_browser_launch_options(config),
         )
         page = browser.new_page()
 
@@ -72,25 +231,8 @@ def get_linkedin_jobs(config: dict, headless: bool = False) -> list[str]:
             # Wait extra time for LinkedIn to render the job list
             page.wait_for_timeout(3000)
 
-            # Try to wait for job cards with fallback selectors
-            job_cards = []
-            selectors = [
-                "ul.jobs-search__results-list li a.base-card__full-link",
-                "a.base-card__full-link",
-                "div.job-card-container a",
-                "div[data-job-id] a",
-            ]
-
-            for selector in selectors:
-                try:
-                    page.wait_for_selector(selector, timeout=5000)
-                    job_cards = page.query_selector_all(selector)
-                    if job_cards:
-                        log.info(f"Found {len(job_cards)} job cards using selector: {selector}")
-                        break
-                except Exception as e:
-                    log.debug(f"Selector '{selector}' not found: {e}")
-                    continue
+            job_cards = _find_linkedin_job_cards(page)
+            log.info(f"Found {len(job_cards)} job cards")
 
             # Paginate through all job results
             page_num = 1
@@ -104,16 +246,16 @@ def get_linkedin_jobs(config: dict, headless: bool = False) -> list[str]:
                         page.evaluate("window.scrollBy(0, window.innerHeight)")
                         page.wait_for_timeout(1000)
 
-                    # Try the most generic selector
-                    job_cards = page.query_selector_all("a.base-card__full-link")
+                    # Try the supported selectors again after scrolling.
+                    job_cards = _find_linkedin_job_cards(page)
                     log.info(f"Found {len(job_cards)} cards after scrolling")
 
                 log.info(f"Processing {len(job_cards)} job cards on page {page_num}...")
                 for idx, card in enumerate(job_cards):
                     try:
-                        url = card.get_attribute("href")
+                        url = _extract_job_url_from_card(card)
                         if not url:
-                            log.info(f"Card {idx}: No href attribute")
+                            log.info(f"Card {idx}: No job URL")
                             continue
 
                         # Ensure it's a LinkedIn jobs URL (more lenient check)
@@ -170,11 +312,8 @@ def get_linkedin_jobs(config: dict, headless: bool = False) -> list[str]:
                         next_buttons[0].click()
                         page.wait_for_timeout(2000)  # Wait for next page to load
                         job_cards = []
-                        for selector in ["div.job-card-container a", "a.base-card__full-link"]:
-                            job_cards = page.query_selector_all(selector)
-                            if job_cards:
-                                log.info(f"Found {len(job_cards)} cards on next page using selector: {selector}")
-                                break
+                        job_cards = _find_linkedin_job_cards(page)
+                        log.info(f"Found {len(job_cards)} cards on next page")
                         page_num += 1
                     except Exception as e:
                         log.info(f"Could not navigate to next page: {e}")

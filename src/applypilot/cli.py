@@ -313,10 +313,15 @@ def linkedin_apply(
         console.print(f"[red]Resume not found:[/red] {resume_path}")
         raise typer.Exit(code=1)
 
+    from applypilot.linkedin.unified_apply import _build_linkedin_search_url
+
+    computed_search_url = _build_linkedin_search_url(config)
+
     console.print("\n[bold blue]LinkedIn Easy Apply[/bold blue]")
-    console.print(f"  Config:  {config_path}")
+    console.print(f"  Config:  {config_file.resolve()}")
     console.print(f"  Title:   {config.get('job_title', 'N/A')}")
     console.print(f"  Location: {config.get('location', 'N/A')}")
+    console.print(f"  URL:     {computed_search_url}")
     console.print(f"  Keyword: {config.get('title_keyword', 'N/A')}")
     console.print(f"  Max:     {config.get('max_applications', 'N/A')}")
     console.print(f"  Delay:   {config.get('delay', 0)}s")
