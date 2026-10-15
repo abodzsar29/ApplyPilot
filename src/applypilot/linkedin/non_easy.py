@@ -237,7 +237,10 @@ def _is_easy_apply(page) -> bool:
     selectors = [
         "[data-sdui-screen*='JobDetails'] a[href*='/jobs/view/'][href*='/apply/']",
         "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label*='Easy Apply']",
+        "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label='LinkedIn Apply to this job']",
         "main a[href*='/jobs/view/'][href*='/apply/'][href*='openSDUIApplyFlow=true']",
+        "a[aria-label='LinkedIn Apply to this job'][href*='currentJobId=']",
+        "a[aria-label='LinkedIn Apply to this job']",
         "a[aria-label='Easy Apply to this job']",
         "a[aria-label*='Easy Apply'][href*='/apply/']",
         ".job-details-top-card button:has-text('Easy Apply')",
@@ -259,7 +262,7 @@ def _is_easy_apply(page) -> bool:
                     + " "
                     + (elem.get_attribute("href") or "")
                 ).lower()
-                if "easy apply" in text or "/apply/" in text:
+                if "easy apply" in text or "/apply/" in text or "linkedin apply to this job" in text:
                     return True
         except Exception:
             continue

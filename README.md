@@ -130,6 +130,54 @@ API keys and runtime config: `NON_EASY_PROVIDER`, `NON_EASY_MODEL`, `OPENROUTER_
 ### `config/linkedin_apply.json`
 LinkedIn Easy Apply config. Supports `company_blacklist`, a list of company names to skip before the bot clicks `Easy Apply`. Set `browser` to `chrome` or `brave` to launch that installed browser instead of the default Playwright Chromium browser. Optional browser-context settings include `locale`, `timezone_id`, `geolocation`, `permissions`, `user_agent`, `viewport`, `device_scale_factor`, `accept_language`, and `extra_http_headers`. Set `search_url` only to reuse a LinkedIn jobs route; the generated `job_title`, `location`, and Easy Apply filter still come from config so stale copied URLs cannot override them. Set `"old_url": true` to preserve the copied `search_url` parameters while replacing its `keywords` value with `job_title` from config. Set `use_search_results_url` to `true` to open LinkedIn's `/jobs/search-results/` route instead of `/jobs/search/`. Add intentional extra query values with `search_params`, for example a fresh `geoId` or `distance`. For phone dropdowns, set `profile.phone_country` to the country name LinkedIn shows, for example `United Kingdom`.
 
+### Scrape LinkedIn job descriptions
+
+```bash
+applypilot linkedin-scrape --config config/linkedin_apply.json
+applypilot linkedin-scrape -c config/linkedin_apply.json --headless
+applypilot linkedin-scrape -c config/linkedin_apply.json --setup  # Manual login, then Ctrl+C
+```
+
+Uses the same saved LinkedIn browser session and browser settings as `linkedin-apply`.
+Close any other command using that session before starting. `--exactlocation` is also supported.
+No resume, application answers, or LLM credentials are needed. A minimal config is:
+
+```json
+{
+  "job_title": "Data AI Engineer",
+  "location": "Berlin, Germany",
+  "only_english": true,
+  "max_applications": 20
+}
+```
+
+Searches with `job_title`, includes both Easy Apply and external jobs, and requires all
+title words to appear as whole words in the displayed title (case insensitive, any order).
+For example, `Data AI Engineer` matches `Data & AI Engineer (all genders)`, and `AI` does
+not match `Retail`. The separate application setting `title_keyword` is not used.
+`only_english` uses the existing English/German description heuristic; when enabled,
+German and unclear descriptions are skipped. `max_applications` limits **saved jobs**.
+Failed extractions and jobs rejected by the title or language filter do not consume the
+limit. For example, with a limit of 5, the scraper keeps searching until it saves 5 jobs
+or exhausts the available results, even if this requires more than 5 detail-page attempts.
+Duplicate jobs and results whose titles do not match are skipped before opening a detail page.
+The spelling `max_application` is also accepted; conflicting values are rejected.
+The default limit is 20, and zero writes an empty JSON array without opening a browser.
+
+Results are a JSON array in `scrapedjobs/<job_title>_<YYYY-MM-DD_HH-MM-SS-microseconds>.json`
+relative to the current directory. Filename-unsafe characters are replaced with `_`;
+timestamps keep separate runs from overwriting one another. Each entry includes the job
+ID, title, URL, company and company URL, location, posting/applicant text, workplace and
+employment types, badges, application URL, full description, company description/details,
+detected language, and scrape timestamp. `metadata` and `job_card_text` preserve additional
+card information; fields unavailable in the page are empty strings/lists.
+
+The scraper follows scrolling and pagination until it reaches the limit or exhausts
+available results. LinkedIn may expose fewer matching jobs than requested. Results are
+saved after each accepted job, including before interruption. Progress logs report attempts,
+saves, failures, and why a job was skipped. A run with extraction failures and no saved jobs
+exits with an error. `delay` controls the pause before each detail request.
+
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
 - `config/sites.yaml` - Direct career sites (30+), blocked sites, base URLs, manual ATS domains

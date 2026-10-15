@@ -61,7 +61,10 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
                 easy_apply_selectors = [
                     "[data-sdui-screen*='JobDetails'] a[href*='/jobs/view/'][href*='/apply/']",
                     "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label*='Easy Apply']",
+                    "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label='LinkedIn Apply to this job']",
                     "main a[href*='/jobs/view/'][href*='/apply/'][href*='openSDUIApplyFlow=true']",
+                    "a[aria-label='LinkedIn Apply to this job'][href*='currentJobId=']",
+                    "a[aria-label='LinkedIn Apply to this job']",
                     "a[aria-label='Easy Apply to this job']",
                     "a[aria-label*='Easy Apply'][href*='/apply/']",
                     "button:has-text('Easy Apply')",
@@ -84,7 +87,8 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
                                 + " "
                                 + href
                             ).lower()
-                            if "easy apply" not in text and "/apply/" not in href:
+                            aria = (candidate.get_attribute("aria-label") or "").strip().lower()
+                            if "easy apply" not in text and "/apply/" not in href and "linkedin apply to this job" not in aria:
                                 continue
                             easy_apply_btn = candidate
                             log.info(f"Found Easy Apply control with selector: {selector}")

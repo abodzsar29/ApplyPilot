@@ -1,9 +1,11 @@
 """Unified LinkedIn search and apply in a single browser session."""
 
 import logging
+import random as random_module
 import re
 import time
 import unicodedata
+from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 from playwright.sync_api import sync_playwright
 from applypilot import config
@@ -18,6 +20,8 @@ _PHONE_COUNTRY_LABEL_TOKENS = (
     "code pays",
     "indicatif",
     "landesvorwahl",
+    "prefisso telefonico",
+    "prefisso",
 )
 
 _PHONE_NUMBER_LABEL_TOKENS = (
@@ -26,9 +30,12 @@ _PHONE_NUMBER_LABEL_TOKENS = (
     "contact number",
     "telephone",
     "telefon",
+    "telefono",
+    "telefonico",
     "telefonnummer",
     "handynummer",
     "mobilnummer",
+    "cellulare",
 )
 
 _FOLLOW_COMPANY_LABEL_TOKENS = (
@@ -47,6 +54,9 @@ _SELECT_PLACEHOLDER_TEXTS = {
     "sélectionnez une option",
     "option auswahlen",
     "option auswählen",
+    "seleziona un'opzione",
+    "seleziona un’opzione",
+    "seleziona",
 }
 
 _NUMERIC_RANGE_VALIDATION_TEXTS = (
@@ -56,6 +66,210 @@ _NUMERIC_RANGE_VALIDATION_TEXTS = (
 _UPLOAD_FORMAT_ERROR_TEXTS = (
     "please upload an acceptable document format (jpg, jpeg, gif, png). change file",
     "please upload an acceptable document format",
+)
+
+_EASY_APPLY_LIMIT_TEXTS = (
+    "you reached today s easy apply limit",
+    "reached today s easy apply limit",
+    "easy apply limit",
+    "continue applying tomorrow",
+)
+
+_RESUME_UPLOAD_LABEL_TOKENS = (
+    "resume",
+    "cv",
+    "curriculum vitae",
+    "lebenslauf",
+)
+
+_NON_RESUME_UPLOAD_LABEL_TOKENS = (
+    "photo",
+    "picture",
+    "image",
+    "headshot",
+    "portrait",
+    "profile photo",
+    "profilfoto",
+    "bild",
+)
+
+_PHOTO_UPLOAD_LABEL_TOKENS = _NON_RESUME_UPLOAD_LABEL_TOKENS
+
+_RESUME_FILE_ACCEPT_TOKENS = (
+    ".pdf",
+    "application/pdf",
+    ".doc",
+    ".docx",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+)
+
+_IMAGE_FILE_ACCEPT_TOKENS = (
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".png",
+    ".webp",
+    "image/jpg",
+    "image/jpeg",
+    "image/gif",
+    "image/png",
+    "image/webp",
+    "image/*",
+)
+
+_REQUIRED_VALIDATION_TEXTS = (
+    "required",
+    "this field is required",
+    "field is required",
+    "required field",
+    "dieses feld ist erforderlich",
+    "pflichtfeld",
+)
+
+_CONSENT_LABEL_TOKENS = (
+    "consent",
+    "privacy",
+    "data processing",
+    "personal data",
+    "confirm i have read",
+    "accepted",
+    "agree",
+    "einwilligung",
+    "datenschutz",
+    "personenbezogene daten",
+    "zustimmen",
+)
+
+_EASY_APPLY_NEXT_BUTTON_SELECTORS = [
+    "button:has-text('Next')",
+    "button:has-text('Continue')",
+    "button:has-text('Review')",
+    "button:has-text('Suivant')",
+    "button:has-text('Continuer')",
+    "button:has-text('Weiter')",
+    "button:has-text('Überprüfen')",
+    "button:has-text('Uberprufen')",
+    "button[aria-label*='Next']",
+    "button[aria-label*='Continue']",
+]
+
+_EASY_APPLY_SUBMIT_BUTTON_SELECTORS = [
+    "button[aria-label='Submit application']",
+    "[data-live-test-easy-apply-submit-button]",
+    "button:has-text('Submit application')",
+    "button:has-text('Envoyer la candidature')",
+    "button:has-text('Bewerbung absenden')",
+    "button:has-text('Submit')",
+    "button:has-text('Apply')",
+    "button:has-text('Send')",
+    "button[type='submit']",
+    "button:has-text('Finish')",
+]
+
+_EASY_APPLY_NEXT_BUTTON_LABELS = {
+    "next",
+    "continue",
+    "review",
+    "suivant",
+    "continuer",
+    "weiter",
+    "uberprufen",
+}
+
+_EASY_APPLY_SUBMIT_BUTTON_LABELS = {
+    "submit application",
+    "submit",
+    "apply",
+    "send",
+    "finish",
+    "envoyer la candidature",
+    "bewerbung absenden",
+}
+
+_YES_OPTION_LABELS = {
+    "yes",
+    "true",
+    "ja",
+    "oui",
+}
+
+_NO_OPTION_LABELS = {
+    "no",
+    "false",
+    "nein",
+    "non",
+}
+
+_LINKEDIN_NEXT_PAGE_SELECTORS = [
+    "button[data-testid='pagination-controls-next-button-visible']",
+    "button[aria-label*='View next page']",
+    "button[aria-label*='next']",
+    "button:has-text('Next')",
+]
+
+_JOB_DETAIL_TEXT_SELECTORS = [
+    "[id^='JobDetails_AboutTheJob']",
+    "#job-details",
+    ".jobs-description-content__text",
+    ".jobs-box__html-content",
+    "[data-sdui-screen*='SemanticJobDetails']",
+    "[data-sdui-screen*='JobDetails']",
+    ".jobs-search__job-details",
+    "main",
+]
+
+_GERMAN_LANGUAGE_TERMS = (
+    "und",
+    "oder",
+    "der",
+    "die",
+    "das",
+    "ein",
+    "eine",
+    "einer",
+    "einen",
+    "mit",
+    "fur",
+    "für",
+    "wir",
+    "suchen",
+    "dich",
+    "sie",
+    "ihre",
+    "deine",
+    "aufgaben",
+    "profil",
+    "kenntnisse",
+    "erfahrung",
+    "berufserfahrung",
+    "verantwortlich",
+    "bewerbung",
+    "arbeits",
+    "deutsch",
+)
+
+_ENGLISH_LANGUAGE_TERMS = (
+    "and",
+    "or",
+    "the",
+    "with",
+    "for",
+    "we",
+    "you",
+    "your",
+    "our",
+    "looking",
+    "experience",
+    "skills",
+    "responsibilities",
+    "requirements",
+    "role",
+    "team",
+    "business",
+    "apply",
+    "candidate",
+    "communication",
 )
 
 
@@ -218,6 +432,21 @@ def _find_linkedin_job_cards(page) -> list:
     return cards
 
 
+def _config_flag_enabled(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _ordered_linkedin_job_cards(job_cards: list, randomize: bool) -> list[tuple[int, object]]:
+    ordered_cards = list(enumerate(job_cards))
+    if randomize:
+        random_module.shuffle(ordered_cards)
+    return ordered_cards
+
+
 def _extract_job_url_from_card(card) -> str:
     """Extract the LinkedIn job detail URL from a legacy or SDUI job card."""
     try:
@@ -248,6 +477,156 @@ def _extract_job_url_from_card(card) -> str:
     return ""
 
 
+def _clean_linkedin_card_text(value: str | None) -> str:
+    text = re.sub(r"\s+", " ", value or "").strip()
+    for marker in ("(Verified job)", "(verified job)"):
+        if marker in text:
+            before, after = text.split(marker, 1)
+            if after.strip() and before.strip().lower() == after.strip().lower():
+                return f"{before.strip()} {marker}".strip()
+    midpoint = len(text) // 2
+    if len(text) % 2 == 0 and text[:midpoint].strip().lower() == text[midpoint:].strip().lower():
+        return text[:midpoint].strip()
+    return text
+
+
+def _title_from_linkedin_label(value: str | None) -> str:
+    text = _clean_linkedin_card_text(value)
+    match = re.search(r"\b(?:job\s+)?title\s*,\s*(.+)", text, flags=re.IGNORECASE)
+    return _clean_linkedin_card_text(match.group(1)) if match else text
+
+
+def _looks_like_linkedin_job_title(value: str) -> bool:
+    text = _clean_linkedin_card_text(value)
+    if not text or len(text) > 220:
+        return False
+    lowered = text.lower()
+    rejected = {
+        "easy apply",
+        "promoted",
+        "viewed",
+        "new",
+        "verified",
+        "verified job",
+        "actively recruiting",
+        "actively reviewing applicants",
+    }
+    if lowered in rejected:
+        return False
+    if lowered.startswith("posted ") or lowered.endswith(" ago"):
+        return False
+    if re.search(r"(?:€|\$|£|\b(?:eur|usd|gbp)\b|/\s*(?:yr|year|mo|month|hour|hr)\b)", lowered, flags=re.IGNORECASE):
+        return False
+    return bool(re.search(r"[a-zA-Z]", text))
+
+
+def _extract_job_title_from_card(card) -> str:
+    """Extract a job title from legacy and newer LinkedIn SDUI cards."""
+    selectors = [
+        "h3",
+        "h2",
+        ".job-card-list__title",
+        ".job-card-container__link",
+        ".base-search-card__title",
+        "[data-testid='job-card-title']",
+        "[data-testid='job-item-title']",
+        "[aria-label^='Job title']",
+        "[aria-label*='Job title,']",
+        "[aria-label^='Title']",
+        "[aria-label*='Title,']",
+        "a[href*='/jobs/view/']",
+        "p",
+        "p span:not([aria-hidden='true'])",
+        "p span",
+    ]
+
+    for selector in selectors:
+        try:
+            elements = card.query_selector_all(selector)
+        except Exception:
+            elements = []
+
+        for elem in elements:
+            for value in (
+                _title_from_linkedin_label(elem.get_attribute("aria-label")),
+                elem.get_attribute("title"),
+                elem.text_content() or "",
+            ):
+                text = _clean_linkedin_card_text(value)
+                if _looks_like_linkedin_job_title(text):
+                    return text
+
+    try:
+        text = card.evaluate(
+            """card => {
+                const normalize = value => (value || "").replace(/\\s+/g, " ").trim();
+                const bad = new Set([
+                    "easy apply",
+                    "promoted",
+                    "viewed",
+                    "new",
+                        "verified",
+                        "verified job",
+                        "actively recruiting",
+                        "actively reviewing applicants",
+                    ]);
+                const selectors = [
+                    "h3",
+                    "h2",
+                    ".job-card-list__title",
+                    ".job-card-container__link",
+                    ".base-search-card__title",
+                    "[data-testid='job-card-title']",
+                    "[data-testid='job-item-title']",
+                    "[aria-label*='Job title']",
+                    "[aria-label*='Title,']",
+                    "a[href*='/jobs/view/']",
+                    "p",
+                    "p span:not([aria-hidden='true'])",
+                    "p span",
+                ];
+                for (const selector of selectors) {
+                    for (const el of card.querySelectorAll(selector)) {
+                        const aria = normalize(el.getAttribute("aria-label"))
+                            .replace(/^((job\\s+)?title)\\s*,\\s*/i, "");
+                        const title = normalize(el.getAttribute("title"));
+                        const text = normalize(el.innerText || el.textContent);
+                        for (const value of [aria, title, text]) {
+                        const lower = value.toLowerCase();
+                        if (
+                            value
+                            && value.length <= 220
+                            && /[a-z]/i.test(value)
+                            && !bad.has(lower)
+                            && !lower.startsWith("posted ")
+                            && !lower.endsWith(" ago")
+                            && !/(?:€|\\$|£|\\b(?:eur|usd|gbp)\\b|\\/\\s*(?:yr|year|mo|month|hour|hr)\\b)/i.test(lower)
+                        ) {
+                                return value;
+                            }
+                        }
+                    }
+                }
+                return "";
+            }"""
+        )
+        text = _clean_linkedin_card_text(text)
+        if _looks_like_linkedin_job_title(text):
+            return text
+    except Exception:
+        pass
+
+    return ""
+
+
+def _scroll_linkedin_job_card_into_view(card) -> None:
+    """Ask LinkedIn's virtualized list to render a card's visible contents."""
+    try:
+        card.evaluate("el => el.scrollIntoView({block: 'center', inline: 'nearest', behavior: 'instant'})")
+    except Exception:
+        pass
+
+
 def _click_linkedin_job_card(card) -> None:
     """Open a job from either a legacy anchor card or a newer clickable card."""
     job_link = card.query_selector("a[href*='/jobs/view/']")
@@ -269,7 +648,11 @@ def _find_easy_apply_control(page):
     selectors = [
         "[data-sdui-screen*='JobDetails'] a[href*='/jobs/view/'][href*='/apply/']",
         "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label*='Easy Apply']",
+        "[data-sdui-screen*='jobs.SemanticJobDetails'] a[aria-label='LinkedIn Apply to this job']",
+        "a[aria-label='LinkedIn Apply to this job'][href*='currentJobId=']",
+        "a[aria-label='LinkedIn Apply to this job']",
         "main a[href*='/jobs/view/'][href*='/apply/'][href*='openSDUIApplyFlow=true']",
+        "a[aria-label='Easy Apply to this job'][href*='currentJobId=']",
         "a[aria-label='Easy Apply to this job']",
         "a[aria-label*='Easy Apply'][href*='/apply/']",
         ".job-details-top-card button:has-text('Easy Apply')",
@@ -297,9 +680,10 @@ def _find_easy_apply_control(page):
                 href = (elem.get_attribute("href") or "").strip().lower()
                 combined = f"{text} {aria} {href}"
 
-                if "easy apply" not in combined and "/apply/" not in href:
+                is_linkedin_apply = "linkedin apply to this job" in aria
+                if "easy apply" not in combined and "/apply/" not in href and not is_linkedin_apply:
                     continue
-                if "search-results" in href and "/jobs/view/" not in href:
+                if "search-results" in href and "/jobs/view/" not in href and "currentjobid=" not in href:
                     continue
 
                 bounding_box = elem.bounding_box()
@@ -319,6 +703,76 @@ def _normalize_location_text(value: str) -> str:
     ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
     lowered = ascii_only.lower()
     return re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+
+
+def _location_text_without_distance(value: str) -> str:
+    normalized = _normalize_location_text(value)
+    return re.sub(r"\b\d+\s*(?:mi|mile|miles|km|kilometer|kilometers)\b", "", normalized).strip()
+
+
+def _linkedin_location_matches_config(active_location: str, config_location: str) -> bool:
+    """Return True when LinkedIn's rendered location still points at the configured place."""
+    active = _location_text_without_distance(active_location)
+    expected = _normalize_location_text(config_location)
+    if not active or not expected:
+        return False
+
+    if active == expected or active in expected or expected in active:
+        return True
+
+    primary_expected = _normalize_location_text(str(config_location).split(",", 1)[0])
+    if primary_expected and (primary_expected in active or active in primary_expected):
+        return True
+
+    primary_token = primary_expected.split(" ", 1)[0] if primary_expected else ""
+    return len(primary_token) > 2 and primary_token in active.split()
+
+
+def _verify_active_linkedin_search_location(page, location: str) -> bool:
+    """Abort guard: do not apply if LinkedIn rendered a different search location."""
+    active_location = _active_linkedin_search_location(page)
+    if not active_location:
+        log.warning("Could not read LinkedIn search location; continuing with configured search URL")
+        return True
+
+    if _linkedin_location_matches_config(active_location, location):
+        log.info("LinkedIn location matches config: %s", active_location)
+        return True
+
+    log.error(
+        "LinkedIn location mismatch; refusing to apply. Page shows '%s', config expects '%s'",
+        active_location,
+        location,
+    )
+    return False
+
+
+def _ensure_configured_linkedin_search_location(page, location: str) -> bool:
+    """Ensure LinkedIn's rendered search location matches config, repairing mismatches."""
+    active_location = _active_linkedin_search_location(page)
+    if not active_location:
+        log.warning("Could not read LinkedIn search location; continuing with configured search URL")
+        return True
+
+    if _linkedin_location_matches_config(active_location, location):
+        log.info("LinkedIn location matches config: %s", active_location)
+        return True
+
+    log.warning(
+        "LinkedIn location shows '%s', expected config location '%s'; correcting it",
+        active_location,
+        location,
+    )
+    if not _ensure_active_linkedin_search_location(page, location, contenteditable=True):
+        log.error(
+            "LinkedIn location mismatch could not be corrected. Page shows '%s', config expects '%s'",
+            active_location,
+            location,
+        )
+        return False
+
+    page.wait_for_timeout(1500)
+    return _verify_active_linkedin_search_location(page, location)
 
 
 def _normalize_company_name(value: str) -> str:
@@ -447,7 +901,7 @@ def _log_active_linkedin_search_state(page, job_title: str, location: str) -> No
     elif active_keyword:
         log.info("LinkedIn search input: %s", active_keyword)
 
-    if active_location and _normalize_location_text(active_location) != _normalize_location_text(location):
+    if active_location and not _linkedin_location_matches_config(active_location, location):
         log.warning(
             "LinkedIn location shows '%s', expected config location '%s'",
             active_location,
@@ -643,13 +1097,13 @@ def _fill_location_contenteditable(page, location: str) -> bool:
 
 
 def _ensure_active_linkedin_search_location(page, location: str, *, contenteditable: bool = False) -> bool:
-    """Set the visible LinkedIn search location when an old copied URL was used."""
+    """Set the visible LinkedIn search location when the URL was normalized differently."""
     target = (location or "").strip()
     if not target:
         return False
 
     active_location = _active_linkedin_search_location(page)
-    if active_location and _normalize_location_text(active_location) == _normalize_location_text(target):
+    if active_location and _linkedin_location_matches_config(active_location, target):
         return True
 
     try:
@@ -837,6 +1291,44 @@ def _apply_exact_location_filter(page, location: str) -> bool:
         return False
 
 
+def _is_visible_enabled_control(element) -> bool:
+    """Return True when a Playwright element handle is usable for a click."""
+    try:
+        if not element.is_visible() or not element.is_enabled():
+            return False
+    except Exception:
+        return False
+
+    try:
+        if (element.get_attribute("aria-disabled") or "").strip().lower() == "true":
+            return False
+        if element.get_attribute("disabled") is not None:
+            return False
+    except Exception:
+        pass
+
+    try:
+        box = element.bounding_box()
+        if not box or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
+            return False
+    except Exception:
+        return False
+
+    return True
+
+
+def _find_linkedin_next_page_button(page):
+    """Find the visible LinkedIn jobs pagination next button."""
+    for selector in _LINKEDIN_NEXT_PAGE_SELECTORS:
+        try:
+            for button in page.query_selector_all(selector):
+                if _is_visible_enabled_control(button):
+                    return button
+        except Exception:
+            continue
+    return None
+
+
 def search_and_apply(
     config_dict: dict,
     max_applications: int = 1,
@@ -857,15 +1349,17 @@ def search_and_apply(
         setup: Whether to keep the browser session open for manual changes only
 
     Returns:
-        Dict with applied, skipped, failed counts
+        Dict with applied, skipped, failed counts, and optionally stopped_reason
     """
     job_title = config_dict.get("job_title", "")
     location = config_dict.get("location", "")
     profile = config_dict.get("profile", {})
     answers = config_dict.get("answers", {})
     resume_path = config_dict.get("resume_path", "")
+    photo_path = config_dict.get("photo_path", "")
     company_blacklist = config_dict.get("company_blacklist", [])
     raw_delay = config_dict.get("delay", 0)
+    randomize_page_jobs = _config_flag_enabled(config_dict.get("random", False))
     blacklisted_companies = tuple(
         _normalize_company_name(company)
         for company in company_blacklist
@@ -908,26 +1402,21 @@ def search_and_apply(
             page.wait_for_timeout(3000)
             _log_active_linkedin_search_state(page, job_title, location)
             use_old_url = config_dict.get("old_url") is True
-            if use_old_url and not _ensure_active_linkedin_search_location(
-                page,
+            active_location_before_repair = _active_linkedin_search_location(page)
+            location_was_repaired = bool(active_location_before_repair) and not _linkedin_location_matches_config(
+                active_location_before_repair,
                 location,
-                contenteditable=True,
-            ):
-                active_location = _active_linkedin_search_location(page)
-                if active_location:
-                    log.warning(
-                        "LinkedIn location remained '%s' after correction attempt; expected '%s'",
-                        active_location,
-                        location,
-                    )
-            if use_old_url:
+            )
+            if not _ensure_configured_linkedin_search_location(page, location):
+                return {"applied": applied, "skipped": skipped, "failed": failed + 1}
+            if use_old_url or location_was_repaired:
                 _ensure_easy_apply_search_filter(page)
             _log_active_linkedin_search_state(page, job_title, location)
 
             if exact_location:
                 _apply_exact_location_filter(page, location)
-                if use_old_url:
-                    _ensure_active_linkedin_search_location(page, location, contenteditable=True)
+                if not _ensure_configured_linkedin_search_location(page, location):
+                    return {"applied": applied, "skipped": skipped, "failed": failed + 1}
                 _log_active_linkedin_search_state(page, job_title, location)
 
             if _dismiss_recruiter_upsell_if_present(page) and use_old_url:
@@ -935,8 +1424,19 @@ def search_and_apply(
 
             # Process jobs on current page
             while applied < max_applications:
+                if _find_easy_apply_limit_modal(page):
+                    log.warning("LinkedIn Easy Apply limit reached for today; stopping run")
+                    return {
+                        "applied": applied,
+                        "skipped": skipped,
+                        "failed": failed,
+                        "stopped_reason": "easy_apply_limit_reached",
+                    }
+
                 if _dismiss_recruiter_upsell_if_present(page) and use_old_url:
                     _ensure_easy_apply_search_filter(page)
+                    if not _ensure_configured_linkedin_search_location(page, location):
+                        return {"applied": applied, "skipped": skipped, "failed": failed + 1}
                 log.info(f"Looking for jobs (applied: {applied}/{max_applications})")
 
                 # Find job cards. LinkedIn has both legacy card containers and
@@ -948,7 +1448,14 @@ def search_and_apply(
                     log.info("No more job cards found")
                     break
 
-                for idx, card in enumerate(job_cards):
+                ordered_job_cards = _ordered_linkedin_job_cards(job_cards, randomize_page_jobs)
+                if randomize_page_jobs:
+                    log.info(
+                        "Random LinkedIn job order for this page: %s",
+                        [idx for idx, _card in ordered_job_cards],
+                    )
+
+                for idx, card in ordered_job_cards:
                     if applied >= max_applications:
                         break
 
@@ -959,17 +1466,28 @@ def search_and_apply(
                             log.debug(f"Card {idx}: No job URL found")
                             continue
 
+                        _scroll_linkedin_job_card_into_view(card)
+                        page.wait_for_timeout(250)
+
                         # Check title if keyword filter is active
                         if title_keyword:
-                            title_elem = card.query_selector("h3, .job-title, span")
-                            if not title_elem:
-                                log.debug(f"Card {idx}: No title element")
+                            title_text = _extract_job_title_from_card(card)
+                            if not title_text:
+                                log.info(
+                                    "Card %s: Skipping because title_keyword '%s' is set but no title was found",
+                                    idx,
+                                    title_keyword,
+                                )
                                 skipped += 1
                                 continue
 
-                            title_text = (title_elem.text_content() or "").lower()
-                            if title_keyword.lower() not in title_text:
-                                log.debug(f"Card {idx}: Skipping - keyword '{title_keyword}' not in '{title_text}'")
+                            if title_keyword.lower() not in title_text.lower():
+                                log.info(
+                                    "Card %s: Skipping because title '%s' does not contain title_keyword '%s'",
+                                    idx,
+                                    title_text,
+                                    title_keyword,
+                                )
                                 skipped += 1
                                 continue
 
@@ -999,22 +1517,62 @@ def search_and_apply(
                             skipped += 1
                             continue
 
+                        job_detail_text = _extract_job_detail_text(page)
+                        detected_language = _detect_job_language(job_detail_text)
+                        if not _job_language_allowed(config_dict, detected_language):
+                            log.info(
+                                "Card %s: Skipping because only_english is enabled and detected language is %s",
+                                idx,
+                                detected_language or "unclear",
+                            )
+                            skipped += 1
+                            continue
+
+                        selected_resume_path, detected_language = _select_resume_path_for_job(
+                            config_dict,
+                            job_detail_text,
+                            resume_path,
+                        )
+                        if detected_language and selected_resume_path != resume_path:
+                            log.info(
+                                "Card %s: Detected job language as %s; using resume %s",
+                                idx,
+                                detected_language,
+                                selected_resume_path,
+                            )
+                        elif detected_language:
+                            log.info(
+                                "Card %s: Detected job language as %s; using fallback resume %s",
+                                idx,
+                                detected_language,
+                                selected_resume_path,
+                            )
+
                         log.info(f"Card {idx}: Clicking Easy Apply control")
                         easy_apply_btn.click()
-                        page.wait_for_timeout(2000)
+                        _wait_for_easy_apply_form_ready(page)
 
                         # Try to fill form (simplified version)
                         result = _fill_and_submit_form(
                             page,
                             profile,
                             answers,
-                            resume_path,
+                            selected_resume_path,
+                            photo_path=photo_path,
                             dry_run=dry_run,
                         )
 
                         if result == "APPLIED":
                             applied += 1
                             log.info(f"Successfully applied to job {idx}")
+                        elif result == "LIMIT_REACHED":
+                            log.warning("LinkedIn Easy Apply limit reached for today; stopping run")
+                            return {
+                                "applied": applied,
+                                "skipped": skipped,
+                                "failed": failed,
+                                "stopped_reason": "easy_apply_limit_reached",
+                            }
                         elif result == "SKIPPED":
                             skipped += 1
                             log.info(f"Skipped job {idx}")
@@ -1039,15 +1597,12 @@ def search_and_apply(
 
                 # Try to go to next page if we haven't reached max
                 if applied < max_applications:
-                    next_btn = page.query_selector(
-                        "button[data-testid='pagination-controls-next-button-visible'], "
-                        "button[aria-label*='View next page'], "
-                        "button[aria-label*='next'], "
-                        "button:has-text('Next')"
-                    )
-                    if next_btn and next_btn.is_enabled():
+                    next_btn = _find_linkedin_next_page_button(page)
+                    if next_btn:
                         log.info("Going to next page")
-                        next_btn.click()
+                        if not _click_action_button(next_btn):
+                            log.info("LinkedIn next page button was present but could not be clicked")
+                            break
                         page.wait_for_timeout(2000)
                     else:
                         log.info("No next page button found")
@@ -1137,6 +1692,8 @@ def _find_discard_confirmation_modal(page):
     """Return the visible top-layer discard-confirmation modal when present."""
     selectors = [
         "[data-test-modal-id='data-test-easy-apply-discard-confirmation']",
+        "dialog[data-testid='dialog']",
+        "dialog[open]",
         ".artdeco-modal-overlay--layer-confirmation[aria-hidden='false']",
         ".artdeco-modal-overlay--is-top-layer [role='alertdialog']",
         ".artdeco-modal[role='alertdialog']",
@@ -1145,7 +1702,47 @@ def _find_discard_confirmation_modal(page):
     for selector in selectors:
         try:
             for modal in page.query_selector_all(selector):
-                if modal.is_visible():
+                if not modal.is_visible():
+                    continue
+                modal_text = _normalize_lookup_text(_scope_text(modal))
+                if (
+                    "save this application" in modal_text
+                    or "application will be discarded" in modal_text
+                    or ("discard" in modal_text and "save" in modal_text and "application" in modal_text)
+                ):
+                    return modal
+        except Exception:
+            continue
+    return None
+
+
+def _is_easy_apply_limit_modal(scope) -> bool:
+    """Return True when LinkedIn says today's Easy Apply limit has been reached."""
+    modal_text = _normalize_lookup_text(_scope_text(scope))
+    if not modal_text:
+        return False
+
+    if any(text in modal_text for text in _EASY_APPLY_LIMIT_TEXTS):
+        return "easy apply" in modal_text and ("limit" in modal_text or "tomorrow" in modal_text)
+
+    return False
+
+
+def _find_easy_apply_limit_modal(page):
+    """Return the visible daily Easy Apply limit modal when LinkedIn shows it."""
+    selectors = [
+        "[data-sdui-screen*='EasyApplyFuseLimitDialogModal']",
+        "dialog[data-testid='dialog']",
+        "dialog[open]",
+        "[role='dialog']",
+        "[role='alertdialog']",
+    ]
+    for selector in selectors:
+        try:
+            for modal in page.query_selector_all(selector):
+                if not modal.is_visible():
+                    continue
+                if _is_easy_apply_limit_modal(modal):
                     return modal
         except Exception:
             continue
@@ -1154,12 +1751,18 @@ def _find_discard_confirmation_modal(page):
 
 def _get_active_modal(page):
     """Return the visible Easy Apply modal/dialog if one is open."""
+    limit_modal = _find_easy_apply_limit_modal(page)
+    if limit_modal:
+        return limit_modal
+
     discard_modal = _find_discard_confirmation_modal(page)
     if discard_modal:
         return discard_modal
 
     selectors = [
         "div.jobs-easy-apply-modal",
+        "[data-testid='dialog-content']:has([data-sdui-screen*='EasyApply'])",
+        "[data-sdui-screen*='EasyApply']",
         ".artdeco-modal[role='dialog']",
         ".artdeco-modal[role='alertdialog']",
         "[role='dialog']",
@@ -1176,8 +1779,76 @@ def _get_active_modal(page):
     return None
 
 
+def _scope_has_easy_apply_controls(scope) -> bool:
+    """Return True when a modal scope has fields or action buttons worth handling."""
+    if _is_easy_apply_limit_modal(scope):
+        return True
+
+    try:
+        field_count = len(scope.query_selector_all("input, select, textarea"))
+    except Exception:
+        field_count = 0
+
+    if field_count > 0:
+        return True
+
+    return any((
+        _find_easy_apply_action_button(
+            scope,
+            _EASY_APPLY_NEXT_BUTTON_SELECTORS,
+            _EASY_APPLY_NEXT_BUTTON_LABELS,
+        ),
+        _find_easy_apply_action_button(
+            scope,
+            _EASY_APPLY_SUBMIT_BUTTON_SELECTORS,
+            _EASY_APPLY_SUBMIT_BUTTON_LABELS,
+        ),
+    ))
+
+
+def _wait_for_easy_apply_form_ready(page, timeout_ms: int = 8000):
+    """Wait until LinkedIn's Easy Apply modal has loaded usable fields or buttons."""
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    last_modal = None
+
+    while time.monotonic() < deadline:
+        modal = _get_active_modal(page)
+        if modal:
+            last_modal = modal
+            if _scope_has_easy_apply_controls(modal):
+                return modal
+        page.wait_for_timeout(300)
+
+    return last_modal
+
+
 def _close_easy_apply_modal(page) -> None:
     """Dismiss the Easy Apply modal if it is still open."""
+    def _find_button_by_text(scope, labels: set[str]):
+        try:
+            buttons = scope.query_selector_all("button, input[type='button'], input[type='submit']")
+        except Exception:
+            return None
+
+        for button in buttons:
+            try:
+                if not button.is_visible() or not button.is_enabled():
+                    continue
+                raw_text = button.evaluate(
+                    """el => [
+                        el.getAttribute('aria-label') || '',
+                        el.innerText || '',
+                        el.textContent || '',
+                        el.value || ''
+                    ].join(' ')"""
+                )
+                normalized_text = _normalize_lookup_text(raw_text)
+                if normalized_text in labels:
+                    return button
+            except Exception:
+                continue
+        return None
+
     def _discard_confirmation_if_present() -> bool:
         modal = _find_discard_confirmation_modal(page)
         if not modal:
@@ -1194,11 +1865,18 @@ def _close_easy_apply_modal(page) -> None:
         selectors = [
             "button[data-control-name='discard_application_confirm_btn']",
             "button[data-test-dialog-secondary-btn]",
+            "button[componentkey]",
+            "button[aria-label*='Discard']",
             "button:has-text('Discard')",
+            "button:has-text('Discard application')",
         ]
         for selector in selectors:
             try:
-                btn = modal.query_selector(selector) or page.query_selector(selector)
+                btn = None
+                if selector == "button[componentkey]":
+                    btn = _find_button_by_text(modal, {"discard", "discard application"})
+                else:
+                    btn = modal.query_selector(selector) or page.query_selector(selector)
                 if btn and btn.is_visible() and btn.is_enabled():
                     if not _click_action_button(btn):
                         continue
@@ -1207,16 +1885,32 @@ def _close_easy_apply_modal(page) -> None:
             except Exception:
                 continue
 
+        btn = _find_button_by_text(modal, {"discard", "discard application"})
+        if btn and _click_action_button(btn):
+            page.wait_for_timeout(500)
+            return True
+
         return False
+
+    def _modal_is_closed() -> bool:
+        try:
+            return _get_active_modal(page) is None
+        except Exception:
+            return True
 
     modal = _get_active_modal(page)
     if not modal:
         return
 
-    if _discard_confirmation_if_present():
+    if _discard_confirmation_if_present() or _modal_is_closed():
         return
 
     selectors = [
+        "button[data-test-modal-close-btn]",
+        "button[data-test-dialog-close-btn]",
+        "button[data-control-name='cancel_application']",
+        "button[aria-label='Dismiss']",
+        "button[aria-label='Close']",
         "button[aria-label*='Dismiss']",
         "button[aria-label*='Close']",
         "button:has-text('Done')",
@@ -1225,23 +1919,24 @@ def _close_easy_apply_modal(page) -> None:
     ]
     for selector in selectors:
         try:
-            btn = modal.query_selector(selector)
+            btn = modal.query_selector(selector) or page.query_selector(selector)
             if btn and btn.is_visible():
                 if not _click_action_button(btn):
                     continue
                 page.wait_for_timeout(500)
-                if _discard_confirmation_if_present():
+                if _discard_confirmation_if_present() or _modal_is_closed():
                     return
-                return
         except Exception:
             continue
 
-    try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(500)
-        _discard_confirmation_if_present()
-    except Exception:
-        pass
+    for _ in range(2):
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+            if _discard_confirmation_if_present() or _modal_is_closed():
+                return
+        except Exception:
+            pass
 
 
 def _is_safety_reminder_modal(scope) -> bool:
@@ -1300,6 +1995,22 @@ def _extract_field_label(scope, input_elem) -> str:
     placeholder = input_elem.get_attribute("placeholder") or ""
 
     try:
+        question_text = input_elem.evaluate(
+            """el => {
+                const fieldset = el.closest('fieldset');
+                if (!fieldset) return '';
+                const container = fieldset.parentElement;
+                if (!container) return '';
+                const question = [...container.children].find((child) => child !== fieldset && (child.innerText || '').trim());
+                return question ? (question.innerText || question.textContent || '') : '';
+            }"""
+        ) or ""
+        if question_text.strip():
+            return question_text.strip()
+    except Exception:
+        pass
+
+    try:
         legend_text = input_elem.evaluate(
             """el => {
                 const fieldset = el.closest('fieldset');
@@ -1355,10 +2066,359 @@ def _scope_text(scope) -> str:
         return ""
 
 
+def _extract_job_detail_text(page) -> str:
+    """Best-effort job detail text used for per-job resume language selection."""
+    for selector in _JOB_DETAIL_TEXT_SELECTORS:
+        try:
+            for elem in page.query_selector_all(selector):
+                text = " ".join((elem.text_content() or "").split())
+                if len(text) >= 120:
+                    return text
+        except Exception:
+            continue
+
+    try:
+        return " ".join((page.text_content("body") or "").split())
+    except Exception:
+        try:
+            return " ".join((page.content() or "").split())
+        except Exception:
+            return ""
+
+
+def _language_term_score(text: str, terms: tuple[str, ...]) -> int:
+    normalized = _normalize_lookup_text(text)
+    if not normalized:
+        return 0
+
+    padded = f" {normalized} "
+    score = 0
+    for term in terms:
+        normalized_term = _normalize_lookup_text(term)
+        if normalized_term:
+            score += padded.count(f" {normalized_term} ")
+    return score
+
+
+def _detect_job_language(text: str) -> str:
+    """Return 'german', 'english', or '' based on the visible job description text."""
+    if not text:
+        return ""
+
+    german_score = _language_term_score(text, _GERMAN_LANGUAGE_TERMS)
+    english_score = _language_term_score(text, _ENGLISH_LANGUAGE_TERMS)
+
+    if re.search(r"[äöüßÄÖÜ]", text):
+        german_score += 2
+
+    if german_score >= english_score + 2 and german_score >= 3:
+        return "german"
+    if english_score >= german_score + 2 and english_score >= 3:
+        return "english"
+    return ""
+
+
+def _configured_language_resume_paths(config_dict: dict) -> dict[str, str]:
+    resume_paths = config_dict.get("resume_paths", {})
+    if not isinstance(resume_paths, dict):
+        resume_paths = {}
+
+    english_path = (
+        resume_paths.get("english")
+        or resume_paths.get("en")
+        or config_dict.get("english_resume_path")
+        or ""
+    )
+    german_path = (
+        resume_paths.get("german")
+        or resume_paths.get("de")
+        or config_dict.get("german_resume_path")
+        or ""
+    )
+
+    return {
+        "english": str(english_path or "").strip(),
+        "german": str(german_path or "").strip(),
+    }
+
+
+def _resume_language_detection_enabled(config_dict: dict) -> bool:
+    configured_value = config_dict.get("auto_select_resume_by_job_language")
+    if configured_value is not None:
+        return _config_flag_enabled(configured_value)
+
+    return any(_configured_language_resume_paths(config_dict).values())
+
+
+def _only_english_jobs_enabled(config_dict: dict) -> bool:
+    return _config_flag_enabled(config_dict.get("only_english", False))
+
+
+def _job_language_allowed(config_dict: dict, detected_language: str) -> bool:
+    if not _only_english_jobs_enabled(config_dict):
+        return True
+
+    return detected_language == "english"
+
+
+def _select_resume_path_for_job(config_dict: dict, job_detail_text: str, fallback_resume_path: str) -> tuple[str, str]:
+    """Pick a language-specific resume path when configured and confidently detected."""
+    if not _resume_language_detection_enabled(config_dict):
+        return fallback_resume_path, ""
+
+    resume_paths = _configured_language_resume_paths(config_dict)
+    detected_language = _detect_job_language(job_detail_text)
+
+    if detected_language and resume_paths.get(detected_language):
+        return resume_paths[detected_language], detected_language
+
+    return fallback_resume_path, detected_language
+
+
+def _collect_field_questions(scope, inputs=None) -> list[str]:
+    """Return unique visible field questions/labels for logging stuck form pages."""
+    if inputs is None:
+        try:
+            inputs = scope.query_selector_all("input, select, textarea")
+        except Exception:
+            inputs = []
+
+    questions: list[str] = []
+    seen = set()
+    for input_elem in inputs:
+        try:
+            field_type = (input_elem.get_attribute("type") or "").lower()
+            if field_type in {"hidden", "file"}:
+                continue
+            label_text = " ".join(_extract_field_label(scope, input_elem).split())
+            if not label_text:
+                continue
+            label_key = _normalize_lookup_text(label_text)
+            if not label_key or label_key in seen:
+                continue
+            seen.add(label_key)
+            questions.append(label_text)
+        except Exception:
+            continue
+    return questions
+
+
+def _form_step_signature(scope, inputs=None) -> str:
+    """Build a stable signature for detecting repeated Easy Apply pages."""
+    questions = _collect_field_questions(scope, inputs)
+    if questions:
+        return "|".join(_normalize_lookup_text(question) for question in questions)
+    return _scope_text(scope)[:500]
+
+
+def _log_stuck_form_questions(questions: list[str]) -> None:
+    if not questions:
+        log.warning("Stuck on repeated Easy Apply page, but no field questions could be extracted")
+        return
+
+    log.warning("Stuck on repeated Easy Apply page with these questions:")
+    for question in questions[:25]:
+        log.warning("  - %s", question)
+    if len(questions) > 25:
+        log.warning("  ... and %d more", len(questions) - 25)
+
+
 def _has_upload_format_error(scope) -> bool:
     """Return True when the current step shows the resume upload format error."""
     scope_text = _scope_text(scope)
     return any(text in scope_text for text in _UPLOAD_FORMAT_ERROR_TEXTS)
+
+
+def _file_accept_tokens(input_elem) -> list[str]:
+    accept = (input_elem.get_attribute("accept") or "").strip().lower()
+    return [token.strip() for token in accept.split(",") if token.strip()]
+
+
+def _file_input_context_text(scope, input_elem) -> str:
+    """Return nearby upload text, including labels that sit outside the input wrapper."""
+    parts: list[str] = []
+    field_id = input_elem.get_attribute("id") or ""
+
+    if field_id:
+        try:
+            label = scope.query_selector(f"label[for='{field_id}']")
+            if label:
+                parts.append(label.text_content() or "")
+        except Exception:
+            pass
+
+    try:
+        parts.append(input_elem.get_attribute("aria-label") or "")
+    except Exception:
+        pass
+
+    try:
+        parts.append(input_elem.evaluate(
+            """el => {
+                const container = el.closest(
+                    '[data-test-form-element], .full-width, fieldset, form, .jobs-document-upload__container'
+                );
+                return container ? (container.innerText || container.textContent || '') : '';
+            }"""
+        ) or "")
+    except Exception:
+        pass
+
+    return " ".join(part for part in parts if part).strip()
+
+
+def _accept_tokens_allow_resume_path(tokens: list[str], resume_path: str) -> bool:
+    if not tokens:
+        return True
+
+    suffix = Path(resume_path).suffix.lower()
+    if suffix in {".pdf", ".doc", ".docx"}:
+        return any(
+            token == suffix
+            or token in _RESUME_FILE_ACCEPT_TOKENS
+            or token == "application/*"
+            for token in tokens
+        )
+
+    return True
+
+
+def _accept_tokens_allow_photo_path(tokens: list[str], photo_path: str) -> bool:
+    if not tokens:
+        return True
+
+    suffix = Path(photo_path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".gif", ".png", ".webp"}:
+        return any(
+            token == suffix
+            or token in _IMAGE_FILE_ACCEPT_TOKENS
+            or token.startswith("image/")
+            for token in tokens
+        )
+
+    return False
+
+
+def _accepts_only_images(tokens: list[str]) -> bool:
+    return bool(tokens) and all(token.startswith("image/") or token in _IMAGE_FILE_ACCEPT_TOKENS for token in tokens)
+
+
+def _is_required_upload_input(scope, input_elem) -> bool:
+    """Return True when LinkedIn marks a file upload field required or invalid."""
+    try:
+        if input_elem.get_attribute("required") is not None:
+            return True
+    except Exception:
+        pass
+
+    try:
+        return bool(input_elem.evaluate(
+            """el => {
+                const container = el.closest(
+                    '[data-test-form-element], .full-width, fieldset, form, .jobs-document-upload__container'
+                );
+                const root = container || el.parentElement;
+                if (!root) return false;
+                const text = (root.innerText || root.textContent || '').toLowerCase();
+                if (text.includes('file is required') || text.includes('a file is required')) return true;
+                if (root.querySelector('[role="alert"], .artdeco-inline-feedback--error')) return true;
+                return !!root.querySelector(
+                    '.jobs-document-upload__title--is-required, [data-test-form-element] [class*="required"]'
+                );
+            }"""
+        ))
+    except Exception:
+        return False
+
+
+def _is_resume_upload_input(scope, input_elem, resume_path: str) -> bool:
+    """Return True only for upload fields that are suitable for the resume file."""
+    tokens = _file_accept_tokens(input_elem)
+    context_text = _file_input_context_text(scope, input_elem)
+    normalized_context = _normalize_lookup_text(context_text)
+
+    if _accepts_only_images(tokens):
+        log.info("Skipping file upload field because it only accepts images: %s", context_text or ",".join(tokens))
+        return False
+
+    if any(token in normalized_context for token in _NON_RESUME_UPLOAD_LABEL_TOKENS):
+        log.info("Skipping non-resume upload field: %s", context_text or "<unknown>")
+        return False
+
+    if not _accept_tokens_allow_resume_path(tokens, resume_path):
+        log.info(
+            "Skipping file upload field because accept='%s' does not allow %s",
+            ",".join(tokens),
+            Path(resume_path).suffix.lower() or "this resume file",
+        )
+        return False
+
+    if tokens and any(token in _RESUME_FILE_ACCEPT_TOKENS for token in tokens):
+        return True
+
+    return any(token in normalized_context for token in _RESUME_UPLOAD_LABEL_TOKENS)
+
+
+def _is_photo_upload_input(scope, input_elem, photo_path: str = "") -> bool:
+    """Return True for photo/image upload fields that are suitable for a configured photo."""
+    tokens = _file_accept_tokens(input_elem)
+    context_text = _file_input_context_text(scope, input_elem)
+    normalized_context = _normalize_lookup_text(context_text)
+
+    if not _accepts_only_images(tokens):
+        return False
+
+    if not any(token in normalized_context for token in _PHOTO_UPLOAD_LABEL_TOKENS):
+        return False
+
+    if photo_path and not _accept_tokens_allow_photo_path(tokens, photo_path):
+        log.info(
+            "Skipping photo upload field because accept='%s' does not allow %s",
+            ",".join(tokens),
+            Path(photo_path).suffix.lower() or "this photo file",
+        )
+        return False
+
+    return True
+
+
+def _find_resume_upload_input(scope, resume_path: str):
+    try:
+        file_inputs = scope.query_selector_all("input[type='file']")
+    except Exception:
+        return None
+
+    for input_elem in file_inputs:
+        if _is_resume_upload_input(scope, input_elem, resume_path):
+            return input_elem
+    return None
+
+
+def _find_photo_upload_input(scope, photo_path: str = ""):
+    try:
+        file_inputs = scope.query_selector_all("input[type='file']")
+    except Exception:
+        return None
+
+    for input_elem in file_inputs:
+        if _is_photo_upload_input(scope, input_elem, photo_path):
+            return input_elem
+    return None
+
+
+def _has_required_photo_upload_without_file(scope) -> bool:
+    try:
+        file_inputs = scope.query_selector_all("input[type='file']")
+    except Exception:
+        return False
+
+    for input_elem in file_inputs:
+        try:
+            if _is_photo_upload_input(scope, input_elem) and _is_required_upload_input(scope, input_elem):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _is_review_submit_step(scope) -> bool:
@@ -1377,21 +2437,23 @@ def _is_review_submit_step(scope) -> bool:
     ):
         return False
 
-    selectors = [
-        "button[aria-label='Submit application']",
-        "[data-live-test-easy-apply-submit-button]",
-        "button:has-text('Submit application')",
-        "button:has-text('Envoyer la candidature')",
-        "button:has-text('Bewerbung absenden')",
-    ]
-    for selector in selectors:
-        try:
-            btn = scope.query_selector(selector)
-            if btn and btn.is_visible() and btn.is_enabled():
-                return True
-        except Exception:
-            continue
-    return False
+    return _find_easy_apply_action_button(
+        scope,
+        _EASY_APPLY_SUBMIT_BUTTON_SELECTORS,
+        _EASY_APPLY_SUBMIT_BUTTON_LABELS,
+    ) is not None
+
+
+def _find_easy_apply_next_button(scope):
+    """Find the next-step button without overriding the final review submit."""
+    if _is_review_submit_step(scope):
+        return None
+
+    return _find_easy_apply_action_button(
+        scope,
+        _EASY_APPLY_NEXT_BUTTON_SELECTORS,
+        _EASY_APPLY_NEXT_BUTTON_LABELS,
+    )
 
 
 def _uncheck_follow_company_checkbox(scope) -> bool:
@@ -1401,24 +2463,50 @@ def _uncheck_follow_company_checkbox(scope) -> bool:
         try:
             checkbox_id = checkbox.get_attribute("id") or ""
             checkbox_name = (checkbox.get_attribute("name") or "").strip().lower()
-            label_text = ""
+            label_text = _choice_option_text(checkbox, "checkbox")
+            aria_checked = ""
             label = None
+            try:
+                aria_checked = (checkbox.evaluate(
+                    """el => {
+                        const control = el.closest('[role="checkbox"]');
+                        return control ? (control.getAttribute('aria-checked') || '') : '';
+                    }"""
+                ) or "").strip().lower()
+            except Exception:
+                aria_checked = ""
+
             if checkbox_id:
                 label = scope.query_selector(f"label[for='{checkbox_id}']")
-                if label:
+                if label and not label_text:
                     label_text = (label.text_content() or "").strip()
 
-            label_lower = " ".join(label_text.lower().split())
+            label_lower = _normalize_lookup_text(label_text)
             should_uncheck = checkbox_id == "follow-company-checkbox" or checkbox_name == "follow-company"
             if not should_uncheck and not any(token in label_lower for token in _FOLLOW_COMPANY_LABEL_TOKENS):
                 continue
 
-            if checkbox.is_checked():
-                if checkbox_id and label and label.is_visible():
-                    label.click(timeout=1000)
-                else:
-                    checkbox.uncheck(timeout=1000, force=True)
+            if aria_checked == "false":
+                return False
+
+            is_checked = aria_checked == "true"
+            if not is_checked:
+                try:
+                    is_checked = checkbox.is_checked()
+                except Exception:
+                    is_checked = checkbox.get_attribute("checked") is not None
+
+            if not is_checked:
+                return False
+
+            if _click_choice_input(scope, checkbox, "checkbox"):
                 return True
+
+            if checkbox_id and label and label.is_visible():
+                label.click(timeout=1000)
+            else:
+                checkbox.uncheck(timeout=1000, force=True)
+            return True
         except Exception:
             continue
     return False
@@ -1430,7 +2518,7 @@ def _match_experience_years(label_lower: str, answers: dict) -> str | None:
         if tech.lower() in label_lower:
             return str(years)
     if "experience" in label_lower or "years" in label_lower:
-        return "1"
+        return "4"
     return None
 
 
@@ -1519,6 +2607,35 @@ def _lookup_direct_mapping(label_text: str, mapping: dict) -> str | None:
     return best_value if best_score >= 0 else None
 
 
+def _lookup_salary_answer(answers: dict) -> str | None:
+    """Return a configured compensation answer for loosely worded salary fields."""
+    salary_tokens = ("salary", "compensation", "gehalt", "vergütung", "verguetung")
+    for key, value in (answers or {}).items():
+        if isinstance(value, (dict, list)) or value in (None, ""):
+            continue
+        key_norm = _normalize_lookup_text(key)
+        if any(token in key_norm for token in salary_tokens):
+            return str(value)
+    return None
+
+
+def _fallback_text_answer(label_text: str, profile: dict, answers: dict) -> str:
+    """Pick a usable text fallback for required fields LinkedIn rejects as blank."""
+    label_norm = _normalize_lookup_text(label_text)
+    salary_answer = _lookup_salary_answer(answers)
+
+    if any(token in label_norm for token in ["salary", "compensation", "base salary", "gehalt", "vergutung", "verguetung"]):
+        return salary_answer or "60000-80000 EUR"
+
+    if any(token in label_norm for token in ["years", "year", "jahre", "anzahl", "number", "how many", "wie viele"]):
+        return "4"
+
+    if "currency" in label_norm or "wahrung" in label_norm or "waehrung" in label_norm:
+        return "EUR"
+
+    return "a"
+
+
 def _infer_question_answer(label_text: str, profile: dict, answers: dict) -> str | None:
     """Infer an answer from config for common LinkedIn screening questions."""
     label_lower = " ".join(label_text.lower().split())
@@ -1544,14 +2661,33 @@ def _infer_question_answer(label_text: str, profile: dict, answers: dict) -> str
         return profile.get("last_name")
     if any(x in label_lower for x in ["email", "e-mail"]):
         return profile.get("email")
+    if any(x in label_lower for x in ["salary", "compensation", "base salary", "gehalt", "vergütung", "verguetung"]):
+        return _lookup_salary_answer(answers) or "60000-80000 EUR"
     if any(x in label_lower for x in ["city", "current location", "current city", "where are you located", "stadt", "wohnort", "ville"]) and "phone" not in label_lower:
         return profile.get("city")
     if "visa" in label_lower or "sponsorship" in label_lower:
         return answers.get("visa_sponsorship", "No")
-    if any(x in label_lower for x in ["authorized to work", "work authorization", "legally authorized"]):
+    if any(x in label_lower for x in [
+        "authorized to work",
+        "work authorization",
+        "legally authorized",
+        "right to work",
+        "legally work",
+        "rechtlich befugt",
+        "arbeitsberechtigt",
+        "arbeitserlaubnis",
+        "in diesem land zu arbeiten",
+    ]):
         return answers.get("authorized_to_work", "Yes")
-    if "onsite" in label_lower or "remote" in label_lower:
-        return answers.get("onsite")
+    if any(x in label_lower for x in [
+        "onsite",
+        "remote",
+        "hybrid",
+        "vor ort",
+        "abwechselnd",
+        "mobil",
+    ]):
+        return answers.get("onsite") or "Yes"
     if "financial services" in label_lower or "fintech" in label_lower:
         quant_years = _safe_years_value((answers.get("years_experience", {}) or {}).get("Quantitative Finance"))
         return "Yes" if quant_years and quant_years > 0 else "No"
@@ -1581,7 +2717,9 @@ def _infer_question_answer(label_text: str, profile: dict, answers: dict) -> str
 
     if any(x in label_lower for x in [
         "willing to move forward", "would you like to proceed", "are you interested",
-        "are you willing", "can you start", "are you available"
+        "are you willing", "can you start", "are you available",
+        "konnen sie sich vorstellen", "können sie sich vorstellen",
+        "sind sie bereit", "waren sie bereit", "wären sie bereit",
     ]):
         return "Yes"
 
@@ -1731,7 +2869,7 @@ def _choose_dropdown_value(input_elem, label_text: str, profile: dict, answers: 
 
 
 def _fill_text_input(input_elem, text_value: str) -> str:
-    """Fill a text input, retrying with '1' when the default 'a' is rejected."""
+    """Fill a text input, retrying with '4' when the default 'a' is rejected."""
     try:
         input_elem.fill(text_value, timeout=1000)
         return text_value
@@ -1739,8 +2877,8 @@ def _fill_text_input(input_elem, text_value: str) -> str:
         if text_value != "a":
             raise
 
-    input_elem.fill("1", timeout=1000)
-    return "1"
+    input_elem.fill("4", timeout=1000)
+    return "4"
 
 
 def _rewrite_default_a_fields_to_four(scope) -> int:
@@ -1860,15 +2998,22 @@ def _retry_numeric_validation_with_four(page, previous_scope_text: str, button, 
 
 def _score_option(label_text: str, option_text: str, inferred_value: str | None, profile: dict, answers: dict) -> int:
     label_lower = " ".join(label_text.lower().split())
+    label_norm = _normalize_lookup_text(label_text)
     option_lower = " ".join(option_text.lower().split())
+    option_norm = _normalize_lookup_text(option_text)
     score = 0
 
     if inferred_value:
         inferred_lower = str(inferred_value).lower()
-        if option_lower == inferred_lower:
+        inferred_norm = _normalize_lookup_text(inferred_value)
+        if option_norm == inferred_norm:
             score += 120
-        elif inferred_lower in option_lower:
+        elif inferred_norm and inferred_norm in option_norm:
             score += 90
+        if inferred_norm in _YES_OPTION_LABELS and option_norm in _YES_OPTION_LABELS:
+            score += 130
+        if inferred_norm in _NO_OPTION_LABELS and option_norm in _NO_OPTION_LABELS:
+            score += 130
 
         numeric_value = _safe_years_value(str(inferred_value))
         if numeric_value is not None:
@@ -1893,28 +3038,48 @@ def _score_option(label_text: str, option_text: str, inferred_value: str | None,
 
     if any(x in label_lower for x in ["visa", "sponsorship"]):
         if sponsorship == "no":
-            if option_lower in {"no", "false"} or "do not require" in option_lower or "no sponsorship" in option_lower:
+            if option_norm in _NO_OPTION_LABELS or "do not require" in option_lower or "no sponsorship" in option_lower:
                 score += 120
             if "sponsorship" in option_lower and any(x in option_lower for x in ["yes", "require", "need"]):
                 score -= 120
         elif sponsorship == "yes":
-            if option_lower in {"yes", "true"} or "require" in option_lower or "need sponsorship" in option_lower:
+            if option_norm in _YES_OPTION_LABELS or "require" in option_lower or "need sponsorship" in option_lower:
                 score += 120
 
-    if any(x in label_lower for x in ["authorized to work", "work authorization", "legally authorized", "right to work", "legally work"]):
+    if any(x in label_norm for x in [
+        "authorized to work",
+        "work authorization",
+        "legally authorized",
+        "right to work",
+        "legally work",
+        "rechtlich befugt",
+        "arbeitsberechtigt",
+        "arbeitserlaubnis",
+        "in diesem land zu arbeiten",
+    ]):
         if authorized == "yes":
-            if option_lower in {"yes", "true"}:
+            if option_norm in _YES_OPTION_LABELS:
                 score += 110
             if any(x in option_lower for x in ["eu", "germany", "german", "citizen", "citizenship", "permanent", "authorized", "work permit"]):
                 score += 95
-            if any(x in option_lower for x in ["no", "false", "need sponsorship", "require sponsorship", "none"]):
+            if option_norm in _NO_OPTION_LABELS or any(x in option_lower for x in ["need sponsorship", "require sponsorship", "none"]):
                 score -= 120
         elif authorized == "no":
-            if option_lower in {"no", "false"}:
+            if option_norm in _NO_OPTION_LABELS:
                 score += 110
 
-    if any(x in label_lower for x in ["open to relocating", "based in berlin", "willing"]):
-        if any(x in option_lower for x in ["yes", "open to relocating", "berlin", "germany"]):
+    if any(x in label_norm for x in [
+        "open to relocating",
+        "based in berlin",
+        "willing",
+        "konnen sie sich vorstellen",
+        "sind sie bereit",
+        "abwechselnd",
+        "vor ort",
+        "remote",
+        "hybrid",
+    ]):
+        if option_norm in _YES_OPTION_LABELS or any(x in option_lower for x in ["open to relocating", "berlin", "germany"]):
             score += 80
         if "outside" in option_lower:
             score -= 30
@@ -1938,7 +3103,121 @@ def _best_option_value(label_text: str, candidates: list[tuple[str, str]], infer
         score = _score_option(label_text, text, inferred_value, profile, answers)
         if score > best_score:
             best_text, best_value, best_score = text, value, score
+    if best_score <= 0:
+        return _fallback_choice_value(candidates)
     return best_value
+
+
+def _fallback_choice_value(candidates: list[tuple[str, str]]) -> str | None:
+    """Pick a required choice when no semantic match is available."""
+    if not candidates:
+        return None
+
+    for text, value in candidates:
+        if _normalize_lookup_text(text) in _YES_OPTION_LABELS or _normalize_lookup_text(value) in _YES_OPTION_LABELS:
+            return value
+
+    return candidates[0][1]
+
+
+def _choice_option_text(input_elem, role: str) -> str:
+    """Read visible option text from LinkedIn's custom choice wrappers."""
+    try:
+        return (input_elem.evaluate(
+            """(el, role) => {
+                const control = el.closest(`[role="${role}"]`);
+                if (!control) return '';
+                return (control.innerText || control.textContent || '').trim();
+            }""",
+            role,
+        ) or "").strip()
+    except Exception:
+        return ""
+
+
+def _click_choice_input(scope, input_elem, role: str) -> bool:
+    """Click a radio/checkbox using LinkedIn's visible wrapper when possible."""
+    try:
+        clicked = input_elem.evaluate(
+            """(el, role) => {
+                const control = el.closest(`[role="${role}"]`);
+                const target = control || el;
+                target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+                target.click();
+                return true;
+            }""",
+            role,
+        )
+        if clicked:
+            return True
+    except Exception:
+        pass
+
+    input_id = input_elem.get_attribute("id") or ""
+    if input_id:
+        try:
+            label = scope.query_selector(f"label[for='{input_id}']")
+            if label and label.is_visible():
+                label.click(timeout=1000)
+                return True
+        except Exception:
+            pass
+
+    try:
+        input_elem.check(timeout=1000, force=True)
+        return True
+    except Exception:
+        return False
+
+
+def _field_requires_answer(input_elem, label_text: str) -> bool:
+    """Return True when a field looks required or is currently failing validation."""
+    label_norm = _normalize_lookup_text(label_text)
+    if any(token in label_norm for token in _CONSENT_LABEL_TOKENS):
+        return True
+
+    try:
+        if input_elem.get_attribute("required") is not None:
+            return True
+    except Exception:
+        pass
+
+    try:
+        validation_text = input_elem.evaluate(
+            """(el) => {
+                const texts = [];
+                const collect = (node) => {
+                    if (node && (node.innerText || node.textContent)) {
+                        texts.push(node.innerText || node.textContent);
+                    }
+                };
+
+                const fieldset = el.closest('fieldset');
+                const container = el.closest('fieldset, [data-testid], div');
+                collect(fieldset);
+                collect(container);
+
+                for (const attr of ['aria-describedby', 'aria-errormessage']) {
+                    const value = el.getAttribute(attr) || fieldset?.getAttribute(attr) || '';
+                    for (const id of value.split(/\\s+/).filter(Boolean)) {
+                        collect(el.ownerDocument.getElementById(id));
+                    }
+                }
+
+                return texts.join('\\n').toLowerCase();
+            }"""
+        )
+        return any(text in str(validation_text or "") for text in _REQUIRED_VALIDATION_TEXTS)
+    except Exception:
+        return False
+
+
+def _has_required_validation(scope) -> bool:
+    try:
+        scope_text = _scope_text(scope).lower()
+    except Exception:
+        return False
+    return any(text in scope_text for text in _REQUIRED_VALIDATION_TEXTS)
 
 
 def _select_radio_group(scope, group_name: str, desired_value: str) -> bool:
@@ -1946,33 +3225,67 @@ def _select_radio_group(scope, group_name: str, desired_value: str) -> bool:
     if not group_name:
         return False
 
-    desired = desired_value.strip().lower()
+    desired = _normalize_lookup_text(desired_value)
     radios = scope.query_selector_all(f"input[type='radio'][name='{group_name}']")
 
     for radio in radios:
         try:
-            option_value = (radio.get_attribute("value") or "").strip().lower()
+            option_value = _normalize_lookup_text(radio.get_attribute("value") or "")
             radio_id = radio.get_attribute("id") or ""
-            label_text = ""
+            label_text = _normalize_lookup_text(_choice_option_text(radio, "radio"))
             if radio_id:
                 label = scope.query_selector(f"label[for='{radio_id}']")
-                if label:
-                    label_text = (label.text_content() or "").strip().lower()
+                if label and not label_text:
+                    label_text = _normalize_lookup_text(label.text_content() or "")
 
-            if desired not in {option_value, label_text}:
+            if desired not in {option_value, label_text} and not (
+                desired in _YES_OPTION_LABELS and (option_value in _YES_OPTION_LABELS or label_text in _YES_OPTION_LABELS)
+            ) and not (
+                desired in _NO_OPTION_LABELS and (option_value in _NO_OPTION_LABELS or label_text in _NO_OPTION_LABELS)
+            ):
                 continue
 
-            if radio_id:
-                label = scope.query_selector(f"label[for='{radio_id}']")
-                if label and label.is_visible():
-                    label.click(timeout=1000)
-                    return True
-
-            radio.check(timeout=1000, force=True)
-            return True
+            return _click_choice_input(scope, radio, "radio")
         except Exception:
             continue
 
+    return False
+
+
+def _radio_group_has_checked_option(scope, group_name: str) -> bool:
+    """Return True when LinkedIn already selected an option in a radio group."""
+    if not group_name:
+        return False
+
+    try:
+        radios = scope.query_selector_all(f"input[type='radio'][name='{group_name}']")
+    except Exception:
+        return False
+
+    for radio in radios:
+        try:
+            aria_checked = (radio.evaluate(
+                """el => {
+                    const control = el.closest('[role="radio"]');
+                    return control ? (control.getAttribute('aria-checked') || '') : '';
+                }"""
+            ) or "").strip().lower()
+            if aria_checked == "true":
+                return True
+            if aria_checked == "false":
+                continue
+        except Exception:
+            pass
+
+        try:
+            if radio.is_checked():
+                return True
+        except Exception:
+            try:
+                if radio.get_attribute("checked") is not None:
+                    return True
+            except Exception:
+                continue
     return False
 
 
@@ -1985,10 +3298,10 @@ def _select_best_radio_option(scope, group_name: str, label_text: str, inferred_
     for radio in radios:
         try:
             radio_id = radio.get_attribute("id") or ""
-            option_label = (radio.get_attribute("value") or "").strip()
+            option_label = _choice_option_text(radio, "radio") or (radio.get_attribute("value") or "").strip()
             if radio_id:
                 label = scope.query_selector(f"label[for='{radio_id}']")
-                if label:
+                if label and not option_label:
                     option_label = (label.text_content() or "").strip() or option_label
             if option_label:
                 candidates.append((option_label, option_label))
@@ -1996,6 +3309,8 @@ def _select_best_radio_option(scope, group_name: str, label_text: str, inferred_
             continue
 
     best_value = _best_option_value(label_text, candidates, inferred_value, profile, answers)
+    if not best_value:
+        best_value = _fallback_choice_value(candidates)
     if not best_value:
         return False
     return _select_radio_group(scope, group_name, best_value)
@@ -2006,29 +3321,26 @@ def _select_checkbox_option(scope, group_name: str, desired_value: str) -> bool:
     if not group_name:
         return False
 
-    desired = desired_value.strip().lower()
+    desired = _normalize_lookup_text(desired_value)
     checkboxes = scope.query_selector_all(f"input[type='checkbox'][name='{group_name}']")
     for checkbox in checkboxes:
         try:
-            option_value = (checkbox.get_attribute("value") or "").strip().lower()
+            option_value = _normalize_lookup_text(checkbox.get_attribute("value") or "")
             checkbox_id = checkbox.get_attribute("id") or ""
-            label_text = ""
+            label_text = _normalize_lookup_text(_choice_option_text(checkbox, "checkbox"))
             if checkbox_id:
                 label = scope.query_selector(f"label[for='{checkbox_id}']")
-                if label:
-                    label_text = (label.text_content() or "").strip().lower()
+                if label and not label_text:
+                    label_text = _normalize_lookup_text(label.text_content() or "")
 
-            if desired not in {option_value, label_text}:
+            if desired not in {option_value, label_text} and not (
+                desired in _YES_OPTION_LABELS and (option_value in _YES_OPTION_LABELS or label_text in _YES_OPTION_LABELS)
+            ) and not (
+                desired in _NO_OPTION_LABELS and (option_value in _NO_OPTION_LABELS or label_text in _NO_OPTION_LABELS)
+            ):
                 continue
 
-            if checkbox_id:
-                label = scope.query_selector(f"label[for='{checkbox_id}']")
-                if label and label.is_visible():
-                    label.click(timeout=1000)
-                    return True
-
-            checkbox.check(timeout=1000, force=True)
-            return True
+            return _click_choice_input(scope, checkbox, "checkbox")
         except Exception:
             continue
     return False
@@ -2043,10 +3355,10 @@ def _select_best_checkbox_option(scope, group_name: str, label_text: str, inferr
     for checkbox in checkboxes:
         try:
             checkbox_id = checkbox.get_attribute("id") or ""
-            option_label = (checkbox.get_attribute("value") or "").strip()
+            option_label = _choice_option_text(checkbox, "checkbox") or (checkbox.get_attribute("value") or "").strip()
             if checkbox_id:
                 label = scope.query_selector(f"label[for='{checkbox_id}']")
-                if label:
+                if label and not option_label:
                     option_label = (label.text_content() or "").strip() or option_label
             if option_label:
                 candidates.append((option_label, option_label))
@@ -2055,8 +3367,121 @@ def _select_best_checkbox_option(scope, group_name: str, label_text: str, inferr
 
     best_value = _best_option_value(label_text, candidates, inferred_value, profile, answers)
     if not best_value:
+        best_value = _fallback_choice_value(candidates)
+    if not best_value:
         return False
     return _select_checkbox_option(scope, group_name, best_value)
+
+
+def _repair_required_fields(scope, profile: dict, answers: dict) -> int:
+    """Fill required fields left invalid after LinkedIn shows validation errors."""
+    repaired = 0
+    processed_choice_groups = set()
+
+    try:
+        inputs = scope.query_selector_all("input, select, textarea")
+    except Exception:
+        return 0
+
+    for input_elem in inputs:
+        try:
+            field_type = (input_elem.get_attribute("type") or "").lower()
+            field_name = input_elem.get_attribute("name") or ""
+            group_name = field_name or input_elem.get_attribute("id") or ""
+            label_text = _extract_field_label(scope, input_elem)
+            choice_group_key = field_name or f"{field_type}:{_normalize_lookup_text(label_text)}" or group_name
+            if not _field_requires_answer(input_elem, label_text):
+                continue
+
+            try:
+                tag_name = input_elem.evaluate("el => el.tagName").lower()
+            except Exception:
+                tag_name = "unknown"
+
+            value = _infer_question_answer(label_text, profile, answers)
+
+            if field_type == "radio":
+                if choice_group_key in processed_choice_groups or _radio_group_has_checked_option(scope, group_name):
+                    processed_choice_groups.add(choice_group_key)
+                    continue
+                selected = False
+                if value:
+                    selected = _select_radio_group(scope, group_name, str(value))
+                if not selected:
+                    selected = _select_best_radio_option(scope, group_name, label_text, value, profile, answers)
+                if selected:
+                    repaired += 1
+                    processed_choice_groups.add(choice_group_key)
+                continue
+
+            if field_type == "checkbox":
+                if choice_group_key in processed_choice_groups:
+                    continue
+                try:
+                    if input_elem.is_checked():
+                        processed_choice_groups.add(choice_group_key)
+                        continue
+                except Exception:
+                    pass
+
+                selected = False
+                if not field_name:
+                    selected = _click_choice_input(scope, input_elem, "checkbox")
+                elif value and str(value).lower() in ["yes", "true", "selected"]:
+                    selected = _click_choice_input(scope, input_elem, "checkbox")
+                if not selected:
+                    selected = _select_best_checkbox_option(scope, group_name, label_text, value, profile, answers)
+                if selected:
+                    repaired += 1
+                    processed_choice_groups.add(choice_group_key)
+                continue
+
+            if tag_name == "select":
+                current_text = _element_current_text(input_elem).lower()
+                if current_text and _normalize_lookup_text(current_text) not in _SELECT_PLACEHOLDER_TEXTS:
+                    continue
+                selected_value = _choose_dropdown_value(input_elem, label_text, profile, answers)
+                if selected_value and _try_fill_select(input_elem, str(selected_value), label_text):
+                    repaired += 1
+                continue
+
+            current_text = _element_current_text(input_elem).strip()
+            if current_text and current_text.lower() != "a":
+                continue
+            text_value = str(value) if value else _fallback_text_answer(label_text, profile, answers)
+            _fill_text_input(input_elem, text_value)
+            repaired += 1
+        except Exception as exc:
+            log.debug("Could not repair required field: %s", exc)
+            continue
+
+    return repaired
+
+
+def _retry_required_validation(page, previous_scope_text: str, button, button_name: str, profile: dict, answers: dict) -> bool:
+    """Retry after a click leaves the Easy Apply step blocked by required validation."""
+    modal = _get_active_modal(page)
+    scope = modal or page
+    current_scope_text = _scope_text(scope)
+    if current_scope_text != previous_scope_text and not _has_required_validation(scope):
+        return False
+    if not _has_required_validation(scope):
+        return False
+
+    repaired = _repair_required_fields(scope, profile, answers)
+    if repaired <= 0:
+        return False
+
+    log.info(
+        "Step still shows required validation after %s; repaired %d field(s) and retrying",
+        button_name,
+        repaired,
+    )
+    page.wait_for_timeout(300)
+    if not _click_action_button(button):
+        return False
+    page.wait_for_timeout(2000)
+    return True
 
 
 def _parse_year_range(option_text: str) -> tuple[float, float] | None:
@@ -2171,6 +3596,113 @@ def _click_action_button(button) -> bool:
         return False
 
 
+def _button_label_matches(button, labels: set[str]) -> bool:
+    """Return True when a button's visible or accessible label matches."""
+    try:
+        raw_label = button.evaluate(
+            """el => [
+                el.getAttribute('aria-label') || '',
+                el.innerText || '',
+                el.textContent || '',
+                el.value || ''
+            ].join(' ')"""
+        )
+    except Exception:
+        raw_label = ""
+
+    label = _normalize_lookup_text(raw_label)
+    if not label:
+        return False
+
+    return any(candidate == label or candidate in label for candidate in labels)
+
+
+def _first_enabled_button_for_selectors(scope, selectors: list[str]):
+    """Find the first visible and enabled button matching any selector."""
+    for selector in selectors:
+        try:
+            for button in scope.query_selector_all(selector):
+                if button.is_visible() and button.is_enabled():
+                    return button
+        except Exception:
+            continue
+    return None
+
+
+def _first_enabled_button_for_labels(scope, labels: set[str]):
+    """Find an enabled button by text/aria label without relying on generated classes."""
+    try:
+        buttons = scope.query_selector_all("button, input[type='button'], input[type='submit']")
+    except Exception:
+        return None
+
+    for button in buttons:
+        try:
+            if button.is_visible() and button.is_enabled() and _button_label_matches(button, labels):
+                return button
+        except Exception:
+            continue
+    return None
+
+
+def _scroll_easy_apply_scope_to_end(scope) -> bool:
+    """Scroll nested Easy Apply containers so footer action buttons are reachable."""
+    try:
+        return bool(scope.evaluate(
+            """root => {
+                const doc = root.ownerDocument || document;
+                const candidates = [
+                    root,
+                    root.querySelector('[data-testid="dialog-content"]'),
+                    root.querySelector('[data-sdui-screen*="EasyApply"]'),
+                    root.querySelector('[data-component-type="LazyColumn"]'),
+                    ...root.querySelectorAll('[data-testid="dialog-content"], [data-component-type="LazyColumn"]'),
+                    ...root.querySelectorAll('div, section, form')
+                ].filter(Boolean);
+
+                let scrolled = false;
+                const seen = new Set();
+                for (const node of candidates) {
+                    if (seen.has(node)) continue;
+                    seen.add(node);
+                    const style = doc.defaultView.getComputedStyle(node);
+                    const canScroll = /(auto|scroll|overlay)/.test(style.overflowY)
+                        || node.scrollHeight > node.clientHeight + 4;
+                    if (!canScroll) continue;
+
+                    const before = node.scrollTop;
+                    node.scrollTop = node.scrollHeight;
+                    if (node.scrollTop !== before) {
+                        scrolled = true;
+                    }
+                }
+
+                return scrolled;
+            }"""
+        ))
+    except Exception:
+        return False
+
+
+def _find_easy_apply_action_button(scope, selectors: list[str], labels: set[str]):
+    """Find an Easy Apply action button, scrolling long SDUI modal content if needed."""
+    button = _first_enabled_button_for_selectors(scope, selectors)
+    if button:
+        return button
+
+    button = _first_enabled_button_for_labels(scope, labels)
+    if button:
+        return button
+
+    if _scroll_easy_apply_scope_to_end(scope):
+        button = _first_enabled_button_for_selectors(scope, selectors)
+        if button:
+            return button
+        return _first_enabled_button_for_labels(scope, labels)
+
+    return None
+
+
 def _confirm_typeahead_input(page, input_elem, value: str) -> bool:
     """Accept the first matching suggestion for LinkedIn typeahead inputs."""
     try:
@@ -2196,29 +3728,41 @@ def _fill_and_submit_form(
     profile: dict,
     answers: dict,
     resume_path: str = "",
+    photo_path: str = "",
     dry_run: bool = False,
 ) -> str:
     """Fill and submit the multi-step Easy Apply form.
 
     Returns:
-        "APPLIED", "SKIPPED", or "FAILED"
+        "APPLIED", "SKIPPED", "FAILED", or "LIMIT_REACHED"
     """
     try:
-        max_steps = 10
+        max_steps = 30
+        max_repeated_step_attempts = 10
         step = 0
+        repeated_step_counts: dict[str, int] = {}
+        blocked_progress_signature = ""
+        blocked_progress_attempts = 0
 
         while step < max_steps:
             step += 1
             log.info(f"Form step {step}")
             page.wait_for_timeout(1000)
 
-            modal = _get_active_modal(page)
+            modal = _wait_for_easy_apply_form_ready(page, timeout_ms=5000)
             scope = modal or page
+
+            if modal and _is_easy_apply_limit_modal(modal):
+                log.warning("LinkedIn says today's Easy Apply limit has been reached")
+                return "LIMIT_REACHED"
 
             if not modal:
                 content = page.content().lower()
                 if any(x in content for x in ["application sent", "thank you", "successfully"]):
                     return "APPLIED"
+                if "easy apply limit" in content and "tomorrow" in content:
+                    log.warning("LinkedIn says today's Easy Apply limit has been reached")
+                    return "LIMIT_REACHED"
                 log.warning("Easy Apply modal is no longer visible")
                 return "FAILED"
 
@@ -2233,6 +3777,17 @@ def _fill_and_submit_form(
             # Find all input fields on this step
             inputs = scope.query_selector_all("input, select, textarea")
             log.info(f"Found {len(inputs)} form fields on step {step}")
+            step_signature = _form_step_signature(scope, inputs)
+            if step_signature:
+                repeated_step_counts[step_signature] = repeated_step_counts.get(step_signature, 0) + 1
+                if repeated_step_counts[step_signature] > max_repeated_step_attempts:
+                    log.warning(
+                        "Easy Apply page repeated more than %d times; skipping this job",
+                        max_repeated_step_attempts,
+                    )
+                    _log_stuck_form_questions(_collect_field_questions(scope, inputs))
+                    _close_easy_apply_modal(page)
+                    return "SKIPPED"
 
             # Log field types for debugging
             field_types = {}
@@ -2245,8 +3800,21 @@ def _fill_and_submit_form(
             if field_types:
                 log.debug(f"Field types: {field_types}")
 
-            # Resume upload can be the only required action on a step.
-            resume_input = scope.query_selector("input[type='file']")
+            # Photo and resume upload can be the only required action on a step.
+            photo_input = _find_photo_upload_input(scope, photo_path)
+            if photo_input:
+                if photo_path:
+                    log.info(f"Uploading photo: {photo_path}")
+                    try:
+                        photo_input.set_input_files(photo_path)
+                        page.wait_for_timeout(2000)
+                    except Exception as e:
+                        log.warning(f"Could not upload photo: {e}")
+                elif _is_required_upload_input(scope, photo_input):
+                    log.info("Required photo upload field found, but no photo_path is configured; skipping this job")
+                    return "SKIPPED"
+
+            resume_input = _find_resume_upload_input(scope, resume_path) if resume_path else None
             if resume_input and resume_path:
                 log.info(f"Uploading resume: {resume_path}")
                 try:
@@ -2270,8 +3838,15 @@ def _fill_and_submit_form(
             for input_elem in inputs:
                 try:
                     field_name = input_elem.get_attribute("name") or ""
-                    field_type = input_elem.get_attribute("type") or ""
+                    field_type = (input_elem.get_attribute("type") or "").lower()
                     label_text = _extract_field_label(scope, input_elem)
+                    group_name = ""
+                    choice_group_key = ""
+                    if field_type in {"radio", "checkbox"}:
+                        group_name = field_name or input_elem.get_attribute("id") or ""
+                        choice_group_key = field_name or f"{field_type}:{_normalize_lookup_text(label_text)}" or group_name
+                        if choice_group_key in processed_choice_groups:
+                            continue
 
                     label_lower = label_text.lower()
                     log.debug(f"Field: {label_text[:40]}, type={field_type}, name={field_name}")
@@ -2286,8 +3861,9 @@ def _fill_and_submit_form(
                         tag_name = "unknown"
 
                     if field_type == "radio":
-                        group_name = field_name or input_elem.get_attribute("name") or input_elem.get_attribute("id") or ""
-                        if group_name in processed_choice_groups:
+                        if _radio_group_has_checked_option(scope, group_name):
+                            processed_choice_groups.add(choice_group_key)
+                            log.info(f"Leaving preselected radio answer unchanged for '{label_text}'")
                             continue
                         selected = False
                         if value:
@@ -2295,24 +3871,25 @@ def _fill_and_submit_form(
                         if not selected:
                             selected = _select_best_radio_option(scope, group_name, label_text, value, profile, answers)
                         if selected:
-                            processed_choice_groups.add(group_name)
+                            processed_choice_groups.add(choice_group_key)
                             log.info(f"Selected radio answer for '{label_text}'")
                         continue
                     if field_type == "checkbox":
-                        group_name = field_name or input_elem.get_attribute("name") or input_elem.get_attribute("id") or ""
-                        if group_name in processed_choice_groups:
-                            continue
                         selected = False
+                        try:
+                            if input_elem.is_checked():
+                                processed_choice_groups.add(choice_group_key)
+                                continue
+                        except Exception:
+                            pass
                         if value and str(value).lower() in ["yes", "true", "selected"]:
-                            try:
-                                input_elem.check(timeout=1000, force=True)
-                                selected = True
-                            except Exception:
-                                selected = False
+                            selected = _click_choice_input(scope, input_elem, "checkbox")
+                        if not selected and not field_name and _field_requires_answer(input_elem, label_text):
+                            selected = _click_choice_input(scope, input_elem, "checkbox")
                         if not selected:
                             selected = _select_best_checkbox_option(scope, group_name, label_text, value, profile, answers)
                         if selected:
-                            processed_choice_groups.add(group_name)
+                            processed_choice_groups.add(choice_group_key)
                             log.info(f"Selected checkbox answer for '{label_text}'")
                     elif tag_name == "select":
                         current_text = _element_current_text(input_elem).lower()
@@ -2338,7 +3915,7 @@ def _fill_and_submit_form(
                             log.info(f"Leaving prefilled email field unchanged: '{current_text}'")
                             continue
 
-                        text_value = str(value) if value else "a"
+                        text_value = str(value) if value else _fallback_text_answer(label_text, profile, answers)
                         used_typeahead = False
                         if any(x in label_lower for x in ["location", "city"]) or (
                             (input_elem.get_attribute("role") or "").lower() == "combobox"
@@ -2353,69 +3930,80 @@ def _fill_and_submit_form(
                     log.debug(f"Could not fill field: {e}")
                     continue
 
-            # LinkedIn often leaves the follow-company box checked by default.
-            try:
-                follow_checkbox = scope.query_selector("input[type='checkbox']")
-                if follow_checkbox and follow_checkbox.is_checked():
-                    label_text = ""
-                    checkbox_id = ""
-                    try:
-                        checkbox_id = follow_checkbox.get_attribute("id") or ""
-                        if checkbox_id:
-                            label = scope.query_selector(f"label[for='{checkbox_id}']")
-                            if label:
-                                label_text = (label.text_content() or "").lower()
-                    except Exception:
-                        pass
-                    if checkbox_id == "follow-company-checkbox" or any(
-                        token in label_text for token in _FOLLOW_COMPANY_LABEL_TOKENS
-                    ):
-                        follow_checkbox.uncheck()
-            except Exception:
-                pass
+            # LinkedIn can render follow-company state on the visible SDUI wrapper,
+            # while the nested input still exposes a stale checked attribute.
+            _uncheck_follow_company_checkbox(scope)
 
             scope_text_before_action = _scope_text(scope)
+
+            if not photo_path and _has_required_photo_upload_without_file(scope):
+                log.info("Required photo upload field is still empty and no photo_path is configured; skipping this job")
+                return "SKIPPED"
 
             if _has_upload_format_error(scope):
                 log.info("Upload format validation is still visible before proceeding; skipping this job")
                 return "SKIPPED"
 
+            is_review_submit_step = _is_review_submit_step(scope)
+            if is_review_submit_step:
+                log.info("Easy Apply review step detected; using final submit action")
+
             # Look for Next/Continue/Review button to go to next step.
-            next_btn = scope.query_selector(
-                "button:has-text('Next'), button:has-text('Continue'), "
-                "button:has-text('Review'), button:has-text('Suivant'), "
-                "button:has-text('Continuer'), button:has-text('Weiter'), "
-                "button:has-text('Überprüfen'), button:has-text('Uberprufen'), "
-                "button[aria-label*='Next'], button[aria-label*='Continue']"
-            )
-            if next_btn and next_btn.is_enabled():
+            next_btn = _find_easy_apply_next_button(scope)
+            if next_btn:
                 log.info(f"Clicking Next button on step {step}")
                 if not _click_action_button(next_btn):
                     log.warning(f"Could not click Next button on step {step}")
                     return "FAILED"
                 page.wait_for_timeout(2000)
-                _retry_numeric_validation_with_four(
+                if not _retry_required_validation(
                     page,
                     scope_text_before_action,
                     next_btn,
                     "Next",
-                )
+                    profile,
+                    answers,
+                ):
+                    _retry_numeric_validation_with_four(
+                        page,
+                        scope_text_before_action,
+                        next_btn,
+                        "Next",
+                    )
+                current_modal = _wait_for_easy_apply_form_ready(page, timeout_ms=1500)
+                current_scope = current_modal or page
+                if current_modal and _is_easy_apply_limit_modal(current_modal):
+                    log.warning("LinkedIn says today's Easy Apply limit has been reached")
+                    return "LIMIT_REACHED"
+                current_signature = _form_step_signature(current_scope)
+                if current_modal and step_signature and current_signature == step_signature:
+                    if blocked_progress_signature == step_signature:
+                        blocked_progress_attempts += 1
+                    else:
+                        blocked_progress_signature = step_signature
+                        blocked_progress_attempts = 1
+
+                    if blocked_progress_attempts > max_repeated_step_attempts:
+                        log.warning(
+                            "Easy Apply did not advance after %d %s attempts; skipping this job",
+                            blocked_progress_attempts,
+                            "Next",
+                        )
+                        _log_stuck_form_questions(_collect_field_questions(current_scope))
+                        _close_easy_apply_modal(page)
+                        return "SKIPPED"
+                else:
+                    blocked_progress_signature = ""
+                    blocked_progress_attempts = 0
                 continue
 
             # Look for final Submit/Apply button
-            submit_btn = (
-                scope.query_selector("button[aria-label='Submit application']")
-                or scope.query_selector("[data-live-test-easy-apply-submit-button]")
-                or scope.query_selector("button:has-text('Submit application')")
-                or scope.query_selector("button:has-text('Envoyer la candidature')")
-                or scope.query_selector("button:has-text('Bewerbung absenden')")
-                or scope.query_selector("button:has-text('Submit')")
-                or scope.query_selector("button:has-text('Apply')")
-                or scope.query_selector("button:has-text('Send')")
-                or scope.query_selector("button[type='submit']")
-                or scope.query_selector("button:has-text('Finish')")
+            submit_btn = _find_easy_apply_action_button(
+                scope,
+                _EASY_APPLY_SUBMIT_BUTTON_SELECTORS,
+                _EASY_APPLY_SUBMIT_BUTTON_LABELS,
             )
-            if submit_btn and submit_btn.is_enabled():
+            if submit_btn:
                 if dry_run:
                     log.info("Dry run active; stopping before final submit")
                     return "SKIPPED"
@@ -2425,12 +4013,20 @@ def _fill_and_submit_form(
                     log.warning(f"Could not click Submit button on step {step}")
                     return "FAILED"
                 page.wait_for_timeout(2000)
-                _retry_numeric_validation_with_four(
+                if not _retry_required_validation(
                     page,
                     scope_text_before_action,
                     submit_btn,
                     "Submit",
-                )
+                    profile,
+                    answers,
+                ):
+                    _retry_numeric_validation_with_four(
+                        page,
+                        scope_text_before_action,
+                        submit_btn,
+                        "Submit",
+                    )
 
                 # Check for success message
                 page.wait_for_timeout(1000)
@@ -2439,16 +4035,46 @@ def _fill_and_submit_form(
                     log.info("Application submitted successfully!")
                     return "APPLIED"
 
+                current_modal = _get_active_modal(page)
+                if current_modal:
+                    if _is_easy_apply_limit_modal(current_modal):
+                        log.warning("LinkedIn says today's Easy Apply limit has been reached")
+                        return "LIMIT_REACHED"
+                    current_signature = _form_step_signature(current_modal)
+                    if step_signature and current_signature == step_signature:
+                        if blocked_progress_signature == step_signature:
+                            blocked_progress_attempts += 1
+                        else:
+                            blocked_progress_signature = step_signature
+                            blocked_progress_attempts = 1
+
+                        if blocked_progress_attempts > max_repeated_step_attempts:
+                            log.warning(
+                                "Easy Apply did not advance after %d %s attempts; skipping this job",
+                                blocked_progress_attempts,
+                                "Submit",
+                            )
+                            _log_stuck_form_questions(_collect_field_questions(current_modal))
+                            _close_easy_apply_modal(page)
+                            return "SKIPPED"
+
                 return "APPLIED"  # Assume success
 
             # If the modal is still open but we cannot advance, treat it as a failure.
+            if not inputs:
+                log.info("Easy Apply form has no fields or action buttons yet; waiting for LinkedIn to finish rendering")
+                page.wait_for_timeout(2000)
+                continue
+
             log.warning(f"Could not find an actionable button on step {step}")
             return "FAILED"
 
+        _close_easy_apply_modal(page)
         return "FAILED"
 
     except Exception as e:
         log.error(f"Error filling form: {e}")
         import traceback
         traceback.print_exc()
+        _close_easy_apply_modal(page)
         return "FAILED"

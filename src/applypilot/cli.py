@@ -313,6 +313,37 @@ def linkedin_apply(
         console.print(f"[red]Resume not found:[/red] {resume_path}")
         raise typer.Exit(code=1)
 
+    language_resume_paths = config.get("resume_paths", {})
+    if not isinstance(language_resume_paths, dict):
+        console.print("[red]Invalid resume_paths:[/red] expected an object with english/german paths")
+        raise typer.Exit(code=1)
+    english_resume_path_value = str(
+        language_resume_paths.get("english")
+        or language_resume_paths.get("en")
+        or config.get("english_resume_path", "")
+        or ""
+    ).strip()
+    german_resume_path_value = str(
+        language_resume_paths.get("german")
+        or language_resume_paths.get("de")
+        or config.get("german_resume_path", "")
+        or ""
+    ).strip()
+    for language, path_value in (
+        ("English resume", english_resume_path_value),
+        ("German resume", german_resume_path_value),
+    ):
+        if path_value and not Path(path_value).exists():
+            console.print(f"[red]{language} not found:[/red] {path_value}")
+            raise typer.Exit(code=1)
+
+    photo_path_value = str(config.get("photo_path", "") or "").strip()
+    if photo_path_value:
+        photo_path = Path(photo_path_value)
+        if not photo_path.exists():
+            console.print(f"[red]Photo not found:[/red] {photo_path}")
+            raise typer.Exit(code=1)
+
     from applypilot.linkedin.unified_apply import _build_linkedin_search_url
 
     computed_search_url = _build_linkedin_search_url(config)
@@ -323,8 +354,14 @@ def linkedin_apply(
     console.print(f"  Location: {config.get('location', 'N/A')}")
     console.print(f"  URL:     {computed_search_url}")
     console.print(f"  Keyword: {config.get('title_keyword', 'N/A')}")
+    console.print(f"  Only EN: {config.get('only_english', False)}")
+    console.print(f"  CV auto: {config.get('auto_select_resume_by_job_language', bool(english_resume_path_value or german_resume_path_value))}")
+    console.print(f"  CV EN:   {english_resume_path_value or 'fallback'}")
+    console.print(f"  CV DE:   {german_resume_path_value or 'fallback'}")
+    console.print(f"  Photo:   {photo_path_value or 'N/A'}")
     console.print(f"  Max:     {config.get('max_applications', 'N/A')}")
     console.print(f"  Delay:   {config.get('delay', 0)}s")
+    console.print(f"  Random:  {config.get('random', False)}")
     console.print(f"  Model:   {model}")
     console.print(f"  Dry run: {dry_run}")
     console.print(f"  Exact location: {exactlocation}")
@@ -355,6 +392,50 @@ def linkedin_apply(
     console.print(f"  Applied:  {result['applied']}")
     console.print(f"  Skipped:  {result['skipped']}")
     console.print(f"  Failed:   {result['failed']}")
+    if result.get("stopped_reason") == "easy_apply_limit_reached":
+        console.print("\n[yellow]LinkedIn Easy Apply limit reached for today. Stopping run; try again tomorrow.[/yellow]")
+
+
+@app.command(name="linkedin-scrape")
+def linkedin_scrape(
+    config_path: str = typer.Option("config/linkedin_apply.json", "--config", "-c",
+                                    help="Path to the LinkedIn JSON config."),
+    headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
+    exactlocation: bool = typer.Option(False, "--exactlocation", help="Select the exact configured location."),
+    setup: bool = typer.Option(False, "--setup", help="Open the saved session for manual login until Ctrl+C."),
+) -> None:
+    """Save matching LinkedIn job cards and descriptions to scrapedjobs/<title>_<date>.json."""
+    import json
+    from pathlib import Path
+
+    from applypilot.config import load_env
+    from applypilot.linkedin.scrape import build_search_url, search_and_scrape, validate_config
+
+    try:
+        settings = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        limit = validate_config(settings)
+        load_env()
+        console.print("\n[bold blue]LinkedIn Job Scraper[/bold blue]")
+        console.print(f"  Title: {settings['job_title']}")
+        console.print(f"  Location: {settings['location']}")
+        console.print(f"  Only English: {settings.get('only_english', False)}")
+        console.print(f"  Maximum saved jobs: {limit}")
+        console.print(f"  Search: {build_search_url(settings)}")
+        result = search_and_scrape(settings, headless=headless, exact_location=exactlocation, setup=setup)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Stopped. Jobs already saved remain in scrapedjobs/.[/yellow]")
+        raise typer.Exit(code=130)
+    except Exception as exc:
+        console.print(f"[red]LinkedIn scrape failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if result["output"]:
+        console.print(f"\nAttempted: {result['attempted']}  Saved: {result['saved']}  "
+                      f"Skipped: {result['skipped']}  Failed: {result['failed']}")
+        console.print(f"JSON: {result['output']}")
+        if result["failed"] and not result["saved"]:
+            console.print("[red]No jobs were saved. See the extraction errors above.[/red]")
+            raise typer.Exit(code=1)
 
 
 @app.command(name="linkedin-noneasy")
@@ -424,6 +505,86 @@ def linkedin_noneasy(
     console.print(f"  Applied:             {result['applied']}")
     console.print(f"  Skipped:             {result['skipped']}")
     console.print(f"  Failed:              {result['failed']}")
+
+
+@app.command(name="stepstone")
+def stepstone_apply(
+    config_path: str = typer.Option("config/stepstone_apply.json", "--config", "-c",
+                                    help="Path to stepstone_apply.json config file"),
+    headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    setup: bool = typer.Option(
+        False,
+        "--setup",
+        help="Open the StepStone session and keep it alive until Ctrl+C for manual browser changes.",
+    ),
+) -> None:
+    """Deterministic StepStone quick-apply bot."""
+    import json
+    from pathlib import Path
+
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    from applypilot.stepstone.apply import build_stepstone_search_url, search_and_apply
+
+    check_tier(3, "stepstone")
+
+    config_file = Path(config_path)
+    if not config_file.exists():
+        console.print(f"[red]Config not found:[/red] {config_path}")
+        console.print(f"[yellow]Template:[/yellow] {Path('config/stepstone_apply.json').resolve()}")
+        raise typer.Exit(code=1)
+
+    try:
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        console.print(f"[red]Invalid JSON in config:[/red] {e}")
+        raise typer.Exit(code=1)
+
+    required_keys = ["job_title", "location", "profile", "answers", "resume_path"]
+    for key in required_keys:
+        if key not in config:
+            console.print(f"[red]Missing required config key:[/red] {key}")
+            raise typer.Exit(code=1)
+
+    resume_path = Path(config["resume_path"])
+    if not setup and not resume_path.exists():
+        console.print(f"[red]Resume not found:[/red] {resume_path}")
+        raise typer.Exit(code=1)
+
+    computed_search_url = build_stepstone_search_url(config)
+
+    console.print("\n[bold blue]StepStone Quick Apply[/bold blue]")
+    console.print(f"  Config:   {config_file.resolve()}")
+    console.print(f"  Title:    {config.get('job_title', 'N/A')}")
+    console.print(f"  Location: {config.get('location', 'N/A')}")
+    console.print(f"  URL:      {computed_search_url}")
+    console.print(f"  Keyword:  {config.get('title_keyword', 'N/A')}")
+    console.print(f"  Max:      {config.get('max_applications', 'N/A')}")
+    console.print(f"  Delay:    {config.get('delay', 0)}s")
+    console.print(f"  Dry run:  {dry_run}")
+    console.print(f"  Setup:    {setup}")
+    console.print()
+
+    if setup:
+        console.print("[cyan]Starting StepStone setup session...[/cyan]")
+    else:
+        console.print("[cyan]Starting StepStone Quick Apply...[/cyan]")
+
+    result = search_and_apply(
+        config_dict=config,
+        max_applications=int(config.get("max_applications", 1)),
+        title_keyword=str(config.get("title_keyword", "") or ""),
+        headless=headless,
+        dry_run=dry_run,
+        setup=setup,
+    )
+
+    console.print("\n[bold]Summary:[/bold]")
+    console.print(f"  Applied:  {result['applied']}")
+    console.print(f"  Skipped:  {result['skipped']}")
+    console.print(f"  Failed:   {result['failed']}")
 
 
 @app.command()

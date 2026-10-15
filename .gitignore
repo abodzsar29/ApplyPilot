@@ -16,10 +16,29 @@ data/AndrewBodzsarCV.pdf
 entirepages/windowforlocation.html
 snapshot-2026-04-13T13-02-00.000Z.md
 snapshot.md
+data/
+config/
+11926.txt
+
+# Business files
+noneasymerge/
+resultspage_files/
+jobcard_files/
+index_files/
+fails_files/
+failedbirthday_files/
+extensiveapplication_files/
+applyprocess_files/
+results.html
+glassdoor_helsing_interview_reviews.txt
+errors/
+cryptoproject/
+coverletter/
 
 
 
 # Runtime artifacts
+scrapedjobs/
 *.db
 tailored_resumes/
 cover_letters/
