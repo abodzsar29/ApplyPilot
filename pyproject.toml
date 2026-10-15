@@ -30,7 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.1"]
-qwen = ["qwen-agent[mcp]"]
+# Qwen-Agent 0.0.34 imports these without declaring them as dependencies.
+# Its MCP connector still uses the v1 streamablehttp_client API.
+qwen = ["qwen-agent[mcp]", "mcp>=1.8,<2", "soundfile", "tqdm"]
 
 [project.scripts]
 applypilot = "applypilot.cli:app"

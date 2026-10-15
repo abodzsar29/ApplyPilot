@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from copy import deepcopy
 from typing import Any
-
-import openai
 
 
 def get_qwen_api_key() -> str:
@@ -105,6 +104,79 @@ def _render_messages(messages: list[dict[str, Any]]) -> str:
     return "\n".join(content)
 
 
+def _normalize_openrouter_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return OpenAI-compatible tool messages with matching call IDs.
+
+    Qwen-Agent 0.0.34 serializes tool responses with an ``id`` field. The
+    OpenAI chat-completions schema used by OpenRouter requires
+    ``tool_call_id`` instead, and some providers stream an empty call ID.
+    """
+    normalized = deepcopy(messages)
+    pending_call_ids: list[str] = []
+    call_number = 0
+
+    for message in normalized:
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                call_number += 1
+                call_id = str(tool_call.get("id") or "").strip()
+                if not call_id:
+                    call_id = f"call_applypilot_{call_number}"
+                tool_call["id"] = call_id
+                pending_call_ids.append(call_id)
+            continue
+
+        if message.get("role") != "tool":
+            continue
+
+        tool_call_id = message.pop("tool_call_id", "")
+        legacy_id = message.pop("id", "")
+        supplied_id = str(tool_call_id or legacy_id or "").strip()
+        if supplied_id and supplied_id in pending_call_ids:
+            call_id = supplied_id
+            pending_call_ids.remove(supplied_id)
+        elif pending_call_ids:
+            call_id = pending_call_ids.pop(0)
+        else:
+            call_number += 1
+            call_id = supplied_id or f"call_applypilot_{call_number}"
+
+        message["tool_call_id"] = call_id
+        # These are Qwen-Agent bookkeeping fields, not chat-completions fields.
+        message.pop("extra", None)
+        message.pop("function_call", None)
+        message.pop("reasoning_content", None)
+
+    return normalized
+
+
+def _openrouter_chat_model(llm_cfg: dict):
+    """Build Qwen-Agent's OAI model with its tool-message schema repaired."""
+    from qwen_agent.llm.oai import TextChatAtOAI
+
+    class OpenRouterTextChat(TextChatAtOAI):
+        @staticmethod
+        def _conv_qwen_agent_messages_to_oai(messages):
+            converted = TextChatAtOAI._conv_qwen_agent_messages_to_oai(messages)
+            return _normalize_openrouter_tool_messages(converted)
+
+    return OpenRouterTextChat(llm_cfg)
+
+
+def _has_terminal_result(output: str) -> bool:
+    """Return True only when output contains a complete terminal result line."""
+    statuses = ("APPLIED", "READY", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE")
+    for line in output.splitlines():
+        line = line.strip().strip('`*"').strip()
+        if line == "RESULT:APPLIED (dry run)":
+            return True
+        if line in {f"RESULT:{status}" for status in statuses}:
+            return True
+        if line.startswith("RESULT:FAILED:") and line.removeprefix("RESULT:FAILED:").strip():
+            return True
+    return False
+
+
 class QwenMCPAgent:
     """Thin wrapper around qwen-agent for MCP-driven browser tasks."""
 
@@ -153,12 +225,14 @@ class QwenMCPAgent:
                 }
             )
 
+        assistant_llm = _openrouter_chat_model(llm_cfg) if provider == "openrouter" else llm_cfg
         self._assistant = Assistant(
-            llm=llm_cfg,
+            llm=assistant_llm,
             function_list=[mcp_config],
             name="ApplyPilot Qwen MCP Agent",
             description="Autonomous browser agent for job applications.",
         )
+        self._provider = provider
         self._llm_cfg = llm_cfg
         self._mcp_config = mcp_config
 
@@ -175,8 +249,9 @@ class QwenMCPAgent:
         generate_cfg["extra_body"] = extra_body
         llm_cfg["generate_cfg"] = generate_cfg
         self._llm_cfg = llm_cfg
+        assistant_llm = _openrouter_chat_model(llm_cfg) if self._provider == "openrouter" else llm_cfg
         self._assistant = Assistant(
-            llm=llm_cfg,
+            llm=assistant_llm,
             function_list=[self._mcp_config],
             name="ApplyPilot Qwen MCP Agent",
             description="Autonomous browser agent for job applications.",
@@ -195,10 +270,25 @@ class QwenMCPAgent:
             delta = rendered[len(last_rendered):] if rendered.startswith(last_rendered) else rendered
             if delta:
                 log_handle.write(delta)
-                if not delta.endswith("\n"):
-                    log_handle.write("\n")
             last_rendered = rendered
+        if rendered:
+            log_handle.write("\n")
         return rendered
+
+    def _run_with_reasoning_fallback(self, prompt: str, log_handle) -> str:
+        """Run once, enabling mandatory reasoning when a provider requires it."""
+        try:
+            return self._run_once(prompt, log_handle)
+        except Exception as exc:
+            message = str(exc)
+            needs_reasoning = (
+                "Reasoning is mandatory for this endpoint and cannot be disabled" in message
+            )
+            if not needs_reasoning:
+                raise
+            self._rebuild_with_reasoning(True)
+            log_handle.write("[INFO] Retrying with reasoning enabled.\n")
+            return self._run_once(prompt, log_handle)
 
     def run_prompt(self, prompt: str, log_path=None) -> str:
         """Execute one prompt and return the final rendered transcript."""
@@ -214,18 +304,28 @@ class QwenMCPAgent:
             should_close = True
 
         try:
-            try:
-                return self._run_once(prompt, log_handle)
-            except Exception as exc:
-                message = str(exc)
-                needs_reasoning = (
-                    "Reasoning is mandatory for this endpoint and cannot be disabled" in message
-                )
-                if not needs_reasoning:
-                    raise
-                self._rebuild_with_reasoning(True)
-                log_handle.write("[INFO] Retrying with reasoning enabled.\n")
-                return self._run_once(prompt, log_handle)
+            outputs: list[str] = []
+            attempt_prompt = prompt
+            for attempt in range(1, 4):
+                if attempt > 1:
+                    log_handle.write(
+                        f"[INFO] No terminal RESULT line; continuing agent attempt {attempt}/3.\n"
+                    )
+                output = self._run_with_reasoning_fallback(attempt_prompt, log_handle)
+                outputs.append(output)
+                if _has_terminal_result(output):
+                    break
+                attempt_prompt = f"""{prompt}
+
+== CONTINUATION AFTER AN INCOMPLETE AGENT TURN ==
+A previous agent turn stopped without a terminal RESULT line. Inspect the current
+browser state before changing anything. If the application is already submitted,
+confirm the visible success state and output RESULT:APPLIED. Otherwise continue the
+application now by invoking browser tools immediately. Do not narrate a future plan,
+ask for permission, close the browser, or stop before one terminal RESULT line.
+Continuation attempt: {attempt + 1} of 3.
+"""
+            return "\n".join(part for part in outputs if part)
         finally:
             if should_close:
                 log_handle.close()

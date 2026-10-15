@@ -442,7 +442,7 @@ def linkedin_scrape(
 def linkedin_noneasy(
     config_path: str = typer.Option("config/linkedin_apply.json", "--config", "-c",
                                     help="Path to linkedin_apply.json config file"),
-    model: str = typer.Option("qwen-flash", "--model", "-m", help="Qwen model name."),
+    model: str = typer.Option("qwen-flash", "--model", "-m", help="Model name for the configured provider."),
     headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
 ) -> None:
@@ -453,7 +453,7 @@ def linkedin_noneasy(
     _bootstrap()
 
     from applypilot.config import check_non_easy_provider_requirements
-    from applypilot.linkedin.non_easy import run_non_easy_apply
+    from applypilot.linkedin.non_easy import run_non_easy_apply, validate_non_easy_config
     from applypilot.qwen_mcp import get_effective_model_and_provider
 
     effective_model, provider = get_effective_model_and_provider(model)
@@ -477,9 +477,10 @@ def linkedin_noneasy(
             console.print(f"[red]Missing required config key:[/red] {key}")
             raise typer.Exit(code=1)
 
-    resume_path = Path(config["resume_path"])
-    if not resume_path.exists():
-        console.print(f"[red]Resume not found:[/red] {resume_path}")
+    try:
+        validate_non_easy_config(config)
+    except ValueError as exc:
+        console.print(f"[red]Invalid application configuration:[/red] {exc}")
         raise typer.Exit(code=1)
 
     console.print("\n[bold blue]LinkedIn Non-Easy-Apply[/bold blue]")
@@ -490,6 +491,9 @@ def linkedin_noneasy(
     console.print(f"  Max:      {config.get('max_applications', 'N/A')}")
     console.print(f"  Provider: {provider}")
     console.print(f"  Model:    {effective_model}")
+    console.print(f"  Only EN:  {config.get('only_english', False)}")
+    console.print(f"  Photo:    {config.get('photo_path') or 'Not configured'}")
+    console.print(f"  Mailbox:  {config.get('mail_inbox_url') or 'Automatic for Proton Mail addresses'}")
     console.print(f"  Dry run:  {dry_run}")
     console.print()
 
@@ -503,8 +507,11 @@ def linkedin_noneasy(
     console.print("\n[bold]Summary:[/bold]")
     console.print(f"  Found external jobs: {result['found']}")
     console.print(f"  Applied:             {result['applied']}")
+    console.print(f"  Ready (dry run):     {result['ready']}")
     console.print(f"  Skipped:             {result['skipped']}")
     console.print(f"  Failed:              {result['failed']}")
+    if result.get("stopped_reason"):
+        console.print(f"[yellow]Stopped:[/yellow] {result['stopped_reason']}")
 
 
 @app.command(name="stepstone")

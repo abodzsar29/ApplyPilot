@@ -22,10 +22,144 @@ from applypilot.apply.chrome import (
     reset_worker_dir,
 )
 from applypilot.qwen_mcp import QwenMCPAgent, get_effective_model_and_provider
+from applypilot.linkedin.unified_apply import (
+    _configured_language_resume_paths,
+    _detect_job_language,
+    _job_language_allowed,
+    _select_resume_path_for_job,
+)
 
 log = logging.getLogger(__name__)
 
 LINKEDIN_BASE_URL = "https://www.linkedin.com"
+PROTONMAIL_INBOX_URL = "https://mail.proton.me/u/0/inbox"
+
+
+def _history_path() -> Path:
+    return config.APP_DIR / "linkedin_noneasy_applied.jsonl"
+
+
+def _job_registry_key(job: dict) -> str:
+    """Prefer job identity; title/company is only a legacy fallback."""
+    url = job.get("linkedin_url", "")
+    if isinstance(url, str) and url:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if host == "linkedin.com" or host.endswith(".linkedin.com"):
+            match = re.search(r"/jobs/view/(?:[^/]*-)?(\d+)(?:/|$)", parsed.path)
+            if match:
+                return f"linkedin:{match.group(1)}"
+    title, company = job.get("title"), job.get("company")
+    if not isinstance(title, str) or not isinstance(company, str):
+        return ""
+    title, company = (" ".join(value.split()).casefold() for value in (title, company))
+    if not title or not company or title == "unknown title" or company == "unknown company":
+        return ""
+    return f"legacy:{title}\t{company}"
+
+
+def _load_applied_job_keys() -> set[str]:
+    keys: set[str] = set()
+    try:
+        with _history_path().open(encoding="utf-8") as fh:
+            for number, line in enumerate(fh, 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    key = _job_registry_key(row) if isinstance(row, dict) else ""
+                except (ValueError, TypeError):
+                    key = ""
+                if key:
+                    keys.add(key)
+                else:
+                    log.warning("Ignoring invalid application history record on line %s", number)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        log.exception("Cannot read application history: %s", _history_path())
+        raise
+    return keys
+
+
+def _was_applied(job: dict, keys: set[str]) -> bool:
+    job_key = _job_registry_key(job)
+    legacy_key = _job_registry_key({"title": job.get("title"), "company": job.get("company")})
+    return bool((job_key and job_key in keys) or (legacy_key and legacy_key in keys))
+
+
+def _record_applied_job(job: dict) -> None:
+    entry = {key: job.get(key, "") for key in ("title", "company", "linkedin_url", "application_url")}
+    entry["recorded_at"] = int(time.time())
+    path = _history_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A separator also isolates a truncated final record from an interrupted run.
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("\n" + json.dumps(entry, ensure_ascii=True) + "\n")
+
+
+def _mailbox_context(settings: dict) -> tuple[str | None, str]:
+    email = str((settings.get("profile") or {}).get("email") or "").strip()
+    url = str(settings.get("mail_inbox_url") or "").strip()
+    if url:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("mail_inbox_url must be an HTTP(S) inbox URL")
+        return url, email
+    if email.lower().endswith(("@proton.me", "@protonmail.com", "@pm.me")):
+        return PROTONMAIL_INBOX_URL, email
+    return None, email
+
+
+def _ensure_mailbox_tab(context, settings: dict, excluded_pages=()):
+    url, _ = _mailbox_context(settings)
+    if not url:
+        return None
+    for page in context.pages:
+        if page not in excluded_pages and not page.is_closed() and page.url.startswith(url):
+            return page
+    page = context.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        return page
+    except Exception as exc:
+        log.warning("Could not open mailbox: %s", exc)
+        page.close()
+        return None
+
+
+def _close_application_tabs(context, keep):
+    for page in list(context.pages):
+        if page not in keep:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+
+def validate_non_easy_config(settings: dict) -> None:
+    paths = {"resume_path": settings.get("resume_path")}
+    paths.update({f"resume_paths.{lang}": path for lang, path in
+                  _configured_language_resume_paths(settings).items() if path})
+    if settings.get("photo_path"):
+        paths["photo_path"] = settings["photo_path"]
+    for label, path in paths.items():
+        if not isinstance(path, str) or not path.strip() or not Path(path).is_file():
+            raise ValueError(f"{label} is not a file: {path}")
+        try:
+            with Path(path).open("rb"):
+                pass
+        except OSError as exc:
+            raise ValueError(f"{label} cannot be read: {path}") from exc
+    _mailbox_context(settings)
+
+
+def _settings_for_job(settings: dict, description: str) -> tuple[dict | None, str]:
+    language = _detect_job_language(description)
+    if not _job_language_allowed(settings, language):
+        return None, language
+    resume, _ = _select_resume_path_for_job(settings, description, settings["resume_path"])
+    return {**settings, "resume_path": resume}, language
 
 
 def _make_mcp_config(cdp_port: int) -> dict:
@@ -52,17 +186,14 @@ def _extract_result(output: str) -> str:
     if "insufficient credits" in lowered or "insufficient balance" in lowered:
         return "failed:provider_credit_low"
 
-    for result_status in ("APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"):
-        if f"RESULT:{result_status}" in output:
-            return result_status.lower()
-
-    if "RESULT:FAILED" in output:
-        for out_line in output.splitlines():
-            if "RESULT:FAILED" not in out_line:
-                continue
-            reason = out_line.split("RESULT:FAILED:", 1)[-1].strip()
-            reason = re.sub(r'[*`"]+$', "", reason).strip() or "unknown"
-            return f"failed:{reason}"
+    for line in reversed(output.splitlines()):
+        line = line.strip().strip('`*"').strip()
+        if line == "RESULT:APPLIED (dry run)":
+            return "ready"
+        match = re.fullmatch(r"RESULT:(APPLIED|READY|EXPIRED|CAPTCHA|LOGIN_ISSUE|FAILED)(?::(.*))?", line)
+        if match:
+            status, reason = match.groups()
+            return f"failed:{reason or 'unknown'}" if status == "FAILED" else status.lower()
 
     return "failed:no_result_line"
 
@@ -133,6 +264,31 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     answers = config_dict.get("answers", {}) or {}
     resume_path = Path(config_dict["resume_path"]).resolve()
     resume_text = _read_resume_text(resume_path)
+    photo = str(config_dict.get("photo_path") or "").strip()
+    photo_path = str(Path(photo).resolve()) if photo else "Not configured"
+    mailbox_url, applicant_email = _mailbox_context(config_dict)
+    mailbox_section = """
+== EMAIL VERIFICATION ==
+No mailbox is configured. If an email code is required, output
+RESULT:FAILED:email_2fa_unavailable. Do not repeatedly attempt to continue.
+"""
+    if mailbox_url:
+        mailbox_section = f"""
+== EMAIL VERIFICATION ==
+Applicant email: {applicant_email}
+Mailbox URL: {mailbox_url}
+- Only use this inbox when the application visibly requests an email verification
+  code, OTP, or one-time passcode. Otherwise ignore the mailbox.
+- Use the existing mailbox tab. If it is absent, open the configured inbox URL.
+- Check the newest relevant employer/ATS verification message for this application,
+  read its code, return to the application tab, and enter the code.
+- Check at most three times, waiting at most 10 seconds between checks. If the
+  inbox requires a login you cannot complete using the existing session, or no
+  matching code arrives, output RESULT:FAILED:email_2fa_unavailable.
+- Do not send, delete, or modify mail. Do not print verification codes in logs.
+- Account registration may continue with the supplied email and available profile
+  details. If required credentials are unavailable, output RESULT:LOGIN_ISSUE.
+"""
 
     profile_lines = [
         f"First name: {profile.get('first_name', '')}",
@@ -147,7 +303,7 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     education_summary = _education_summary(answers)
     captcha_section = _build_captcha_section()
     submit_instruction = (
-        "Do NOT click the final Submit/Apply button. Review the form, then output RESULT:APPLIED (dry run)."
+        "Do NOT click the final Submit/Apply button. Review the form, then output RESULT:READY."
         if dry_run
         else "Submit the application after verifying all required fields are correct."
     )
@@ -164,6 +320,10 @@ Company: {job.get('company', 'Unknown')}
 
 == FILES ==
 Resume PDF (upload this): {resume_path}
+Photo (only for a photo/image upload field): {photo_path}
+If a photo is required but not configured, output RESULT:FAILED:missing_required_photo.
+Do not upload the resume into a photo field. Respect file type and size constraints;
+if a required upload is rejected, output RESULT:FAILED:upload_rejected.
 
 == APPLICANT PROFILE ==
 {chr(10).join(profile_lines)}
@@ -179,9 +339,11 @@ Resume PDF (upload this): {resume_path}
 
 == RESUME TEXT ==
 {resume_text or "Not available as text. Use the uploaded resume PDF plus the profile/answer bank above."}
+{mailbox_section}
 
 == CORE RULES ==
 1. Never pause and wait for a human. Either answer, skip safely, or fail with a clear RESULT code.
+   Do not merely describe an action you intend to take: invoke the browser tool in the same turn.
 2. Answer work authorization, sponsorship, citizenship, licenses, education credentials, criminal history, and security clearance truthfully from the provided profile/answers only.
 3. For common screening questions not explicitly listed, infer the best truthful answer from the profile, answer bank, resume text, and job page.
 4. For open-ended required questions, write concise factual answers. Use the job description and the candidate profile. Do not invent employers, projects, degrees, certifications, or years.
@@ -189,6 +351,7 @@ Resume PDF (upload this): {resume_path}
 6. Never sign in through Google, Microsoft, Okta, Auth0, or any SSO provider. If required, output RESULT:FAILED:sso_required.
 7. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
 8. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
+9. Never close the browser, browser context, or tabs. ApplyPilot manages tab cleanup after your final RESULT line.
 
 == QUESTION POLICY ==
 - FIRST: check SCREENING OVERRIDES. If the visible question text substantially matches an override, use that override answer exactly.
@@ -205,7 +368,7 @@ Resume PDF (upload this): {resume_path}
 - If a required question would force fabrication, output RESULT:FAILED:unknown_required_question.
 
 == PROCESS ==
-1. Start by listing tabs/windows and switch to the newest non-LinkedIn tab if one exists. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
+1. Start by listing tabs/windows and select the page matching the external application URL above, allowing redirects to the employer's ATS. Exclude mailbox tabs, including mailbox login pages. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
 2. If no external tab is already open, navigate directly to the external application URL as a fallback.
 3. Read the page with browser_snapshot. Use the visible page content/HTML structure to understand the form.
 4. Upload the resume PDF when asked.
@@ -214,10 +377,11 @@ Resume PDF (upload this): {resume_path}
 7. If the site is not a real job application form, output RESULT:FAILED:not_a_job_application.
 8. If you hit a login wall that requires SSO or account creation you cannot complete safely, output RESULT:LOGIN_ISSUE.
 9. {submit_instruction}
-10. After submit, confirm success and output exactly one RESULT line.
+10. After submit, confirm visible success before outputting RESULT:APPLIED. In a dry run output RESULT:READY instead. Output exactly one final RESULT line.
 
 == RESULT CODES ==
 RESULT:APPLIED
+RESULT:READY
 RESULT:EXPIRED
 RESULT:CAPTCHA
 RESULT:LOGIN_ISSUE
@@ -292,11 +456,11 @@ def _find_apply_control(page):
                 href = (elem.get_attribute("href") or "").strip()
                 cls = (elem.get_attribute("class") or "").strip().lower()
                 combined = f"{text} {aria}"
-                href_lower = href.lower()
+                href_lower = urljoin(LINKEDIN_BASE_URL, href).lower()
                 if "apply" not in combined and "company website" not in combined:
                     if "apply" not in cls and "apply" not in href_lower:
                         continue
-                if "easy apply" in combined or (
+                if "easy apply" in combined or "linkedin apply to this job" in combined or (
                     "linkedin.com" in href_lower
                     and "/jobs/view/" in href_lower
                     and "/apply/" in href_lower
@@ -518,15 +682,13 @@ def _open_external_application_page(detail_page):
             popup.wait_for_load_state("domcontentloaded", timeout=20000)
         except Exception:
             pass
-        return popup, popup.url
+        if _is_external_http_url(popup.url):
+            return popup, popup.url
     except Exception:
         pass
 
-    try:
-        apply_control.click(timeout=5000)
-    except Exception:
-        return None, None
-
+    # expect_popup can time out after successful same-tab navigation. Inspect
+    # the original click's result instead of clicking the stale control again.
     deadline = time.time() + 8
     while time.time() < deadline:
         for page in list(context.pages):
@@ -536,7 +698,8 @@ def _open_external_application_page(detail_page):
                 page.wait_for_load_state("domcontentloaded", timeout=5000)
             except Exception:
                 pass
-            return page, page.url
+            if _is_external_http_url(page.url):
+                return page, page.url
 
         try:
             if detail_page.is_closed():
@@ -571,11 +734,7 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
     profile_dir = config.CHROME_WORKER_DIR / "linkedin-search"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    search_url = (
-        "https://www.linkedin.com/jobs/search/"
-        f"?keywords={quote(job_title)}"
-        f"&location={quote(location)}"
-    )
+    search_url = _search_url(config_dict)
 
     candidates: list[dict] = []
     found_jobs: list[dict] = []
@@ -600,13 +759,13 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
             page_num = 1
             seen_page_markers: set[str] = set()
             while len(candidates) < scan_target and page_num <= max_pages:
-                job_cards = page.query_selector_all("a.base-card__full-link, div.job-card-container a[href*='/jobs/view/']")
+                job_cards = _iter_result_cards(page)
                 if not job_cards:
                     break
 
                 page_marker = ""
                 for card in job_cards[:5]:
-                    href = _normalize_linkedin_job_url(card.get_attribute("href") or "")
+                    href = _job_url_from_result_card(card)
                     if href:
                         page_marker = href
                         break
@@ -625,7 +784,7 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
                 )
 
                 for card in job_cards:
-                    href = _normalize_linkedin_job_url(card.get_attribute("href") or "")
+                    href = _job_url_from_result_card(card)
                     if not href or "/jobs/" not in href or href in seen_urls:
                         continue
 
@@ -790,14 +949,31 @@ def _run_external_application(
 
 def _search_url(config_dict: dict) -> str:
     return (
-        "https://www.linkedin.com/jobs/search/"
+        "https://www.linkedin.com/jobs/search-results/"
         f"?keywords={quote(config_dict.get('job_title', ''))}"
         f"&location={quote(config_dict.get('location', ''))}"
     )
 
 
 def _iter_result_cards(page):
-    return page.query_selector_all("a.base-card__full-link, div.job-card-container a[href*='/jobs/view/']")
+    return page.query_selector_all(
+        "a.base-card__full-link, "
+        "div.job-card-container a[href*='/jobs/view/'], "
+        "[componentkey^='job-card-component-ref-']"
+    )
+
+
+def _job_url_from_result_card(card) -> str:
+    """Extract a LinkedIn job URL from classic or semantic-search cards."""
+    href = _normalize_linkedin_job_url(card.get_attribute("href") or "")
+    if "/jobs/view/" in href:
+        return href
+
+    component_key = card.get_attribute("componentkey") or ""
+    match = re.search(r"(?:^|-)job-card-component-ref-(\d+)(?:$|[^\d])", component_key)
+    if not match:
+        return ""
+    return f"{LINKEDIN_BASE_URL}/jobs/view/{match.group(1)}/"
 
 
 def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
@@ -813,14 +989,20 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     if not job_title or not location:
         raise ValueError("job_title and location are required")
 
+    validate_non_easy_config(config_dict)
+    applied_keys = _load_applied_job_keys()
+
     summary = {
         "found": 0,
         "applied": 0,
+        "ready": 0,
         "skipped": 0,
         "failed": 0,
         "search_stats": {
             "candidate_urls": 0,
             "easy_skipped": 0,
+            "already_applied": 0,
+            "language_skipped": 0,
             "no_external_url": 0,
             "pages_scanned": 0,
         },
@@ -843,10 +1025,17 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
             if not browser.contexts:
                 raise RuntimeError("CDP browser has no contexts")
             context = browser.contexts[0]
-            search_page = context.pages[0] if context.pages else context.new_page()
+            inbox_url, _ = _mailbox_context(config_dict)
+            inbox_host = urlparse(inbox_url).hostname if inbox_url else None
+            search_page = next((pg for pg in context.pages if not pg.is_closed()
+                                and (not inbox_host or urlparse(pg.url).hostname != inbox_host)), None)
+            if search_page is None:
+                search_page = context.new_page()
             detail_page = context.new_page()
+            mailbox_page = None
 
             try:
+                mailbox_page = _ensure_mailbox_tab(context, config_dict, (search_page, detail_page))
                 search_url = _search_url(config_dict)
                 log.info("Searching LinkedIn non-Easy-Apply jobs: %s in %s", job_title, location)
                 search_page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
@@ -873,7 +1062,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         if inspected >= max_candidates or summary["found"] >= max_applications:
                             break
 
-                        linkedin_url = _normalize_linkedin_job_url(card.get_attribute("href") or "")
+                        linkedin_url = _job_url_from_result_card(card)
                         if not linkedin_url or linkedin_url in seen_urls or "/jobs/view/" not in linkedin_url:
                             continue
 
@@ -885,6 +1074,12 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         inspected += 1
                         summary["search_stats"]["candidate_urls"] = inspected
                         log.info("Inspecting LinkedIn job %d/%d: %s", inspected, max_candidates, linkedin_url)
+
+                        if _was_applied({"linkedin_url": linkedin_url}, applied_keys):
+                            summary["skipped"] += 1
+                            summary["search_stats"]["already_applied"] += 1
+                            log.info("Skipping previously applied job: %s", linkedin_url)
+                            continue
 
                         if detail_page.is_closed():
                             detail_page = context.new_page()
@@ -919,34 +1114,74 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         except Exception:
                             pass
 
+                        # Parse only the description so English navigation text
+                        # does not influence the language filter.
+                        from applypilot.linkedin.scrape import parse_job
+
+                        description = ""
+                        try:
+                            details = parse_job(detail_page.content(), linkedin_url)
+                            description = details["description"]
+                            title_text = details["title"] or title_text
+                            company = details["company"] or company
+                        except ValueError as exc:
+                            log.warning("Could not parse job description: %s", exc)
+
+                        job = {
+                            "linkedin_url": linkedin_url,
+                            "title": title_text or "Unknown title",
+                            "company": company,
+                        }
+                        if _was_applied(job, applied_keys):
+                            summary["skipped"] += 1
+                            summary["search_stats"]["already_applied"] += 1
+                            log.info("Skipping previously applied job: %s", linkedin_url)
+                            continue
+                        job_settings, language = _settings_for_job(config_dict, description)
+                        if job_settings is None:
+                            summary["skipped"] += 1
+                            summary["search_stats"]["language_skipped"] += 1
+                            log.info("Skipping %s: only_english enabled, language=%s", linkedin_url, language or "unclear")
+                            continue
+                        log.info("Job language=%s; CV=%s; photo=%s", language or "unclear",
+                                 job_settings["resume_path"], job_settings.get("photo_path") or "not configured")
+
                         application_page, application_url = _open_external_application_page(detail_page)
                         if not application_page:
                             summary["skipped"] += 1
                             summary["search_stats"]["no_external_url"] += 1
                             log.info("No external application page opened after Apply click: %s", linkedin_url)
+                            _close_application_tabs(context, (search_page, detail_page, mailbox_page))
                             continue
 
-                        job = {
-                            "linkedin_url": linkedin_url,
-                            "application_url": application_url or "",
-                            "title": title_text or "Unknown title",
-                            "company": company,
-                        }
+                        job["application_url"] = application_url or ""
                         summary["jobs"].append(job)
                         summary["found"] += 1
                         log.info("Opened external application page: %s", application_url or "<unknown>")
 
-                        result, _duration_ms = _run_external_application(
-                            provider=provider,
-                            model=effective_model,
-                            agent=agent,
-                            job=job,
-                            config_dict=config_dict,
-                            port=port,
-                            dry_run=dry_run,
-                        )
-                        if result == "applied":
+                        try:
+                            result, _duration_ms = _run_external_application(
+                                provider=provider,
+                                model=effective_model,
+                                agent=agent,
+                                job=job,
+                                config_dict=job_settings,
+                                port=port,
+                                dry_run=dry_run,
+                            )
+                        finally:
+                            _close_application_tabs(context, (search_page, detail_page, mailbox_page))
+                        if dry_run and result in {"ready", "applied"}:
+                            summary["ready"] += 1
+                        elif not dry_run and result == "applied":
                             summary["applied"] += 1
+                            applied_keys.add(_job_registry_key(job))
+                            try:
+                                _record_applied_job(job)
+                            except OSError:
+                                log.exception("Application submitted but history could not be saved; stopping to prevent duplicates")
+                                summary["stopped_reason"] = "history_write_failed"
+                                return summary
                         else:
                             summary["failed"] += 1
                             log.info(
@@ -957,15 +1192,6 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             if result == "failed:provider_credit_low":
                                 log.error("Stopping non-easy apply run: provider credits are exhausted.")
                                 return summary
-
-                        # Cleanup any external tabs opened during apply, but keep the LinkedIn pages alive.
-                        for pg in list(context.pages):
-                            if pg is search_page or pg is detail_page:
-                                continue
-                            try:
-                                pg.close()
-                            except Exception:
-                                pass
 
                     if summary["found"] >= max_applications or inspected >= max_candidates:
                         break
@@ -982,6 +1208,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                     except Exception:
                         break
             finally:
+                _close_application_tabs(context, (search_page, detail_page))
                 try:
                     detail_page.close()
                 except Exception:
