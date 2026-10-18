@@ -256,11 +256,35 @@ def apply(
     )
 
 
+def _prepare_intelligent_settings(settings: dict, config_file, *, model="qwen-flash", setup=False) -> bool:
+    """Validate the opt-in output pipeline before any application browser opens."""
+    if setup:
+        return False
+    from pathlib import Path
+
+    from applypilot.linkedin.intelligent_apply import intelligent_enabled, validate_intelligent_config
+
+    try:
+        enabled = intelligent_enabled(settings)
+        if enabled:
+            settings["_project_root"] = str(Path.cwd().resolve())
+            settings["_config_path"] = str(Path(config_file).resolve())
+            inputs = validate_intelligent_config(settings, model=model)
+            console.print(f"  Intelligent Apply: enabled ({'UK / path 1' if inputs.uk else 'EU / path 2'})")
+            console.print(f"  Bullet-point model: {inputs.connection.model} (provider={inputs.connection.provider})")
+            console.print("  Cache-aware requests: enabled; usage and costs saved per job")
+        return enabled
+    except Exception as exc:
+        console.print(f"[red]Invalid intelligent application configuration:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+
 @app.command(name="linkedin-apply")
 def linkedin_apply(
     config_path: str = typer.Option("config/linkedin_apply.json", "--config", "-c",
                                     help="Path to linkedin_apply.json config file"),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: str = typer.Option("haiku", "--model", "-m",
+                             help="Legacy option; forms use Playwright. Set bulletpoint_model in config for résumé generation."),
     headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     exactlocation: bool = typer.Option(
@@ -274,7 +298,7 @@ def linkedin_apply(
         help="Open the LinkedIn session and keep it alive until Ctrl+C for manual browser changes.",
     ),
 ) -> None:
-    """Deterministic LinkedIn Easy Apply bot (no LLM tailoring, no cover letters)."""
+    """LinkedIn Easy Apply, with optional intelligent_apply résumé preparation."""
     import json
     from pathlib import Path
 
@@ -307,9 +331,11 @@ def linkedin_apply(
             console.print(f"[red]Missing required config key:[/red] {key}")
             raise typer.Exit(code=1)
 
+    intelligent = _prepare_intelligent_settings(config, config_file, setup=setup)
+
     # Check resume exists
     resume_path = Path(config["resume_path"])
-    if not resume_path.exists():
+    if not intelligent and not setup and not resume_path.exists():
         console.print(f"[red]Resume not found:[/red] {resume_path}")
         raise typer.Exit(code=1)
 
@@ -333,7 +359,7 @@ def linkedin_apply(
         ("English resume", english_resume_path_value),
         ("German resume", german_resume_path_value),
     ):
-        if path_value and not Path(path_value).exists():
+        if not intelligent and not setup and path_value and not Path(path_value).exists():
             console.print(f"[red]{language} not found:[/red] {path_value}")
             raise typer.Exit(code=1)
 
@@ -362,7 +388,7 @@ def linkedin_apply(
     console.print(f"  Max:     {config.get('max_applications', 'N/A')}")
     console.print(f"  Delay:   {config.get('delay', 0)}s")
     console.print(f"  Random:  {config.get('random', False)}")
-    console.print(f"  Model:   {model}")
+    console.print("  Browser: Playwright (forms use no LLM)")
     console.print(f"  Dry run: {dry_run}")
     console.print(f"  Exact location: {exactlocation}")
     console.print(f"  Setup:   {setup}")
@@ -378,22 +404,30 @@ def linkedin_apply(
     max_apps = config.get("max_applications", 1)
     title_keyword = config.get("title_keyword", "")
 
-    result = search_and_apply(
-        config_dict=config,
-        max_applications=max_apps,
-        title_keyword=title_keyword,
-        headless=headless,
-        dry_run=dry_run,
-        exact_location=exactlocation,
-        setup=setup,
-    )
+    try:
+        result = search_and_apply(
+            config_dict=config,
+            max_applications=max_apps,
+            title_keyword=title_keyword,
+            headless=headless,
+            dry_run=dry_run,
+            exact_location=exactlocation,
+            setup=setup,
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(f"[red]LinkedIn apply stopped:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     console.print(f"\n[bold]Summary:[/bold]")
     console.print(f"  Applied:  {result['applied']}")
+    if "ready" in result:
+        console.print(f"  Ready:    {result['ready']}")
     console.print(f"  Skipped:  {result['skipped']}")
     console.print(f"  Failed:   {result['failed']}")
     if result.get("stopped_reason") == "easy_apply_limit_reached":
         console.print("\n[yellow]LinkedIn Easy Apply limit reached for today. Stopping run; try again tomorrow.[/yellow]")
+    elif result.get("stopped_reason"):
+        console.print(f"[yellow]Stopped:[/yellow] {result['stopped_reason']}")
 
 
 @app.command(name="linkedin-scrape")
@@ -442,7 +476,8 @@ def linkedin_scrape(
 def linkedin_noneasy(
     config_path: str = typer.Option("config/linkedin_apply.json", "--config", "-c",
                                     help="Path to linkedin_apply.json config file"),
-    model: str = typer.Option("qwen-flash", "--model", "-m", help="Model name for the configured provider."),
+    model: str = typer.Option("qwen-flash", "--model", "-m",
+                             help="Fallback model; browser_model and bulletpoint_model in config take precedence."),
     headless: bool = typer.Option(False, "--headless", help="Run browser in headless mode."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
 ) -> None:
@@ -454,10 +489,7 @@ def linkedin_noneasy(
 
     from applypilot.config import check_non_easy_provider_requirements
     from applypilot.linkedin.non_easy import run_non_easy_apply, validate_non_easy_config
-    from applypilot.qwen_mcp import get_effective_model_and_provider
-
-    effective_model, provider = get_effective_model_and_provider(model)
-    check_non_easy_provider_requirements("linkedin-noneasy", provider)
+    from applypilot.qwen_mcp import get_configured_model, get_effective_model_and_provider
 
     config_file = Path(config_path)
     if not config_file.exists():
@@ -479,9 +511,15 @@ def linkedin_noneasy(
 
     try:
         validate_non_easy_config(config)
+        effective_model, provider = get_effective_model_and_provider(
+            model, model_override=get_configured_model(config, "browser_model"),
+        )
     except ValueError as exc:
         console.print(f"[red]Invalid application configuration:[/red] {exc}")
         raise typer.Exit(code=1)
+
+    check_non_easy_provider_requirements("linkedin-noneasy", provider)
+    _prepare_intelligent_settings(config, config_file, model=model)
 
     console.print("\n[bold blue]LinkedIn Non-Easy-Apply[/bold blue]")
     console.print(f"  Config:   {config_path}")
@@ -490,19 +528,23 @@ def linkedin_noneasy(
     console.print(f"  Keyword:  {config.get('title_keyword', 'N/A')}")
     console.print(f"  Max:      {config.get('max_applications', 'N/A')}")
     console.print(f"  Provider: {provider}")
-    console.print(f"  Model:    {effective_model}")
+    console.print(f"  Browser model: {effective_model}")
     console.print(f"  Only EN:  {config.get('only_english', False)}")
     console.print(f"  Photo:    {config.get('photo_path') or 'Not configured'}")
     console.print(f"  Mailbox:  {config.get('mail_inbox_url') or 'Automatic for Proton Mail addresses'}")
     console.print(f"  Dry run:  {dry_run}")
     console.print()
 
-    result = run_non_easy_apply(
-        config_dict=config,
-        model=effective_model,
-        headless=headless,
-        dry_run=dry_run,
-    )
+    try:
+        result = run_non_easy_apply(
+            config_dict=config,
+            model=model,
+            headless=headless,
+            dry_run=dry_run,
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(f"[red]LinkedIn non-Easy Apply stopped:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     console.print("\n[bold]Summary:[/bold]")
     console.print(f"  Found external jobs: {result['found']}")

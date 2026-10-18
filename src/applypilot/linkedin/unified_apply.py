@@ -1,5 +1,6 @@
 """Unified LinkedIn search and apply in a single browser session."""
 
+import json
 import logging
 import random as random_module
 import re
@@ -7,8 +8,13 @@ import time
 import unicodedata
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+
 from applypilot import config
+from applypilot.linkedin.intelligent_apply import PreparationError, intelligent_session
 
 log = logging.getLogger(__name__)
 
@@ -637,8 +643,17 @@ def _click_linkedin_job_card(card) -> None:
     card.click()
 
 
-def _find_easy_apply_control(page):
-    """Find the visible Easy Apply control in LinkedIn's job detail pane.
+def _linkedin_job_id(url: str) -> str | None:
+    parsed = urlsplit(url)
+    match = re.search(r"/jobs/view/(?:[^/]*-)?(\d+)(?:/|$)", parsed.path)
+    if match:
+        return match[1]
+    value = dict(parse_qsl(parsed.query)).get("currentJobId", "")
+    return value if value.isdecimal() else None
+
+
+def _find_easy_apply_control(page, *, job_url: str | None = None):
+    """Find a live locator for the visible Easy Apply control in the detail pane.
 
     LinkedIn's newer SDUI layout renders Easy Apply as an anchor whose href
     points at /jobs/view/<id>/apply/?openSDUIApplyFlow=true rather than as the
@@ -664,20 +679,24 @@ def _find_easy_apply_control(page):
         "button:has-text('Easy Apply')",
     ]
 
+    expected_id = _linkedin_job_id(job_url) if job_url else None
     for selector in selectors:
         try:
-            for elem in page.query_selector_all(selector):
+            matches = page.locator(selector)
+            for index in range(matches.count()):
+                elem = matches.nth(index)
                 if not elem.is_visible():
                     continue
                 try:
-                    if not elem.is_enabled():
+                    if not elem.is_enabled(timeout=500):
                         continue
                 except Exception:
                     pass
 
-                text = (elem.text_content() or "").strip().lower()
-                aria = (elem.get_attribute("aria-label") or "").strip().lower()
-                href = (elem.get_attribute("href") or "").strip().lower()
+                text = (elem.text_content(timeout=500) or "").strip().lower()
+                aria = (elem.get_attribute("aria-label", timeout=500) or "").strip().lower()
+                raw_href = elem.get_attribute("href", timeout=500) or ""
+                href = raw_href.strip().lower()
                 combined = f"{text} {aria} {href}"
 
                 is_linkedin_apply = "linkedin apply to this job" in aria
@@ -685,16 +704,129 @@ def _find_easy_apply_control(page):
                     continue
                 if "search-results" in href and "/jobs/view/" not in href and "currentjobid=" not in href:
                     continue
+                control_id = _linkedin_job_id(raw_href)
+                if expected_id and control_id and control_id != expected_id:
+                    continue
 
-                bounding_box = elem.bounding_box()
+                bounding_box = elem.bounding_box(timeout=500)
                 if not bounding_box:
                     continue
 
+                if expected_id and control_id:
+                    # Pin job-bearing links as well as their visual selector, so
+                    # another job cannot replace the link during action waiting.
+                    return page.locator(f"{selector}[href={json.dumps(raw_href)}]:visible").first
                 return elem
         except Exception:
             continue
 
     return None
+
+
+def _current_linkedin_job_id(page) -> str | None:
+    """Prefer rendered detail identity over a possibly stale search URL."""
+    result = page.evaluate("""() => {
+        const visible = el => {
+            const style = getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden'
+                && (rect.width > 0 || rect.height > 0);
+        };
+        const ids = new Set();
+        for (const el of document.querySelectorAll(
+            "[id^='JobDetails_AboutTheJob_'], [componentkey^='JobDetails_AboutTheJob_']"
+        )) {
+            if (!visible(el)) continue;
+            const match = (el.id || el.getAttribute('componentkey') || '').match(/JobDetails_AboutTheJob_(\\d+)$/);
+            if (match) ids.add(match[1]);
+        }
+        if (ids.size) return {ids: [...ids]};
+        for (const el of document.querySelectorAll(
+            ".job-details-jobs-unified-top-card__job-title a[href*='/jobs/view/'], " +
+            "[data-sdui-screen*='JobDetails'] h1 a[href*='/jobs/view/'], " +
+            "[data-sdui-screen*='JobDetails'] p a[href*='/jobs/view/'], " +
+            ".jobs-search__job-details h1 a[href*='/jobs/view/'], " +
+            ".jobs-detail__main-content h1 a[href*='/jobs/view/'], " +
+            ".jobs-search__job-details [data-job-id], .job-details-jobs-unified-top-card[data-job-id]"
+        )) {
+            if (!visible(el)) continue;
+            const match = (el.getAttribute('href') || '').match(/\\/jobs\\/view\\/(?:[^/]*-)?(\\d+)(?:\\/|$)/);
+            const id = el.getAttribute('data-job-id') || (match && match[1]);
+            if (id && /^\\d+$/.test(id)) ids.add(id);
+        }
+        return {ids: [...ids]};
+    }""")
+    ids = result["ids"]
+    if ids:
+        return ids[0] if len(ids) == 1 else None
+    return _linkedin_job_id(page.url)
+
+
+def _restore_job_detail_header(page, job_id: str) -> None:
+    """Bring a virtualized detail header back without changing the selected job."""
+    page.evaluate("""jobId => {
+        const section = document.querySelector(`[id='JobDetails_AboutTheJob_${jobId}'], ` +
+            `[componentkey='JobDetails_AboutTheJob_${jobId}'], #job-details, .jobs-description-content__text`);
+        for (let el = section && section.parentElement; el; el = el.parentElement) {
+            if (el.scrollHeight > el.clientHeight + 2 && /auto|scroll|overlay/.test(getComputedStyle(el).overflowY)) {
+                el.scrollTop = 0;
+            }
+        }
+        if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
+    }""", job_id)
+
+
+def _open_easy_apply_for_job(page, job_url: str, *, record=None, timeout_ms: int = 8000) -> None:
+    """Recheck the job and reacquire its control after preparation/re-rendering."""
+    job_id = _linkedin_job_id(job_url)
+    if not job_id:
+        raise ValueError("Cannot open Easy Apply without a LinkedIn job ID")
+    def report(outcome, message):
+        if record:
+            record("easy_apply_open", outcome, message)
+        else:
+            log.info("Easy Apply job=%s %s: %s", job_id, outcome, message)
+
+    deadline = time.monotonic() + timeout_ms / 1000
+    clicks = 0
+    reason = "The selected job or its Easy Apply control did not become available"
+    report("START", f"Reacquiring the current Easy Apply control for job {job_id}")
+    while time.monotonic() < deadline:
+        current_id = _current_linkedin_job_id(page)
+        if current_id and current_id != job_id:
+            reason = f"Selected job changed from {job_id} to {current_id}; refusing application handoff"
+            report("FAILED", reason)
+            raise RuntimeError(reason)
+        if current_id == job_id:
+            _restore_job_detail_header(page, job_id)
+            control = _find_easy_apply_control(page, job_url=job_url)
+            if control:
+                # Scrolling can itself trigger another asynchronous render.
+                if _current_linkedin_job_id(page) != job_id:
+                    continue
+                clicks += 1
+                try:
+                    control.click(timeout=max(1, min(2000, int((deadline - time.monotonic()) * 1000))))
+                except PlaywrightError as exc:
+                    if not isinstance(exc, PlaywrightTimeoutError) and not re.search(
+                        r"not attached|detached|not connected|not visible|not stable", str(exc), re.IGNORECASE,
+                    ):
+                        raise
+                    if _get_active_modal(page):
+                        report("SUCCESS", "Easy Apply dialog is already open after the click")
+                        return
+                    reason = str(exc).splitlines()[0]
+                    report("RETRY", f"Control changed or was not actionable during click {clicks}/3; reacquiring")
+                    if clicks >= 3:
+                        break
+                else:
+                    report("SUCCESS", f"Clicked the current control for job {job_id}")
+                    return
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms > 0:
+            page.wait_for_timeout(min(250, remaining_ms))
+    report("FAILED", reason)
+    raise RuntimeError(f"Could not open Easy Apply for job {job_id}: {reason}")
 
 
 def _normalize_location_text(value: str) -> str:
@@ -1329,6 +1461,7 @@ def _find_linkedin_next_page_button(page):
     return None
 
 
+@intelligent_session
 def search_and_apply(
     config_dict: dict,
     max_applications: int = 1,
@@ -1349,7 +1482,7 @@ def search_and_apply(
         setup: Whether to keep the browser session open for manual changes only
 
     Returns:
-        Dict with applied, skipped, failed counts, and optionally stopped_reason
+        Dict with applied, skipped, failed counts, optional ready and stopped_reason
     """
     job_title = config_dict.get("job_title", "")
     location = config_dict.get("location", "")
@@ -1377,8 +1510,19 @@ def search_and_apply(
         return {"applied": 0, "skipped": 0, "failed": 0}
 
     applied = 0
+    ready = 0
     skipped = 0
     failed = 0
+    preparer = config_dict.get("_intelligent_preparer")
+    seen_intelligent_jobs = set()
+
+    def summary(*, extra_failure=0, stopped_reason=None):
+        result = {"applied": applied, "skipped": skipped, "failed": failed + extra_failure}
+        if preparer:
+            result["ready"] = ready
+        if stopped_reason:
+            result["stopped_reason"] = stopped_reason
+        return result
 
     try:
         with sync_playwright() as p:
@@ -1408,7 +1552,7 @@ def search_and_apply(
                 location,
             )
             if not _ensure_configured_linkedin_search_location(page, location):
-                return {"applied": applied, "skipped": skipped, "failed": failed + 1}
+                return summary(extra_failure=1)
             if use_old_url or location_was_repaired:
                 _ensure_easy_apply_search_filter(page)
             _log_active_linkedin_search_state(page, job_title, location)
@@ -1416,27 +1560,22 @@ def search_and_apply(
             if exact_location:
                 _apply_exact_location_filter(page, location)
                 if not _ensure_configured_linkedin_search_location(page, location):
-                    return {"applied": applied, "skipped": skipped, "failed": failed + 1}
+                    return summary(extra_failure=1)
                 _log_active_linkedin_search_state(page, job_title, location)
 
             if _dismiss_recruiter_upsell_if_present(page) and use_old_url:
                 _ensure_easy_apply_search_filter(page)
 
             # Process jobs on current page
-            while applied < max_applications:
+            while applied + ready < max_applications:
                 if _find_easy_apply_limit_modal(page):
                     log.warning("LinkedIn Easy Apply limit reached for today; stopping run")
-                    return {
-                        "applied": applied,
-                        "skipped": skipped,
-                        "failed": failed,
-                        "stopped_reason": "easy_apply_limit_reached",
-                    }
+                    return summary(stopped_reason="easy_apply_limit_reached")
 
                 if _dismiss_recruiter_upsell_if_present(page) and use_old_url:
                     _ensure_easy_apply_search_filter(page)
                     if not _ensure_configured_linkedin_search_location(page, location):
-                        return {"applied": applied, "skipped": skipped, "failed": failed + 1}
+                        return summary(extra_failure=1)
                 log.info(f"Looking for jobs (applied: {applied}/{max_applications})")
 
                 # Find job cards. LinkedIn has both legacy card containers and
@@ -1456,15 +1595,23 @@ def search_and_apply(
                     )
 
                 for idx, card in ordered_job_cards:
-                    if applied >= max_applications:
+                    if applied + ready >= max_applications:
                         break
 
+                    prepared = None
                     try:
                         # Get job URL
                         job_url = _extract_job_url_from_card(card)
                         if not job_url:
                             log.debug(f"Card {idx}: No job URL found")
                             continue
+                        if preparer:
+                            identity = re.search(r"/jobs/view/(?:[^/?]*-)?(\d+)", job_url)
+                            job_key = identity[1] if identity else job_url
+                            if job_key in seen_intelligent_jobs:
+                                skipped += 1
+                                continue
+                            seen_intelligent_jobs.add(job_key)
 
                         _scroll_linkedin_job_card_into_view(card)
                         page.wait_for_timeout(250)
@@ -1510,14 +1657,22 @@ def search_and_apply(
                         # Look for Easy Apply in the job detail panel. Newer
                         # LinkedIn SDUI pages render this as an <a> with an
                         # /apply/ href rather than a legacy <button>.
-                        easy_apply_btn = _find_easy_apply_control(page)
-
-                        if not easy_apply_btn:
+                        if not _find_easy_apply_control(page):
                             log.info(f"Card {idx}: No Easy Apply control found in job detail")
                             skipped += 1
                             continue
 
-                        job_detail_text = _extract_job_detail_text(page)
+                        details = None
+                        if preparer:
+                            from applypilot.linkedin.scrape import read_current_job
+
+                            details = read_current_job(page, job_url)
+                            if _is_blacklisted_company(details.get("company", ""), blacklisted_companies):
+                                skipped += 1
+                                continue
+                            job_detail_text = details["description"]
+                        else:
+                            job_detail_text = _extract_job_detail_text(page)
                         detected_language = _detect_job_language(job_detail_text)
                         if not _job_language_allowed(config_dict, detected_language):
                             log.info(
@@ -1528,12 +1683,17 @@ def search_and_apply(
                             skipped += 1
                             continue
 
-                        selected_resume_path, detected_language = _select_resume_path_for_job(
-                            config_dict,
-                            job_detail_text,
-                            resume_path,
-                        )
-                        if detected_language and selected_resume_path != resume_path:
+                        if preparer:
+                            prepared = preparer.prepare(details)
+                            prepared.verify_published()
+                            selected_resume_path = str(prepared.published_pdf)
+                        else:
+                            selected_resume_path, detected_language = _select_resume_path_for_job(
+                                config_dict, job_detail_text, resume_path,
+                            )
+                        if prepared:
+                            log.info("Card %s: Using verified job-specific résumé %s", idx, selected_resume_path)
+                        elif detected_language and selected_resume_path != resume_path:
                             log.info(
                                 "Card %s: Detected job language as %s; using resume %s",
                                 idx,
@@ -1549,7 +1709,7 @@ def search_and_apply(
                             )
 
                         log.info(f"Card {idx}: Clicking Easy Apply control")
-                        easy_apply_btn.click()
+                        _open_easy_apply_for_job(page, job_url, record=prepared.audit.record if prepared else None)
                         _wait_for_easy_apply_form_ready(page)
 
                         # Try to fill form (simplified version)
@@ -1560,25 +1720,32 @@ def search_and_apply(
                             selected_resume_path,
                             photo_path=photo_path,
                             dry_run=dry_run,
+                            require_fresh_resume=bool(prepared),
                         )
 
                         if result == "APPLIED":
                             applied += 1
                             log.info(f"Successfully applied to job {idx}")
+                        elif result == "READY":
+                            ready += 1
+                            log.info("Job %s ready; dry run stopped before submission", idx)
                         elif result == "LIMIT_REACHED":
+                            if prepared:
+                                prepared.finish("failed:easy_apply_limit_reached")
                             log.warning("LinkedIn Easy Apply limit reached for today; stopping run")
-                            return {
-                                "applied": applied,
-                                "skipped": skipped,
-                                "failed": failed,
-                                "stopped_reason": "easy_apply_limit_reached",
-                            }
+                            return summary(stopped_reason="easy_apply_limit_reached")
                         elif result == "SKIPPED":
                             skipped += 1
                             log.info(f"Skipped job {idx}")
                         else:
                             failed += 1
                             log.info(f"Failed to apply to job {idx}")
+
+                        if prepared:
+                            outcome = "ready" if result == "READY" else "applied" if result == "APPLIED" else (
+                                "skipped" if result == "SKIPPED" else "failed"
+                            )
+                            prepared.finish(outcome)
 
                         _close_easy_apply_modal(page)
                         page.wait_for_timeout(1000)
@@ -1590,13 +1757,25 @@ def search_and_apply(
                             )
                             page.wait_for_timeout(int(apply_delay_seconds * 1000))
 
+                    except PreparationError as e:
+                        log.error("%s", e)
+                        failed += 1
+                        if prepared and not prepared.finalized:
+                            prepared.finish("failed")
+                        if e.fatal:
+                            return summary(stopped_reason=f"intelligent_{e.stage}_failed")
+                        _close_easy_apply_modal(page)
                     except Exception as e:
                         log.error(f"Error processing card {idx}: {e}")
                         failed += 1
+                        if prepared:
+                            prepared.finish("failed")
+                        if preparer:
+                            _close_easy_apply_modal(page)
                         continue
 
                 # Try to go to next page if we haven't reached max
-                if applied < max_applications:
+                if applied + ready < max_applications:
                     next_btn = _find_linkedin_next_page_button(page)
                     if next_btn:
                         log.info("Going to next page")
@@ -1614,9 +1793,11 @@ def search_and_apply(
         log.error(f"Error in search_and_apply: {e}")
         import traceback
         traceback.print_exc()
+        if preparer:
+            return summary(extra_failure=1, stopped_reason="intelligent_run_failed")
 
     log.info(f"Final results: applied={applied}, skipped={skipped}, failed={failed}")
-    return {"applied": applied, "skipped": skipped, "failed": failed}
+    return summary()
 
 
 def _smart_select_option(select_elem, value: str, label: str, log) -> bool:
@@ -3730,11 +3911,12 @@ def _fill_and_submit_form(
     resume_path: str = "",
     photo_path: str = "",
     dry_run: bool = False,
+    require_fresh_resume: bool = False,
 ) -> str:
     """Fill and submit the multi-step Easy Apply form.
 
     Returns:
-        "APPLIED", "SKIPPED", "FAILED", or "LIMIT_REACHED"
+        "APPLIED", "READY" (intelligent dry run), "SKIPPED", "FAILED", or "LIMIT_REACHED"
     """
     try:
         max_steps = 30
@@ -3743,6 +3925,7 @@ def _fill_and_submit_form(
         repeated_step_counts: dict[str, int] = {}
         blocked_progress_signature = ""
         blocked_progress_attempts = 0
+        resume_uploaded = False
 
         while step < max_steps:
             step += 1
@@ -3815,7 +3998,7 @@ def _fill_and_submit_form(
                     return "SKIPPED"
 
             resume_input = _find_resume_upload_input(scope, resume_path) if resume_path else None
-            if resume_input and resume_path:
+            if resume_input and resume_path and (not require_fresh_resume or not resume_uploaded):
                 log.info(f"Uploading resume: {resume_path}")
                 try:
                     resume_input.set_input_files(resume_path)
@@ -3823,8 +4006,25 @@ def _fill_and_submit_form(
                     if _has_upload_format_error(scope):
                         log.info("Resume upload triggered format validation; skipping this job")
                         return "SKIPPED"
+                    resume_uploaded = True
                 except Exception as e:
                     log.warning(f"Could not upload resume: {e}")
+                    if require_fresh_resume:
+                        return "FAILED"
+            elif require_fresh_resume and not resume_uploaded:
+                upload_button = scope.query_selector("button[aria-label*='Upload resume'], button:has-text('Upload resume')")
+                if upload_button:
+                    try:
+                        with page.expect_file_chooser(timeout=5000) as chooser:
+                            upload_button.click()
+                        chooser.value.set_files(resume_path)
+                        page.wait_for_timeout(2000)
+                        if _has_upload_format_error(scope):
+                            return "FAILED"
+                        resume_uploaded = True
+                    except Exception:
+                        log.error("Could not upload the generated résumé; refusing a saved résumé fallback")
+                        return "FAILED"
 
             if _uncheck_follow_company_checkbox(scope):
                 if _is_review_submit_step(scope):
@@ -4004,9 +4204,12 @@ def _fill_and_submit_form(
                 _EASY_APPLY_SUBMIT_BUTTON_LABELS,
             )
             if submit_btn:
+                if require_fresh_resume and not resume_uploaded:
+                    log.error("The generated résumé was never uploaded; refusing to submit a saved résumé")
+                    return "FAILED"
                 if dry_run:
                     log.info("Dry run active; stopping before final submit")
-                    return "SKIPPED"
+                    return "READY" if require_fresh_resume else "SKIPPED"
 
                 log.info(f"Clicking Submit button on step {step}")
                 if not _click_action_button(submit_btn):

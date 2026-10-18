@@ -72,6 +72,10 @@ class LinkedInScrapeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No job description"):
             scrape.parse_job('<h1>Data AI Engineer</h1><span data-testid="expandable-text-box">Company description</span>', URL)
 
+    def test_description_for_a_different_job_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            scrape.parse_job(FIXTURE.read_text(), "https://www.linkedin.com/jobs/view/999/")
+
     def test_empty_description_shell_is_not_a_job(self):
         with self.assertRaisesRegex(ValueError, "No job description"):
             scrape.parse_job('<div id="JobDetails_AboutTheJob_4467577090"><h2>About the job</h2></div>', URL)
@@ -246,7 +250,7 @@ class LinkedInScrapeBrowserTests(unittest.TestCase):
     def setUp(self):
         self.playwright = scrape.sync_playwright().start()
         self.addCleanup(self.playwright.stop)
-        self.browser = self.playwright.chromium.launch(headless=True)
+        self.browser = self.playwright.chromium.launch(headless=True, executable_path=scrape.config.get_chrome_path())
         self.addCleanup(self.browser.close)
         self.page = self.browser.new_page()
 
@@ -257,6 +261,19 @@ class LinkedInScrapeBrowserTests(unittest.TestCase):
         self.assertIn("earliest possible starting date.", job["description"])
         self.assertNotIn("… more", job["description"])
         self.assertEqual(job["workplace_type"], "Hybrid")
+
+    def test_in_place_reader_expands_only_current_job_without_navigation(self):
+        self.page.set_content(FIXTURE.read_text())
+        self.page.locator("#JobDetails_AboutTheJob_4467577090 [data-testid='expandable-text-box']").evaluate(
+            """el => {
+                el.innerHTML = 'Short description <button data-testid="expandable-text-button">more</button>';
+                el.querySelector('button').onclick = () => { el.textContent = 'Expanded description for this job only.'; };
+            }""",
+        )
+        url_before = self.page.url
+        job = scrape.read_current_job(self.page, URL)
+        self.assertEqual(self.page.url, url_before)
+        self.assertEqual(job["description"], "Expanded description for this job only.")
 
     def test_plain_title_anchor_and_sdui_card_candidates(self):
         self.page.set_content(FIXTURE.read_text())

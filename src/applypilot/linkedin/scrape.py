@@ -147,6 +147,8 @@ def parse_job(html: str, job_url: str) -> dict:
     about = soup.select_one(f"[id='JobDetails_AboutTheJob_{job_id}']")
     if about is None:
         about = soup.select_one(f"[componentkey='JobDetails_AboutTheJob_{job_id}']")
+    if about is None and soup.select_one("[id^='JobDetails_AboutTheJob_'], [componentkey^='JobDetails_AboutTheJob_']"):
+        raise ValueError(f"The displayed description does not belong to job {job_id}")
     description = about.select_one("[data-testid='expandable-text-box']") if about else None
     if description is None:
         description = about or soup.select_one(
@@ -292,18 +294,31 @@ def _read_job(page, candidate: dict) -> dict:
     job_id = candidate["job_id"]
     url = f"https://www.linkedin.com/jobs/view/{job_id}/"
     page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    return read_current_job(page, url)
+
+
+def read_current_job(page, url: str) -> dict:
+    """Read/expand the current listing in place, retaining its Apply controls."""
+    job_id = _job_id(url)
+    if not job_id:
+        raise ValueError("Cannot read job details without a LinkedIn job ID")
     _check_login(page)
     selector = (
         f"[id='JobDetails_AboutTheJob_{job_id}'] [data-testid='expandable-text-box'], "
         f"[componentkey='JobDetails_AboutTheJob_{job_id}'] [data-testid='expandable-text-box'], "
         "#job-details, .show-more-less-html__markup, .jobs-description-content__text"
     )
+    section = page.locator(selector).first
+    if section.count():
+        try:
+            section.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            log.debug("Job description not yet visible; waiting for job %s", job_id)
     page.wait_for_function(
         "selector => [...document.querySelectorAll(selector)].some(el => (el.textContent || '').trim())",
         arg=selector, timeout=15000,
     )
     # Full text is usually already in the DOM, but expand when LinkedIn provides a control.
-    section = page.locator(selector).first
     for control in section.locator("[data-testid='expandable-text-button'], button[aria-expanded='false']").all():
         try:
             if control.is_visible():

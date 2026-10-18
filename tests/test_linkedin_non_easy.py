@@ -190,7 +190,8 @@ class NonEasyTests(unittest.TestCase):
                                                          settings, 9222, True)[0], "ready")
         self.assertEqual(captured, [prompt])
 
-    def run_session(self, result="applied", *, settings=None, easy=False, description=None, dry_run=False, jobs=1):
+    def run_session(self, result="applied", *, settings=None, easy=False, description=None, dry_run=False, jobs=1,
+                    resolve_models=False):
         search, detail = Mock(url="about:blank"), Mock()
         search.is_closed.return_value = False
         mailbox = Mock(url=MAIL_URL)
@@ -221,9 +222,11 @@ class NonEasyTests(unittest.TestCase):
         playwright = Mock()
         playwright.chromium.connect_over_cdp.return_value = Mock(contexts=[context])
         with ExitStack() as stack:
-            for name in ("launch_chrome", "cleanup_worker", "kill_all_chrome", "QwenMCPAgent"):
+            for name in ("launch_chrome", "cleanup_worker", "kill_all_chrome"):
                 stack.enter_context(patch.object(ne, name))
-            stack.enter_context(patch.object(ne, "get_effective_model_and_provider", return_value=("model", "openrouter")))
+            self.agent_factory = stack.enter_context(patch.object(ne, "QwenMCPAgent"))
+            if not resolve_models:
+                stack.enter_context(patch.object(ne, "get_effective_model_and_provider", return_value=("model", "openrouter")))
             manager = stack.enter_context(patch.object(ne, "sync_playwright"))
             manager.return_value.__enter__.return_value = playwright
             stack.enter_context(patch.object(ne, "_iter_result_cards", return_value=cards))
@@ -238,6 +241,35 @@ class NonEasyTests(unittest.TestCase):
                 self.assertTrue(application.close.called)
             self.assertTrue(mailbox.close.called)
             return summary, opener, runner
+
+    def test_browser_model_config_reaches_browser_agent_and_application_runner(self):
+        settings = self.settings | {"browser_model": "fixture/browser-agent", "bulletpoint_model": "fixture/bullets"}
+        with patch.dict(os.environ, {"NON_EASY_PROVIDER": "openrouter", "NON_EASY_MODEL": "environment-model"},
+                        clear=True):
+            summary, _, runner = self.run_session("ready", settings=settings, dry_run=True, resolve_models=True)
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(self.agent_factory.call_args.kwargs["model"], "fixture/browser-agent")
+        self.assertEqual(runner.call_args.kwargs["model"], "fixture/browser-agent")
+
+    def test_cli_model_selection_keeps_browser_override_out_of_bulletpoint_fallback(self):
+        from typer.testing import CliRunner
+        from applypilot.cli import app
+
+        path = self.root / "config-models.json"
+        settings = self.settings | {"browser_model": "fixture/browser-agent", "bulletpoint_model": "fixture/bullets"}
+        path.write_text(json.dumps(settings))
+        with (patch.dict(os.environ, {"NON_EASY_PROVIDER": "openrouter", "NON_EASY_MODEL": "environment-model"},
+                         clear=True),
+              patch("applypilot.cli._bootstrap"), patch("applypilot.config.check_non_easy_provider_requirements"),
+              patch("applypilot.cli._prepare_intelligent_settings") as preparation,
+              patch.object(ne, "run_non_easy_apply", return_value={
+                  "found": 0, "applied": 0, "ready": 0, "skipped": 0, "failed": 0}) as runner):
+            result = CliRunner().invoke(app, ["linkedin-noneasy", "--config", str(path), "--model", "cli-fallback"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Browser model: fixture/browser-agent", result.output)
+        self.assertEqual(preparation.call_args.kwargs["model"], "cli-fallback")
+        self.assertEqual(preparation.call_args.args[0]["bulletpoint_model"], "fixture/bullets")
+        self.assertEqual(runner.call_args.kwargs["model"], "cli-fallback")
 
     def test_session_records_success_then_skips_before_external_click(self):
         summary, _, runner = self.run_session()

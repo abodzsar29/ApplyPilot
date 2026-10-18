@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
-import json
 import subprocess
 import time
 from pathlib import Path
@@ -21,13 +21,14 @@ from applypilot.apply.chrome import (
     launch_chrome,
     reset_worker_dir,
 )
-from applypilot.qwen_mcp import QwenMCPAgent, get_effective_model_and_provider
+from applypilot.linkedin.intelligent_apply import PreparationError, intelligent_enabled, intelligent_session
 from applypilot.linkedin.unified_apply import (
     _configured_language_resume_paths,
     _detect_job_language,
     _job_language_allowed,
     _select_resume_path_for_job,
 )
+from applypilot.qwen_mcp import QwenMCPAgent, get_configured_model, get_effective_model_and_provider
 
 log = logging.getLogger(__name__)
 
@@ -138,9 +139,11 @@ def _close_application_tabs(context, keep):
 
 
 def validate_non_easy_config(settings: dict) -> None:
-    paths = {"resume_path": settings.get("resume_path")}
-    paths.update({f"resume_paths.{lang}": path for lang, path in
-                  _configured_language_resume_paths(settings).items() if path})
+    paths = {}
+    if not intelligent_enabled(settings):
+        paths["resume_path"] = settings.get("resume_path")
+        paths.update({f"resume_paths.{lang}": path for lang, path in
+                      _configured_language_resume_paths(settings).items() if path})
     if settings.get("photo_path"):
         paths["photo_path"] = settings["photo_path"]
     for label, path in paths.items():
@@ -158,7 +161,9 @@ def _settings_for_job(settings: dict, description: str) -> tuple[dict | None, st
     language = _detect_job_language(description)
     if not _job_language_allowed(settings, language):
         return None, language
-    resume, _ = _select_resume_path_for_job(settings, description, settings["resume_path"])
+    resume = settings["resume_path"]
+    if not intelligent_enabled(settings):
+        resume, _ = _select_resume_path_for_job(settings, description, resume)
     return {**settings, "resume_path": resume}, language
 
 
@@ -263,7 +268,12 @@ def _build_prompt(job: dict, config_dict: dict, dry_run: bool = False) -> str:
     profile = config_dict.get("profile", {}) or {}
     answers = config_dict.get("answers", {}) or {}
     resume_path = Path(config_dict["resume_path"]).resolve()
-    resume_text = _read_resume_text(resume_path)
+    resume_text = (config_dict["_intelligent_resume_text"] if "_intelligent_resume_text" in config_dict
+                   else _read_resume_text(resume_path))
+    if config_dict.get("_intelligent_pdf_sha256"):
+        resume_text += ("\n\nThis résumé was generated for this job. Upload the exact PDF path above; "
+                        "do not select a previously saved résumé with the same filename. If the fresh upload "
+                        "cannot be completed and verified, output RESULT:FAILED:upload_rejected.")
     photo = str(config_dict.get("photo_path") or "").strip()
     photo_path = str(Path(photo).resolve()) if photo else "Not configured"
     mailbox_url, applicant_email = _mailbox_context(config_dict)
@@ -991,6 +1001,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
     validate_non_easy_config(config_dict)
     applied_keys = _load_applied_job_keys()
+    preparer = config_dict.get("_intelligent_preparer")
 
     summary = {
         "found": 0,
@@ -1011,10 +1022,13 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
     port = BASE_CDP_PORT
     chrome_proc = None
+    effective_model, provider = get_effective_model_and_provider(
+        model, model_override=get_configured_model(config_dict, "browser_model"),
+    )
+    log.info("External browser agent model: %s (provider=%s)", effective_model, provider)
 
     try:
         chrome_proc = launch_chrome(0, port=port, headless=headless)
-        effective_model, provider = get_effective_model_and_provider(model)
         agent = None if provider == "claude" else QwenMCPAgent(
             model=effective_model,
             mcp_config=_make_mcp_config(port),
@@ -1116,16 +1130,21 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
                         # Parse only the description so English navigation text
                         # does not influence the language filter.
-                        from applypilot.linkedin.scrape import parse_job
+                        from applypilot.linkedin.scrape import parse_job, read_current_job
 
                         description = ""
+                        details = {}
                         try:
-                            details = parse_job(detail_page.content(), linkedin_url)
+                            details = (read_current_job(detail_page, linkedin_url) if preparer else
+                                       parse_job(detail_page.content(), linkedin_url))
                             description = details["description"]
                             title_text = details["title"] or title_text
                             company = details["company"] or company
-                        except ValueError as exc:
+                        except (ValueError, PlaywrightTimeoutError) as exc:
                             log.warning("Could not parse job description: %s", exc)
+                            if preparer:
+                                summary["failed"] += 1
+                                continue
 
                         job = {
                             "linkedin_url": linkedin_url,
@@ -1144,22 +1163,30 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             log.info("Skipping %s: only_english enabled, language=%s", linkedin_url, language or "unclear")
                             continue
                         log.info("Job language=%s; CV=%s; photo=%s", language or "unclear",
-                                 job_settings["resume_path"], job_settings.get("photo_path") or "not configured")
+                                 "pending intelligent preparation" if preparer else job_settings["resume_path"],
+                                 job_settings.get("photo_path") or "not configured")
 
-                        application_page, application_url = _open_external_application_page(detail_page)
-                        if not application_page:
-                            summary["skipped"] += 1
-                            summary["search_stats"]["no_external_url"] += 1
-                            log.info("No external application page opened after Apply click: %s", linkedin_url)
-                            _close_application_tabs(context, (search_page, detail_page, mailbox_page))
-                            continue
-
-                        job["application_url"] = application_url or ""
-                        summary["jobs"].append(job)
-                        summary["found"] += 1
-                        log.info("Opened external application page: %s", application_url or "<unknown>")
-
+                        prepared = None
+                        outcome = "failed"
                         try:
+                            if preparer:
+                                prepared = preparer.prepare({**details, **job})
+                                prepared.verify_published()
+                                job_settings = {**job_settings, "resume_path": str(prepared.published_pdf),
+                                                "_intelligent_resume_text": prepared.text,
+                                                "_intelligent_pdf_sha256": prepared.pdf_sha256}
+                            application_page, application_url = _open_external_application_page(detail_page)
+                            if not application_page:
+                                summary["skipped"] += 1
+                                summary["search_stats"]["no_external_url"] += 1
+                                outcome = "skipped"
+                                log.info("No external application page opened after Apply click: %s", linkedin_url)
+                                continue
+
+                            job["application_url"] = application_url or ""
+                            summary["jobs"].append(job)
+                            summary["found"] += 1
+                            log.info("Opened external application page: %s", application_url or "<unknown>")
                             result, _duration_ms = _run_external_application(
                                 provider=provider,
                                 model=effective_model,
@@ -1169,29 +1196,42 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 port=port,
                                 dry_run=dry_run,
                             )
-                        finally:
-                            _close_application_tabs(context, (search_page, detail_page, mailbox_page))
-                        if dry_run and result in {"ready", "applied"}:
-                            summary["ready"] += 1
-                        elif not dry_run and result == "applied":
-                            summary["applied"] += 1
-                            applied_keys.add(_job_registry_key(job))
-                            try:
-                                _record_applied_job(job)
-                            except OSError:
-                                log.exception("Application submitted but history could not be saved; stopping to prevent duplicates")
-                                summary["stopped_reason"] = "history_write_failed"
-                                return summary
-                        else:
+                            if dry_run and result in {"ready", "applied"}:
+                                summary["ready"] += 1
+                                outcome = "ready"
+                            elif not dry_run and result == "applied":
+                                summary["applied"] += 1
+                                outcome = "applied"
+                                applied_keys.add(_job_registry_key(job))
+                                try:
+                                    _record_applied_job(job)
+                                except OSError:
+                                    log.exception("Application submitted but history could not be saved; stopping to prevent duplicates")
+                                    summary["stopped_reason"] = "history_write_failed"
+                                    return summary
+                            else:
+                                summary["failed"] += 1
+                                log.info("Non-easy apply failed for %s: %s", application_url or linkedin_url, result)
+                                if result == "failed:provider_credit_low":
+                                    summary["stopped_reason"] = "provider_credit_low"
+                                    return summary
+                        except PreparationError as exc:
+                            log.error("%s", exc)
                             summary["failed"] += 1
-                            log.info(
-                                "Non-easy apply failed for %s: %s",
-                                application_url or linkedin_url,
-                                result,
-                            )
-                            if result == "failed:provider_credit_low":
-                                log.error("Stopping non-easy apply run: provider credits are exhausted.")
+                            if exc.fatal:
+                                summary["stopped_reason"] = f"intelligent_{exc.stage}_failed"
                                 return summary
+                        except Exception:
+                            if not preparer:
+                                raise
+                            log.exception("Application failed after intelligent preparation: %s", linkedin_url)
+                            summary["failed"] += 1
+                        finally:
+                            try:
+                                if prepared:
+                                    prepared.finish(outcome)
+                            finally:
+                                _close_application_tabs(context, (search_page, detail_page, mailbox_page))
 
                     if summary["found"] >= max_applications or inspected >= max_candidates:
                         break
@@ -1226,6 +1266,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     return summary
 
 
+@intelligent_session
 def run_non_easy_apply(config_dict: dict, model: str = "qwen-flash",
                        headless: bool = False, dry_run: bool = False) -> dict:
     """Backward-compatible shim."""

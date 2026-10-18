@@ -62,16 +62,16 @@ class FakeElement:
     def is_visible(self):
         return self.visible
 
-    def is_enabled(self):
+    def is_enabled(self, **kwargs):
         return self.enabled
 
     def is_checked(self):
         return self.checked
 
-    def text_content(self):
+    def text_content(self, **kwargs):
         return self.text
 
-    def get_attribute(self, name):
+    def get_attribute(self, name, **kwargs):
         if name == "id":
             return self.element_id
         if name == "aria-label":
@@ -91,7 +91,7 @@ class FakeElement:
     def query_selector_all(self, selector):
         return self.elements_by_selector.get(selector, [])
 
-    def bounding_box(self):
+    def bounding_box(self, **kwargs):
         return self.box
 
     def evaluate(self, script, *args):
@@ -112,6 +112,24 @@ class FakePage:
 
     def query_selector_all(self, selector):
         return self.elements_by_selector.get(selector, [])
+
+    def locator(self, selector):
+        return FakeLocator(self.elements_by_selector.get(selector, []))
+
+
+class FakeLocator:
+    def __init__(self, elements):
+        self.elements = elements
+
+    def count(self):
+        return len(self.elements)
+
+    def nth(self, index):
+        return self.elements[index]
+
+    @property
+    def first(self):
+        return self.nth(0)
 
 
 class LabelScope:

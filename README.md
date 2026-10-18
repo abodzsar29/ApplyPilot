@@ -130,6 +130,25 @@ API keys and runtime config: `NON_EASY_PROVIDER`, `NON_EASY_MODEL`, `OPENROUTER_
 ### `config/linkedin_apply.json`
 LinkedIn Easy Apply config. Supports `company_blacklist`, a list of company names to skip before the bot clicks `Easy Apply`. Set `browser` to `chrome` or `brave` to launch that installed browser instead of the default Playwright Chromium browser. Optional browser-context settings include `locale`, `timezone_id`, `geolocation`, `permissions`, `user_agent`, `viewport`, `device_scale_factor`, `accept_language`, and `extra_http_headers`. Set `search_url` only to reuse a LinkedIn jobs route; the generated `job_title`, `location`, and Easy Apply filter still come from config so stale copied URLs cannot override them. Set `"old_url": true` to preserve the copied `search_url` parameters while replacing its `keywords` value with `job_title` from config. Set `use_search_results_url` to `true` to open LinkedIn's `/jobs/search-results/` route instead of `/jobs/search/`. Add intentional extra query values with `search_params`, for example a fresh `geoId` or `distance`. For phone dropdowns, set `profile.phone_country` to the country name LinkedIn shows, for example `United Kingdom`.
 
+### Per-job intelligent résumés
+
+Both `linkedin-apply` and `linkedin-noneasy` support `"intelligent_apply": true` in
+`config/linkedin_apply.json`. After the existing job filters pass, they save the
+description, query the configured non-Easy-Apply API, replace just the two NOMOS
+bullets, compile and verify a UK/EU PDF, publish it to `data/AndrewBodzsarCV.pdf`,
+and use that exact résumé for the application. Prompt/source files are reread per
+job; cache-aware requests and cache/cost telemetry are included.
+
+Set `browser_model` and `bulletpoint_model` in the same JSON file to select the
+external browser agent and résumé generation models independently. Nonempty
+config values override environment model defaults. Easy Apply's browser uses
+Playwright directly; `browser_model` applies to `linkedin-noneasy`.
+
+See [Intelligent Apply](INTELLIGENT_APPLY.md) for configuration, artifacts, safety
+checks, and tests. `--dry-run` still calls the API and overwrites the published CV;
+it stops before final application submission. `linkedin-apply --setup` bypasses
+résumé preparation.
+
 ### Scrape LinkedIn job descriptions
 
 ```bash

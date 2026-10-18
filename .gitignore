@@ -22,7 +22,10 @@ config/
 NON_EASY_MERGE_PLAN.md 
 docs/
 openrouter_cheapest_tool_models.txt
-
+Automatic.txt
+INTELLIGENT_APPLY.md
+INTELLIGENT_APPLY_IMPLEMENTATION_PLAN.md
+tailored/
 
 
 # Business files
@@ -43,6 +46,7 @@ coverletter/
 
 
 # Runtime artifacts
+JobApplications/
 scrapedjobs/
 *.db
 tailored_resumes/

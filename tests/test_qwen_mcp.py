@@ -1,13 +1,51 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from applypilot.qwen_mcp import (
     QwenMCPAgent,
     _has_terminal_result,
     _normalize_openrouter_tool_messages,
+    get_configured_model,
+    get_effective_model_and_provider,
+    resolve_non_easy_connection,
 )
 
 
 class QwenMCPTests(unittest.TestCase):
+    def test_model_config_override_takes_precedence_without_changing_provider(self):
+        for provider in ("openrouter", "dashscope", "claude"):
+            with (self.subTest(provider=provider), patch.dict(os.environ, {
+                "NON_EASY_PROVIDER": provider, "NON_EASY_MODEL": "environment-model",
+            }, clear=True)):
+                self.assertEqual(get_effective_model_and_provider("cli-model", model_override=" config-model "),
+                                 ("config-model", provider))
+                self.assertEqual(get_effective_model_and_provider("cli-model"), ("environment-model", provider))
+        with patch.dict(os.environ, {"NON_EASY_PROVIDER": "openrouter"}, clear=True):
+            self.assertEqual(get_effective_model_and_provider("cli-model"), ("cli-model", "openrouter"))
+
+    def test_optional_model_values_and_invalid_config_types(self):
+        for value in (None, "", "  "):
+            self.assertIsNone(get_configured_model({"browser_model": value}, "browser_model"))
+        self.assertIsNone(get_configured_model({}, "browser_model"))
+        self.assertEqual(get_configured_model({"bulletpoint_model": " chosen-model "}, "bulletpoint_model"),
+                         "chosen-model")
+        for key in ("browser_model", "bulletpoint_model"):
+            for value in (True, False, 12, [], {}):
+                with self.subTest(key=key, value=value), self.assertRaisesRegex(ValueError, key):
+                    get_configured_model({key: value}, key)
+
+    def test_text_model_override_reuses_connection_and_credentials(self):
+        with patch.dict(os.environ, {"NON_EASY_PROVIDER": "openrouter", "NON_EASY_MODEL": "browser-default",
+                                     "OPENROUTER_API_KEY": "test-secret", "OPENROUTER_BASE_URL": "https://fixture/v1"},
+                        clear=True):
+            connection = resolve_non_easy_connection("cli-fallback", model_override="bullet-model")
+        self.assertEqual(connection.model, "bullet-model")
+        self.assertEqual(connection.provider, "openrouter")
+        self.assertEqual(connection.base_url, "https://fixture/v1")
+        self.assertEqual(connection.api_key, "test-secret")
+        self.assertNotIn("test-secret", repr(connection))
+
     def test_openrouter_tool_result_gets_matching_nonempty_call_id(self):
         source = [
             {"role": "user", "content": "inspect"},
