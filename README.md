@@ -130,6 +130,58 @@ API keys and runtime config: `NON_EASY_PROVIDER`, `NON_EASY_MODEL`, `OPENROUTER_
 ### `config/linkedin_apply.json`
 LinkedIn Easy Apply config. Supports `company_blacklist`, a list of company names to skip before the bot clicks `Easy Apply`. Set `browser` to `chrome` or `brave` to launch that installed browser instead of the default Playwright Chromium browser. Optional browser-context settings include `locale`, `timezone_id`, `geolocation`, `permissions`, `user_agent`, `viewport`, `device_scale_factor`, `accept_language`, and `extra_http_headers`. Set `search_url` only to reuse a LinkedIn jobs route; the generated `job_title`, `location`, and Easy Apply filter still come from config so stale copied URLs cannot override them. Set `"old_url": true` to preserve the copied `search_url` parameters while replacing its `keywords` value with `job_title` from config. Set `use_search_results_url` to `true` to open LinkedIn's `/jobs/search-results/` route instead of `/jobs/search/`. Add intentional extra query values with `search_params`, for example a fresh `geoId` or `distance`. For phone dropdowns, set `profile.phone_country` to the country name LinkedIn shows, for example `United Kingdom`.
 
+Set `"to_ignore": ["senior", "lead", "scientist"]` to skip job titles containing
+**any** listed text in `linkedin-apply` and `linkedin-noneasy`, regardless of
+capitalization. A single string such as `"to_ignore": "scientist"` still works. This is a
+literal substring match against the title only, not the company or description;
+for example, it excludes `Climate Simulation & AI Scientist, Built Environment`.
+Each entry can also be a phrase; a comma within a string is literal, not a separator.
+Missing, null, empty, or whitespace-only values (including an empty list) disable the filter. Matching jobs
+are logged and skipped before résumé tailoring or application handoff, whether
+Intelligent Apply is enabled or not. `title_keyword` remains the separate positive
+title filter; a job must pass both filters.
+
+### Screening-question fallback
+
+`linkedin-apply` uses configured profile/answer values first. For an unmatched
+choice question it tries **Yes**, then **Ja**, and otherwise randomly selects
+an enabled, non-placeholder option. A valid selection is preserved on step
+retries. This applies to radio groups, checkbox option groups (including unnamed
+SDUI inputs with empty labels and sibling option text), native selects, and custom
+combobox/listbox controls (including portalled dropdown menus). An unanswered
+checkbox option group gets one choice; independent required consent boxes are
+handled separately and follow-company boxes stay unchecked. Free-text fields receive `"a"`
+and numeric/count fields receive `"1"`.
+
+If a text/number field reports "Invalid input", "Invalid type", or equivalent
+number/type validation, Easy Apply retries only that field: an applicable
+configured answer first, then `"1"` (number) and `"a"` (text), excluding values
+already rejected and formats blocked by the input's native constraints. Attempts
+are tracked per question across form re-renders, and corrected values are kept
+on subsequent passes. Review/Next and final Submit validation both use this
+fallback; exhausted choices stop that application instead of repeating forever.
+
+Selections are verified with short timeouts. No LLM or offline classifier is used.
+File uploads, saved résumé selections, and hidden inputs are kept separate from
+text answers. Add explicit answers for any personal facts you do not want the
+random fallback to choose, including demographic questions.
+
+Open education and work-experience editors in LinkedIn Easy Apply are deleted
+using their own Delete control before any fields are filled. Closed/saved entries
+and unrelated questions are left alone. The bot verifies deletion, handles an
+entry-specific confirmation dialog if present, and stops that application if the
+entry cannot be deleted; it does not fill or save the open editor as a fallback.
+This also applies during required-field validation retries.
+
+Every document upload request receives the selected job-specific CV again,
+including transcripts, cover letters, certificates, and unfamiliar attachments.
+Easy Apply supports multiple direct file inputs and SDUI file-picker buttons such
+as "Upload Transcript", and avoids uploading completed fields again on retries.
+The non-Easy-Apply agent receives the same document-upload instructions. This reuses
+the same file, does not generate other documents, and does not replace the separate
+résumé upload. File-type restrictions are respected: image-only fields still use
+`photo_path` when configured, and a required incompatible upload reports a failure.
+
 ### Per-job intelligent résumés
 
 Both `linkedin-apply` and `linkedin-noneasy` support `"intelligent_apply": true` in

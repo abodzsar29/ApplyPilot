@@ -1,0 +1,177 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Local multi-choice screening fixture</title>
+<div role="dialog" id="application"></div>
+<script>
+(() => {
+const questions = [
+    {id: 'source', label: 'How did you hear about Distribusion?*', options: [
+        'Distribusion’s careers page', 'LinkedIn', 'Indeed', 'Wellfound', 'Glassdoor', 'Otta',
+        'Career event', 'I was referred by an employee of Distribusion',
+        'I was contacted by a Talent Partner', 'Other'
+    ]},
+    {id: 'setup', label: 'What is your preferred working setup?*', options: [
+        'Fully remote (remaining in my current location)', 'Another one',
+        'In Berlin / Relocation to Berlin', 'In Germany, but not Berlin'
+    ]},
+    {id: 'gender', label: 'Gender identity*', options: [
+        'Man', 'Woman', 'Transgender', 'Non-Binary', 'I choose not to identify', 'Other'
+    ]},
+    {id: 'age', label: 'Age range*', options: [
+        '20’s', '30’s', '40’s', '50’s', '60’s', 'I choose not to identify', 'Other'
+    ]}
+];
+window.questions = questions;
+const fields = [
+    {id: 'other', label: 'Please list the "Other" or the name of the Talent Partner / Referral contact:'},
+    {id: 'based', label: 'Where are you currently based? (city, country)*'},
+    {id: 'base', label: 'What is your annual base salary range expectation for this role? (in EUR)*', type: 'number'},
+    {id: 'compensation', label: 'What is your total annual compensation range expectation for this role? (in EUR)', type: 'number'},
+    {id: 'notice', label: 'What is your current notice period? or When could you start with us?*'}
+];
+window.choiceState = {};
+window.textState = {};
+window.nextClicks = 0;
+window.rerenderOnChoice = true;
+let mode = 'custom';
+
+function rememberText() {
+    for (const field of fields) {
+        const input = document.getElementById(field.id);
+        if (input) window.textState[field.id] = input.value;
+    }
+}
+
+function choose(question, text, control) {
+    rememberText();
+    window.choiceState[question.id] = text;
+    document.getElementById('popup-' + question.id)?.remove();
+    if (window.rerenderOnChoice) {
+        renderForm(mode);
+    } else {
+        if (control.tagName === 'INPUT' || control.tagName === 'SELECT') control.value = text;
+        else control.textContent = text;
+        control.setAttribute('aria-expanded', 'false');
+    }
+}
+
+function addQuestion(question, container) {
+    const fieldset = document.createElement('fieldset');
+    const legend = document.createElement('legend');
+    legend.id = question.id + '-label';
+    legend.textContent = question.label;
+    fieldset.append(legend);
+    container.append(fieldset);
+    if (mode === 'radio') {
+        for (const [index, text] of question.options.entries()) {
+            const label = document.createElement('label');
+            label.style.display = 'contents';
+            const input = document.createElement('input');
+            input.id = question.id + '-' + index;
+            input.type = 'radio';
+            input.name = question.id + '-generated-' + index;
+            input.value = 'opaque-' + index;
+            input.style = 'position:absolute;opacity:0;left:-10000px';
+            input.checked = window.choiceState[question.id] === text;
+            input.onchange = () => choose(question, text, input);
+            const span = document.createElement('span');
+            span.textContent = text;
+            label.append(input, span);
+            fieldset.append(label);
+        }
+        return;
+    }
+    if (mode === 'select') {
+        const select = document.createElement('select');
+        select.id = question.id;
+        select.setAttribute('aria-labelledby', legend.id);
+        select.required = true;
+        select.append(new Option('Choose', ''));
+        const disabled = new Option('Disabled option', 'disabled');
+        disabled.disabled = true;
+        select.append(disabled);
+        for (const text of question.options) select.append(new Option(text, text));
+        select.value = window.choiceState[question.id] || '';
+        select.onchange = () => choose(question, select.value, select);
+        fieldset.append(select);
+        return;
+    }
+    const control = document.createElement(question.id === 'setup' ? 'input' : 'button');
+    if (control.tagName === 'INPUT') {
+        control.readOnly = true;
+        control.value = window.choiceState[question.id] || '';
+    } else {
+        control.type = 'button';
+        control.textContent = window.choiceState[question.id] || 'Choose';
+    }
+    control.id = question.id;
+    control.setAttribute('role', 'combobox');
+    control.setAttribute('aria-required', 'true');
+    control.setAttribute('aria-labelledby', legend.id);
+    control.setAttribute('aria-haspopup', 'listbox');
+    control.setAttribute('aria-controls', 'popup-' + question.id);
+    control.setAttribute('aria-expanded', 'false');
+    control.onclick = () => {
+        if (document.getElementById('popup-' + question.id)) return;
+        const popup = document.createElement('div');
+        popup.id = 'popup-' + question.id;
+        popup.setAttribute('role', 'listbox');
+        popup.setAttribute('aria-labelledby', legend.id);
+        const addOption = (text, disabled = false) => {
+            const option = document.createElement('div');
+            option.setAttribute('role', 'option');
+            option.setAttribute('aria-disabled', String(disabled));
+            option.setAttribute('aria-selected', String(window.choiceState[question.id] === text));
+            option.textContent = text;
+            option.onclick = () => { if (!disabled) choose(question, text, control); };
+            popup.append(option);
+        };
+        addOption('Choose');
+        addOption('Disabled option', true);
+        for (const text of question.options) addOption(text);
+        document.body.append(popup); // Typical portalled dropdown outside the modal.
+        control.setAttribute('aria-expanded', 'true');
+    };
+    fieldset.append(control);
+}
+
+window.renderForm = function(nextMode = mode) {
+    mode = nextMode;
+    const container = document.getElementById('application');
+    container.replaceChildren();
+    const heading = document.createElement('h2');
+    heading.textContent = 'Additional Questions';
+    container.append(heading);
+    addQuestion(questions[0], container);
+    for (const field of fields) {
+        const label = document.createElement('label');
+        label.textContent = field.label;
+        const input = document.createElement('input');
+        input.id = field.id;
+        input.type = field.type || 'text';
+        input.required = field.label.includes('*');
+        input.value = window.textState[field.id] || '';
+        input.oninput = () => { window.textState[field.id] = input.value; };
+        label.append(input);
+        container.append(label);
+    }
+    for (const question of questions.slice(1)) addQuestion(question, container);
+    const next = document.createElement('button');
+    next.id = 'next';
+    next.type = 'button';
+    next.textContent = 'Next';
+    next.onclick = () => {
+        window.nextClicks++;
+        rememberText();
+        const complete = questions.every(question => question.options.includes(window.choiceState[question.id])) &&
+            fields.every(field => window.textState[field.id]);
+        if (complete) {
+            window.snapshot = {...window.choiceState, ...window.textState};
+            container.innerHTML = '<h2>Review your application</h2><button type="button">Submit application</button>';
+        }
+    };
+    container.append(next);
+};
+renderForm();
+})();
+</script>

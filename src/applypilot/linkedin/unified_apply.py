@@ -6,6 +6,7 @@ import random as random_module
 import re
 import time
 import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
@@ -14,9 +15,18 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
+from applypilot.linkedin.filters import configured_title_exclusion, title_is_ignored
 from applypilot.linkedin.intelligent_apply import PreparationError, intelligent_session
 
 log = logging.getLogger(__name__)
+
+_FORM_INPUT_SELECTOR = (
+    'input, select, textarea, [role="radio"]:not(:has(input[type="radio"])), '
+    '[role="checkbox"]:not(:has(input[type="checkbox"])), '
+    '[role="combobox"]:not(:has(input, select, textarea)), '
+    '[aria-haspopup="listbox"]:not(:has(input, select, textarea)), '
+    '[role="listbox"]:not(:has(input[type="radio"], select))'
+)
 
 
 _PHONE_COUNTRY_LABEL_TOKENS = (
@@ -69,6 +79,14 @@ _NUMERIC_RANGE_VALIDATION_TEXTS = (
     "enter a whole number between 0 and 99",
 )
 
+_INVALID_TYPE_VALIDATION_TEXTS = (
+    "invalid input", "invalid type", "invalid value", "invalid number",
+    "enter a valid number", "enter a number", "must be a number", "must be numeric",
+    "ungültige eingabe", "ungultige eingabe", "ungültiger typ", "ungultiger typ",
+    "ongeldige invoer", "ongeldig type",
+    *_NUMERIC_RANGE_VALIDATION_TEXTS,
+)
+
 _UPLOAD_FORMAT_ERROR_TEXTS = (
     "please upload an acceptable document format (jpg, jpeg, gif, png). change file",
     "please upload an acceptable document format",
@@ -88,6 +106,15 @@ _RESUME_UPLOAD_LABEL_TOKENS = (
     "lebenslauf",
 )
 
+_COVER_LETTER_UPLOAD_LABEL_TOKENS = (
+    "cover letter",
+    "coverletter",
+    "anschreiben",
+    "motivationsschreiben",
+    "motivation letter",
+    "lettre de motivation",
+)
+
 _NON_RESUME_UPLOAD_LABEL_TOKENS = (
     "photo",
     "picture",
@@ -100,15 +127,6 @@ _NON_RESUME_UPLOAD_LABEL_TOKENS = (
 )
 
 _PHOTO_UPLOAD_LABEL_TOKENS = _NON_RESUME_UPLOAD_LABEL_TOKENS
-
-_RESUME_FILE_ACCEPT_TOKENS = (
-    ".pdf",
-    "application/pdf",
-    ".doc",
-    ".docx",
-    "application/msword",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-)
 
 _IMAGE_FILE_ACCEPT_TOKENS = (
     ".jpg",
@@ -146,6 +164,25 @@ _CONSENT_LABEL_TOKENS = (
     "personenbezogene daten",
     "zustimmen",
 )
+
+_HISTORY_EDITOR_LABELS = {
+    "experience": (
+        "edit experience", "add experience", "edit work experience", "add work experience",
+        "berufserfahrung bearbeiten", "berufserfahrung hinzufügen", "berufserfahrung hinzufugen",
+    ),
+    "education": (
+        "edit education", "add education", "ausbildung bearbeiten", "ausbildung hinzufügen",
+        "ausbildung hinzufugen",
+    ),
+}
+
+_HISTORY_DELETE_LABELS = {
+    "experience": (
+        "delete experience", "delete work experience", "remove experience", "remove work experience",
+        "berufserfahrung löschen", "berufserfahrung loschen",
+    ),
+    "education": ("delete education", "remove education", "ausbildung löschen", "ausbildung loschen"),
+}
 
 _EASY_APPLY_NEXT_BUTTON_SELECTORS = [
     "button:has-text('Next')",
@@ -529,6 +566,7 @@ def _looks_like_linkedin_job_title(value: str) -> bool:
 def _extract_job_title_from_card(card) -> str:
     """Extract a job title from legacy and newer LinkedIn SDUI cards."""
     selectors = [
+        "a[href*='/jobs/view/']",
         "h3",
         "h2",
         ".job-card-list__title",
@@ -540,7 +578,6 @@ def _extract_job_title_from_card(card) -> str:
         "[aria-label*='Job title,']",
         "[aria-label^='Title']",
         "[aria-label*='Title,']",
-        "a[href*='/jobs/view/']",
         "p",
         "p span:not([aria-hidden='true'])",
         "p span",
@@ -577,6 +614,7 @@ def _extract_job_title_from_card(card) -> str:
                         "actively reviewing applicants",
                     ]);
                 const selectors = [
+                    "a[href*='/jobs/view/']",
                     "h3",
                     "h2",
                     ".job-card-list__title",
@@ -586,7 +624,6 @@ def _extract_job_title_from_card(card) -> str:
                     "[data-testid='job-item-title']",
                     "[aria-label*='Job title']",
                     "[aria-label*='Title,']",
-                    "a[href*='/jobs/view/']",
                     "p",
                     "p span:not([aria-hidden='true'])",
                     "p span",
@@ -621,6 +658,15 @@ def _extract_job_title_from_card(card) -> str:
             return text
     except Exception:
         pass
+
+    # Some result cards are the title link itself, rather than its parent.
+    try:
+        if "/jobs/view/" in (card.get_attribute("href") or ""):
+            text = _clean_linkedin_card_text(card.text_content() or "")
+            if _looks_like_linkedin_job_title(text):
+                return text
+    except PlaywrightError as exc:
+        log.debug("Could not read self-anchored LinkedIn job title: %s", exc)
 
     return ""
 
@@ -1491,6 +1537,7 @@ def search_and_apply(
     resume_path = config_dict.get("resume_path", "")
     photo_path = config_dict.get("photo_path", "")
     company_blacklist = config_dict.get("company_blacklist", [])
+    to_ignore = configured_title_exclusion(config_dict) if not setup else ""
     raw_delay = config_dict.get("delay", 0)
     randomize_page_jobs = _config_flag_enabled(config_dict.get("random", False))
     blacklisted_companies = tuple(
@@ -1616,19 +1663,23 @@ def search_and_apply(
                         _scroll_linkedin_job_card_into_view(card)
                         page.wait_for_timeout(250)
 
-                        # Check title if keyword filter is active
-                        if title_keyword:
+                        # Read only the title, excluding company/description text.
+                        if title_keyword or to_ignore:
                             title_text = _extract_job_title_from_card(card)
                             if not title_text:
                                 log.info(
-                                    "Card %s: Skipping because title_keyword '%s' is set but no title was found",
-                                    idx,
-                                    title_keyword,
+                                    "Card %s: Skipping because a title filter is enabled but no title was found", idx,
                                 )
                                 skipped += 1
                                 continue
 
-                            if title_keyword.lower() not in title_text.lower():
+                            if title_is_ignored(title_text, to_ignore):
+                                log.info("Card %s: Skipping because title '%s' contains to_ignore '%s' "
+                                         "(case-insensitive)", idx, title_text, to_ignore)
+                                skipped += 1
+                                continue
+
+                            if title_keyword and title_keyword.lower() not in title_text.lower():
                                 log.info(
                                     "Card %s: Skipping because title '%s' does not contain title_keyword '%s'",
                                     idx,
@@ -1667,6 +1718,11 @@ def search_and_apply(
                             from applypilot.linkedin.scrape import read_current_job
 
                             details = read_current_job(page, job_url)
+                            if title_is_ignored(details.get("title", ""), to_ignore):
+                                log.info("Card %s: Skipping because detail title '%s' contains to_ignore '%s' "
+                                         "(case-insensitive)", idx, details["title"], to_ignore)
+                                skipped += 1
+                                continue
                             if _is_blacklisted_company(details.get("company", ""), blacklisted_companies):
                                 skipped += 1
                                 continue
@@ -1966,11 +2022,16 @@ def _scope_has_easy_apply_controls(scope) -> bool:
         return True
 
     try:
-        field_count = len(scope.query_selector_all("input, select, textarea"))
+        field_count = len(scope.query_selector_all(_FORM_INPUT_SELECTOR))
     except Exception:
         field_count = 0
 
     if field_count > 0:
+        return True
+
+    # SDUI can expose only an attachment file-picker button while Next is
+    # disabled. This is still an actionable form step, even without an input.
+    if _find_document_upload_buttons(scope):
         return True
 
     return any((
@@ -2178,8 +2239,21 @@ def _extract_field_label(scope, input_elem) -> str:
     try:
         question_text = input_elem.evaluate(
             """el => {
-                const fieldset = el.closest('fieldset');
+                const choice = el.matches('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"]');
+                if (!choice) {
+                    const labels = [...(el.labels || [])].map(label => label.innerText || label.textContent || '').join(' ').trim();
+                    if (labels) return labels;
+                    const labelled = (el.getAttribute('aria-labelledby') || '').split(/\\s+/)
+                        .map(id => el.ownerDocument.getElementById(id)?.textContent || '').join(' ').trim();
+                    if (labelled) return labelled;
+                }
+                const fieldset = el.closest('[role="radiogroup"], [role="group"], fieldset');
                 if (!fieldset) return '';
+                const labelled = (fieldset.getAttribute('aria-labelledby') || '').split(/\\s+/)
+                    .map(id => el.ownerDocument.getElementById(id)?.textContent || '').join(' ').trim();
+                const legend = fieldset.querySelector('legend');
+                const heading = labelled || fieldset.getAttribute('aria-label') || (legend && legend.textContent);
+                if (heading) return heading;
                 const container = fieldset.parentElement;
                 if (!container) return '';
                 const question = [...container.children].find((child) => child !== fieldset && (child.innerText || '').trim());
@@ -2360,7 +2434,7 @@ def _collect_field_questions(scope, inputs=None) -> list[str]:
     """Return unique visible field questions/labels for logging stuck form pages."""
     if inputs is None:
         try:
-            inputs = scope.query_selector_all("input, select, textarea")
+            inputs = scope.query_selector_all(_FORM_INPUT_SELECTOR)
         except Exception:
             inputs = []
 
@@ -2417,8 +2491,10 @@ def _file_accept_tokens(input_elem) -> list[str]:
 
 def _file_input_context_text(scope, input_elem) -> str:
     """Return nearby upload text, including labels that sit outside the input wrapper."""
-    parts: list[str] = []
     field_id = input_elem.get_attribute("id") or ""
+    # React's generated _r_cv_ ID is not a semantic "CV" label.
+    descriptive_id = "" if re.fullmatch(r"(?:_r_[A-Za-z0-9]+_|:r[A-Za-z0-9]+:)", field_id) else field_id
+    parts: list[str] = [descriptive_id, input_elem.get_attribute("name") or ""]
 
     if field_id:
         try:
@@ -2430,16 +2506,35 @@ def _file_input_context_text(scope, input_elem) -> str:
 
     try:
         parts.append(input_elem.get_attribute("aria-label") or "")
+        parts.append(input_elem.evaluate(
+            """el => [
+                ...[...(el.labels || [])].map(label => label.innerText || label.textContent || ''),
+                ...(el.getAttribute('aria-labelledby') || '').split(/\\s+/)
+                    .map(id => el.ownerDocument.getElementById(id)?.textContent || ''),
+            ].join(' ')"""
+        ) or "")
     except Exception:
         pass
+
+    explicit = " ".join(part for part in parts if part).strip()
+    normalized = _normalize_lookup_text(explicit)
+    if any(token in normalized for token in (
+        *_RESUME_UPLOAD_LABEL_TOKENS, *_COVER_LETTER_UPLOAD_LABEL_TOKENS, *_PHOTO_UPLOAD_LABEL_TOKENS,
+    )):
+        return explicit
 
     try:
         parts.append(input_elem.evaluate(
             """el => {
-                const container = el.closest(
-                    '[data-test-form-element], .full-width, fieldset, form, .jobs-document-upload__container'
-                );
-                return container ? (container.innerText || container.textContent || '') : '';
+                for (let container = el.parentElement; container; container = container.parentElement) {
+                    // Never let another upload field's label classify this input.
+                    if (container.querySelectorAll('input[type="file"]').length > 1) break;
+                    if (container.querySelector('#easyApplyUploadedCoverLetterRef')) return 'cover letter';
+                    const text = (container.innerText || container.textContent || '').trim();
+                    if (text) return text;
+                    if (container.matches('form, [role="dialog"], body, .jobs-document-upload__container')) break;
+                }
+                return '';
             }"""
         ) or "")
     except Exception:
@@ -2454,12 +2549,9 @@ def _accept_tokens_allow_resume_path(tokens: list[str], resume_path: str) -> boo
 
     suffix = Path(resume_path).suffix.lower()
     if suffix in {".pdf", ".doc", ".docx"}:
-        return any(
-            token == suffix
-            or token in _RESUME_FILE_ACCEPT_TOKENS
-            or token == "application/*"
-            for token in tokens
-        )
+        mime = {".pdf": "application/pdf", ".doc": "application/msword",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}[suffix]
+        return any(token in {suffix, mime, "application/*", "*/*"} for token in tokens)
 
     return True
 
@@ -2513,10 +2605,13 @@ def _is_required_upload_input(scope, input_elem) -> bool:
 
 
 def _is_resume_upload_input(scope, input_elem, resume_path: str) -> bool:
-    """Return True only for upload fields that are suitable for the resume file."""
+    """Recognize the actual résumé field, distinct from other PDF attachments."""
     tokens = _file_accept_tokens(input_elem)
     context_text = _file_input_context_text(scope, input_elem)
     normalized_context = _normalize_lookup_text(context_text)
+
+    if any(token in normalized_context for token in _COVER_LETTER_UPLOAD_LABEL_TOKENS):
+        return False
 
     if _accepts_only_images(tokens):
         log.info("Skipping file upload field because it only accepts images: %s", context_text or ",".join(tokens))
@@ -2534,10 +2629,9 @@ def _is_resume_upload_input(scope, input_elem, resume_path: str) -> bool:
         )
         return False
 
-    if tokens and any(token in _RESUME_FILE_ACCEPT_TOKENS for token in tokens):
-        return True
-
-    return any(token in normalized_context for token in _RESUME_UPLOAD_LABEL_TOKENS)
+    # A transcript, certificate, or other PDF must not satisfy the separate
+    # fresh-résumé requirement just because it accepts the same file format.
+    return any(_contains_lookup_phrase(normalized_context, token) for token in _RESUME_UPLOAD_LABEL_TOKENS)
 
 
 def _is_photo_upload_input(scope, input_elem, photo_path: str = "") -> bool:
@@ -2573,6 +2667,198 @@ def _find_resume_upload_input(scope, resume_path: str):
         if _is_resume_upload_input(scope, input_elem, resume_path):
             return input_elem
     return None
+
+
+def _find_cover_letter_upload_input(scope):
+    for input_elem in scope.query_selector_all("input[type='file']"):
+        context = _normalize_lookup_text(_file_input_context_text(scope, input_elem))
+        if any(token in context for token in _COVER_LETTER_UPLOAD_LABEL_TOKENS):
+            return input_elem
+    return None
+
+
+def _find_cover_letter_upload_button(scope):
+    for button in _find_document_upload_buttons(scope):
+        label = _upload_button_label(button)
+        if any(token in _normalize_lookup_text(label) for token in _COVER_LETTER_UPLOAD_LABEL_TOKENS):
+            return button
+    return None
+
+
+def _upload_button_label(button) -> str:
+    return button.evaluate(
+        """el => [el.getAttribute('aria-label') || '', el.innerText || el.textContent || '',
+                  el.value || ''].join(' ')"""
+    ) or ""
+
+
+def _find_document_upload_buttons(scope) -> list:
+    """Find file-picker controls by their action, not the attachment's name."""
+    buttons = []
+    for button in scope.query_selector_all("button, [role='button'], input[type='button']"):
+        if not button.is_visible() or not button.is_enabled():
+            continue
+        normalized = _normalize_lookup_text(_upload_button_label(button))
+        if any(_contains_lookup_phrase(normalized, token) for token in (
+            "upload", "hochladen", "téléverser", "televerser", "joindre", "attach", "browse",
+            "choose file", "select file", "change file", "replace file", "add file", "add document",
+            "add attachment", "datei auswählen", "datei auswahlen", "datei wählen", "datei hinzufugen",
+        )) or ("add" in normalized.split() and any(
+            token in normalized for token in (*_RESUME_UPLOAD_LABEL_TOKENS, *_COVER_LETTER_UPLOAD_LABEL_TOKENS)
+        )):
+            buttons.append(button)
+    return buttons
+
+
+def _upload_control_key(scope, control) -> str:
+    """Identify a field across retries without depending on React's generated IDs."""
+    return control.evaluate(
+        """(el, scope) => {
+            const path = [];
+            for (let node = el; node && node !== scope; node = node.parentElement) {
+                const siblings = node.parentElement ? [...node.parentElement.children] : [node];
+                path.unshift(node.tagName + ':' + siblings.filter(n => n.tagName === node.tagName).indexOf(node));
+            }
+            const heading = scope.querySelector('h1, h2, h3, [role="heading"]')?.textContent || '';
+            const isFile = el.matches('input[type="file"]');
+            let question = '';
+            for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+                const title = [...parent.children].filter(node =>
+                    node.matches('legend, h2, h3, p, [role="heading"]') &&
+                    (node.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)).at(-1);
+                if (title) { question = title.textContent || ''; break; }
+                if (parent === scope) break;
+            }
+            let label = el.getAttribute('aria-label') || (isFile
+                ? [...(el.labels || [])].map(n => n.textContent || '').join(' ') || el.name
+                : question ? '' : el.innerText || el.textContent || el.value || '');
+            // Selected filenames are state, not part of the question's identity.
+            for (const file of el.files || []) label = label.replaceAll(file.name, '');
+            return JSON.stringify([isFile ? 'file' : 'button', heading.trim(), question.trim(),
+                label.trim().replace(/\\s+/g, ' '), path.join('/')]);
+        }""", scope,
+    )
+
+
+def _upload_button_input(button):
+    """Resolve a button's own file input without crossing into another upload field."""
+    handle = button.evaluate_handle(
+        """el => {
+            for (const id of [el.getAttribute('for'), el.getAttribute('aria-controls')]) {
+                const input = id && el.ownerDocument.getElementById(id);
+                if (input?.matches('input[type="file"]')) return input;
+            }
+            for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+                if (parent.matches('form, [role="dialog"], body')) break;
+                const inputs = [...parent.querySelectorAll('input[type="file"]')];
+                if (inputs.length > 1) return null;
+                if (inputs.length === 1) return inputs[0];
+            }
+            return null;
+        }"""
+    )
+    return handle.as_element()
+
+
+def _upload_application_attachments(
+    page, scope, resume_path: str, photo_path: str, completed: set[str],
+) -> tuple[bool, bool]:
+    """Upload the current CV for every document request; return success and fresh-CV status."""
+    resume_uploaded = False
+    try:
+        # Reacquire after every change: an upload can rerender all remaining fields.
+        for _ in range(50):
+            scope = _get_active_modal(page) or scope
+            buttons = _find_document_upload_buttons(scope)
+            local_button_inputs = {}
+            input_button_counts: dict[str, int] = {}
+            for button in buttons:
+                linked_input = _upload_button_input(button)
+                if linked_input is not None and scope.evaluate("(root, input) => root.contains(input)", linked_input):
+                    input_key = _upload_control_key(scope, linked_input)
+                    local_button_inputs[_upload_control_key(scope, button)] = input_key
+                    input_button_counts[input_key] = input_button_counts.get(input_key, 0) + 1
+            pending = None
+            for input_elem in scope.query_selector_all("input[type='file']"):
+                if not input_elem.is_enabled():
+                    continue
+                key = _upload_control_key(scope, input_elem)
+                # A shared picker needs the individual button click to establish
+                # which document slot receives the selected file.
+                if input_button_counts.get(key, 0) > 1:
+                    continue
+                if key not in completed:
+                    pending = (input_elem, None, key)
+                    break
+            if pending is None:
+                for button in buttons:
+                    key = _upload_control_key(scope, button)
+                    if key in completed:
+                        continue
+                    input_key = local_button_inputs.get(key)
+                    if input_key in completed and input_button_counts.get(input_key, 0) == 1:
+                        completed.add(key)
+                        continue
+                    pending = (None, button, key)
+                    break
+            if pending is None:
+                return True, resume_uploaded
+
+            input_elem, button, key = pending
+            label = (_upload_button_label(button) if button is not None
+                     else _file_input_context_text(scope, input_elem))
+            chooser = None
+            if input_elem is None:
+                with page.expect_file_chooser(timeout=3000) as event:
+                    button.click(timeout=1000)
+                chooser = event.value
+                input_elem = chooser.element
+
+            tokens = _file_accept_tokens(input_elem)
+            if _accepts_only_images(tokens):
+                # Keep the existing configured-photo behavior for image-only fields.
+                if not photo_path:
+                    if _is_required_upload_input(scope, input_elem):
+                        raise ValueError(f"Image-only upload {label!r} cannot accept the CV and no photo is configured")
+                    log.info("Skipping optional image-only upload that cannot accept a CV: %s", label)
+                    completed.add(key)
+                    continue
+                upload_path = photo_path
+                if not _accept_tokens_allow_photo_path(tokens, upload_path):
+                    raise ValueError(f"Image-only upload {label!r} does not accept the configured photo")
+            else:
+                upload_path = resume_path
+                if not _accept_tokens_allow_resume_path(tokens, upload_path):
+                    raise ValueError(f"Upload field {label!r} accept={','.join(tokens)!r} does not allow the selected CV")
+            if not upload_path or not Path(upload_path).is_file():
+                raise ValueError(f"Upload {label!r} requested, but the configured file does not exist")
+
+            if button is not None:
+                normalized = _normalize_lookup_text(label)
+                is_resume = upload_path == resume_path and any(
+                    _contains_lookup_phrase(normalized, token) for token in _RESUME_UPLOAD_LABEL_TOKENS
+                )
+            else:
+                is_resume = upload_path == resume_path and _is_resume_upload_input(scope, input_elem, resume_path)
+            input_key = _upload_control_key(scope, input_elem)
+            log.info("Attachment requested (%s); uploading %s", label or "file", upload_path)
+            # SDUI may reuse one picker for several document slots. Selecting the
+            # identical CV again otherwise need not dispatch a new change event.
+            input_elem.evaluate("el => { if (el.files?.length) el.value = ''; }")
+            if chooser is not None:
+                chooser.set_files(upload_path, timeout=5000)
+            else:
+                input_elem.set_input_files(upload_path, timeout=5000)
+            page.wait_for_timeout(2000)
+            if _has_upload_format_error(_get_active_modal(page) or scope):
+                raise ValueError(f"Upload {label!r} was rejected by the form")
+            completed.update((key, input_key))
+            resume_uploaded = resume_uploaded or is_resume
+            log.info("Attachment upload SUCCESS: %s", label or "file")
+        raise ValueError("Too many attachment controls appeared on one form step")
+    except (PlaywrightError, ValueError, OSError) as exc:
+        log.error("Attachment upload FAILED: %s", str(exc).splitlines()[0])
+        return False, resume_uploaded
 
 
 def _find_photo_upload_input(scope, photo_path: str = ""):
@@ -2680,7 +2966,7 @@ def _uncheck_follow_company_checkbox(scope) -> bool:
             if not is_checked:
                 return False
 
-            if _click_choice_input(scope, checkbox, "checkbox"):
+            if _click_choice_input(scope, checkbox, "checkbox", checked=False):
                 return True
 
             if checkbox_id and label and label.is_visible():
@@ -2696,10 +2982,8 @@ def _uncheck_follow_company_checkbox(scope) -> bool:
 def _match_experience_years(label_lower: str, answers: dict) -> str | None:
     years_experience = answers.get("years_experience", {}) or {}
     for tech, years in sorted(years_experience.items(), key=lambda item: len(item[0]), reverse=True):
-        if tech.lower() in label_lower:
+        if _contains_lookup_phrase(_normalize_lookup_text(label_lower), _normalize_lookup_text(tech)):
             return str(years)
-    if "experience" in label_lower or "years" in label_lower:
-        return "4"
     return None
 
 
@@ -2757,6 +3041,10 @@ def _normalize_lookup_text(value: str) -> str:
     return " ".join(normalized.split())
 
 
+def _contains_lookup_phrase(text: str, phrase: str) -> bool:
+    return bool(phrase and re.search(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", text))
+
+
 def _lookup_direct_mapping(label_text: str, mapping: dict) -> str | None:
     """Return a scalar config value when the field label matches a config key."""
     label_norm = _normalize_lookup_text(label_text)
@@ -2776,9 +3064,9 @@ def _lookup_direct_mapping(label_text: str, mapping: dict) -> str | None:
         score = -1
         if label_norm == key_norm:
             score = 300 + len(key_norm)
-        elif key_norm in label_norm:
+        elif _contains_lookup_phrase(label_norm, key_norm):
             score = 200 + len(key_norm)
-        elif label_norm in key_norm:
+        elif _contains_lookup_phrase(key_norm, label_norm):
             score = 100 + len(label_norm)
 
         if score > best_score:
@@ -2801,19 +3089,7 @@ def _lookup_salary_answer(answers: dict) -> str | None:
 
 
 def _fallback_text_answer(label_text: str, profile: dict, answers: dict) -> str:
-    """Pick a usable text fallback for required fields LinkedIn rejects as blank."""
-    label_norm = _normalize_lookup_text(label_text)
-    salary_answer = _lookup_salary_answer(answers)
-
-    if any(token in label_norm for token in ["salary", "compensation", "base salary", "gehalt", "vergutung", "verguetung"]):
-        return salary_answer or "60000-80000 EUR"
-
-    if any(token in label_norm for token in ["years", "year", "jahre", "anzahl", "number", "how many", "wie viele"]):
-        return "4"
-
-    if "currency" in label_norm or "wahrung" in label_norm or "waehrung" in label_norm:
-        return "EUR"
-
+    """Use the requested simple default for unmatched text fields."""
     return "a"
 
 
@@ -2843,7 +3119,7 @@ def _infer_question_answer(label_text: str, profile: dict, answers: dict) -> str
     if any(x in label_lower for x in ["email", "e-mail"]):
         return profile.get("email")
     if any(x in label_lower for x in ["salary", "compensation", "base salary", "gehalt", "vergütung", "verguetung"]):
-        return _lookup_salary_answer(answers) or "60000-80000 EUR"
+        return _lookup_salary_answer(answers)
     if any(x in label_lower for x in ["city", "current location", "current city", "where are you located", "stadt", "wohnort", "ville"]) and "phone" not in label_lower:
         return profile.get("city")
     if "visa" in label_lower or "sponsorship" in label_lower:
@@ -3011,17 +3287,134 @@ def _collect_select_candidates(input_elem) -> list[tuple[str, str]]:
         return candidates
 
     for opt in options:
+        if not opt.is_enabled():
+            continue
         text = (opt.text_content() or "").strip()
         value = (opt.get_attribute("value") or "").strip()
-        normalized = text.lower()
-        if not text:
-            continue
-        if normalized in _SELECT_PLACEHOLDER_TEXTS or any(
-            placeholder in normalized for placeholder in _SELECT_PLACEHOLDER_TEXTS
-        ):
+        if not text or _is_choice_placeholder(text):
             continue
         candidates.append((text, value or text))
     return candidates
+
+
+def _is_choice_placeholder(text: str) -> bool:
+    normalized = _normalize_lookup_text(text)
+    # "I choose not to identify" is a real answer, not a "Choose" placeholder.
+    return not normalized or normalized in {
+        _normalize_lookup_text(placeholder) for placeholder in _SELECT_PLACEHOLDER_TEXTS
+    }
+
+
+def _is_custom_choice_control(input_elem, label_text: str) -> bool:
+    role = (input_elem.get_attribute("role") or "").lower()
+    popup = (input_elem.get_attribute("aria-haspopup") or "").lower()
+    if role == "listbox":
+        return True
+    if role != "combobox" and popup != "listbox":
+        return False
+    tag = input_elem.evaluate("el => el.tagName.toLowerCase()")
+    if tag == "select":
+        return False
+    # Keep editable address/phone typeaheads on their existing profile-fill path.
+    if tag == "input" and input_elem.get_attribute("readonly") is None and any(
+        token in label_text.lower() for token in ("city", "location", "based", "phone", "country code")
+    ):
+        return False
+    return True
+
+
+def _custom_choice_options(input_elem) -> list:
+    """Read this control's visible options, including portals outside the modal."""
+    handle = input_elem.evaluate_handle(
+        """el => {
+            const doc = el.ownerDocument;
+            const visible = node => node && node.getClientRects().length > 0 &&
+                getComputedStyle(node).visibility !== 'hidden';
+            const control = el.closest('[role="combobox"], [aria-haspopup="listbox"]') || el;
+            const ids = [control, el].flatMap(node => ['aria-controls', 'aria-owns']
+                .flatMap(attr => (node.getAttribute(attr) || '').split(/\\s+/).filter(Boolean)));
+            let roots = el.matches('[role="listbox"]') ? [el] : ids.map(id => doc.getElementById(id));
+            roots = roots.filter(visible);
+            if (!roots.length && !ids.length) {
+                roots = [...control.querySelectorAll('[role="listbox"]')].filter(visible);
+                if (!roots.length) {
+                    const open = [...doc.querySelectorAll('[role="listbox"]')].filter(visible);
+                    if (open.length === 1) roots = open;
+                }
+            }
+            return [...new Set(roots.flatMap(root => [...root.querySelectorAll('[role="option"], option')]))]
+                .filter(option => visible(option) && !option.disabled && option.getAttribute('aria-disabled') !== 'true');
+        }"""
+    )
+    try:
+        return [prop.as_element() for prop in handle.get_properties().values() if prop.as_element() is not None]
+    finally:
+        handle.dispose()
+
+
+def _custom_choice_text(input_elem) -> str:
+    return input_elem.evaluate(
+        """el => {
+            if (!el.isConnected) return '';
+            if (el.matches('[role="listbox"]')) {
+                return [...el.querySelectorAll('[aria-selected="true"]')].map(node => node.textContent || '').join(' ');
+            }
+            if (el.value) return el.value;
+            const copy = el.cloneNode(true);
+            for (const popup of copy.querySelectorAll('[role="listbox"]')) popup.remove();
+            return el.getAttribute('aria-valuetext') || copy.textContent || '';
+        }"""
+    ) or ""
+
+
+def _answer_custom_choice(page, scope, input_elem, label_text: str, profile: dict, answers: dict) -> bool:
+    """Open, choose and verify a custom dropdown with bounded, short waits."""
+    input_id = input_elem.get_attribute("id") or ""
+
+    def current_control():
+        return (page.query_selector(f'[id={json.dumps(input_id)}]') if input_id else None) or input_elem
+
+    try:
+        if not input_elem.is_visible() or not input_elem.is_enabled():
+            return False
+        options = _custom_choice_options(input_elem)
+        if not options:
+            input_elem.click(timeout=500)
+            for _ in range(8):
+                options = _custom_choice_options(current_control())
+                if options:
+                    break
+                page.wait_for_timeout(50)
+        candidates = [
+            ((option.text_content() or option.get_attribute("aria-label") or "").strip(), str(index))
+            for index, option in enumerate(options)
+        ]
+        candidates = [(text, index) for text, index in candidates if not _is_choice_placeholder(text)]
+        current_text = _normalize_lookup_text(_custom_choice_text(current_control()))
+        current = next((index for text, index in candidates if _normalize_lookup_text(text) == current_text), None)
+        inferred = _infer_question_answer(label_text, profile, answers)
+        selected = _best_option_value(label_text, candidates, inferred, profile, answers, current_value=current)
+        if selected is None:
+            log.warning("Choice answer FAILED: question=%r; no enabled dropdown options found", label_text)
+            return False
+        option = options[int(selected)]
+        selected_text = next(text for text, index in candidates if index == selected)
+        option.click(timeout=500)
+        selected_norm = _normalize_lookup_text(selected_text)
+        success = False
+        for _ in range(4):
+            actual = _normalize_lookup_text(_custom_choice_text(current_control()))
+            if (actual and (actual == selected_norm or _contains_lookup_phrase(actual, selected_norm))) or (
+                option.get_attribute("aria-selected") == "true"
+            ):
+                success = True
+                break
+            page.wait_for_timeout(25)
+        log.info("Choice answer %s: question=%r; option=%r", "SUCCESS" if success else "FAILED", label_text, selected_text)
+        return success
+    except PlaywrightError as exc:
+        log.warning("Choice answer FAILED: question=%r; %s", label_text, exc.message.splitlines()[0])
+        return False
 
 
 def _choose_dropdown_value(input_elem, label_text: str, profile: dict, answers: dict) -> str | None:
@@ -3049,21 +3442,213 @@ def _choose_dropdown_value(input_elem, label_text: str, profile: dict, answers: 
     return _fallback_select_value(input_elem, label_text, profile, answers)
 
 
+def _is_numeric_input(input_elem) -> bool:
+    input_type = (input_elem.get_attribute("type") or "").lower()
+    mode = (input_elem.get_attribute("inputmode") or "").lower()
+    pattern = input_elem.get_attribute("pattern") or ""
+    return input_type == "number" or mode in {"numeric", "decimal"} or "\\d" in pattern or "[0-9]" in pattern
+
+
+def _text_field_answer(input_elem, label_text: str, profile: dict, answers: dict) -> str:
+    value = _infer_question_answer(label_text, profile, answers)
+    numeric = _is_numeric_input(input_elem) or bool(re.search(
+        r"\b(?:how many|number of|anzahl|wie viele)\b", _normalize_lookup_text(label_text),
+    ))
+    if numeric:
+        # Do not try to type language levels, free text, or 'a' into a numeric
+        # control just because an imperfect label matched another config key.
+        return str(value).strip() if value is not None and re.fullmatch(r"-?\d+(?:\.\d+)?", str(value).strip()) else "1"
+    return str(value) if value is not None else _fallback_text_answer(label_text, profile, answers)
+
+
 def _fill_text_input(input_elem, text_value: str) -> str:
-    """Fill a text input, retrying with '4' when the default 'a' is rejected."""
+    """Fill quickly; use '1' if an 'a' fallback is rejected by a numeric input."""
+    if text_value == "a" and _is_numeric_input(input_elem):
+        text_value = "1"
     try:
-        input_elem.fill(text_value, timeout=1000)
+        input_elem.fill(text_value, timeout=500)
         return text_value
     except Exception:
         if text_value != "a":
             raise
 
-    input_elem.fill("4", timeout=1000)
-    return "4"
+    input_elem.fill("1", timeout=500)
+    return "1"
 
 
-def _rewrite_default_a_fields_to_four(scope) -> int:
-    """Replace fallback 'a' values with '4' for visible text-like inputs."""
+@dataclass
+class _TypeFallbackState:
+    tried: set[str] = field(default_factory=set)
+    value: str = ""
+
+
+def _invalid_type_inputs(scope) -> list:
+    """Find editable text/number fields with their own visible type-validation feedback."""
+    handle = scope.evaluate_handle(
+        """(root, messages) => {
+            const selector = 'input, textarea';
+            const shown = node => {
+                const style = getComputedStyle(node);
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                    (node.getClientRects().length > 0 || (style.display === 'contents' &&
+                        [...node.children].some(child => child.getClientRects().length > 0)));
+            };
+            return [...root.querySelectorAll(selector)].filter(input => {
+                if (!shown(input) || input.disabled || input.readOnly || input.getAttribute('role') === 'combobox') return false;
+                if (input.tagName !== 'TEXTAREA' && !['text', 'number', 'tel', 'search', 'email', 'url'].includes(input.type)) return false;
+                const texts = [];
+                const collect = node => {
+                    if (node && shown(node)) texts.push((typeof node.innerText === 'string'
+                        ? node.innerText : node.textContent || '').toLowerCase());
+                };
+                for (const attr of ['aria-describedby', 'aria-errormessage']) {
+                    for (const id of (input.getAttribute(attr) || '').split(/\\s+/).filter(Boolean)) {
+                        collect(input.ownerDocument.getElementById(id));
+                    }
+                }
+                // A shared form/fieldset error must not mark unrelated inputs invalid.
+                for (let parent = input.parentElement; parent && root.contains(parent); parent = parent.parentElement) {
+                    if (parent.querySelectorAll('input:not([type="hidden"]):not([type="file"]), select, textarea').length > 1) break;
+                    for (const error of parent.querySelectorAll(
+                        '[role="alert"], [data-testid="text-input-helper-text"], [data-testid="input-error"], ' +
+                        '.artdeco-inline-feedback--error, [aria-live="assertive"]')) collect(error);
+                    if (parent === root) break;
+                }
+                const validity = input.validity;
+                const nativeTypeError = validity && (validity.badInput || validity.typeMismatch || validity.patternMismatch ||
+                    validity.rangeUnderflow || validity.rangeOverflow || validity.stepMismatch);
+                return !!nativeTypeError || texts.some(text => messages.some(message => text.includes(message)));
+            });
+        }""", _INVALID_TYPE_VALIDATION_TEXTS,
+    )
+    try:
+        return [prop.as_element() for prop in handle.get_properties().values() if prop.as_element() is not None]
+    finally:
+        handle.dispose()
+
+
+def _type_fallback_key(scope, input_elem, label_text: str, step_signature: str) -> str:
+    """Keep per-field attempts across React ID changes, without mixing different questions."""
+    path = input_elem.evaluate(
+        """(input, root) => {
+            const component = input.closest('[componentkey^="easyApplyFieldFocus_"]');
+            if (component) return component.getAttribute('componentkey');
+            const path = [];
+            for (let node = input; node && node !== root; node = node.parentElement) {
+                const siblings = node.parentElement ? [...node.parentElement.children] : [node];
+                path.unshift(node.tagName + ':' + siblings.filter(other => other.tagName === node.tagName).indexOf(node));
+            }
+            return path.join('/');
+        }""", scope,
+    )
+    return json.dumps([step_signature, _normalize_lookup_text(label_text), path])
+
+
+def _type_fallback_candidates(input_elem, label_text: str, profile: dict, answers: dict) -> list[tuple[str, str]]:
+    """Try an applicable configured answer, then the requested numeric/text defaults."""
+    inferred = _infer_question_answer(label_text, profile, answers)
+    candidates = []
+    if inferred is not None:
+        candidates.append((str(inferred), "configured"))
+    candidates.extend((("1", "number"), ("a", "text")))
+    seen = set()
+    compatible = []
+    for value, source in candidates:
+        if value in seen:
+            continue
+        seen.add(value)
+        allowed = input_elem.evaluate(
+            """(input, value) => {
+                const copy = input.cloneNode();
+                copy.value = value;
+                // Native type/pattern/range constraints are checked before typing.
+                return copy.value === value && (!copy.validity || copy.validity.valid);
+            }""", value,
+        )
+        if allowed:
+            compatible.append((value, source))
+    return compatible
+
+
+def _rotate_invalid_type_fields(page, scope, states: dict[str, _TypeFallbackState], profile: dict, answers: dict) -> int:
+    """Change each rejected field once per pass; never repeat a failed value."""
+    changed = 0
+    processed = set()
+    step_signature = None
+    for _ in range(100):
+        scope = _get_active_modal(page) or scope
+        invalid = _invalid_type_inputs(scope)
+        if not invalid:
+            return changed
+        if step_signature is None:
+            step_signature = _form_step_signature(scope)
+        pending = None
+        for input_elem in invalid:
+            label_text = _extract_field_label(scope, input_elem)
+            key = _type_fallback_key(scope, input_elem, label_text, step_signature)
+            if key not in processed:
+                pending = (input_elem, label_text, key)
+                break
+        if pending is None:
+            return changed
+        input_elem, label_text, key = pending
+        processed.add(key)
+        state = states.setdefault(key, _TypeFallbackState())
+        state.tried.add(_element_current_text(input_elem).strip())
+        for value, source in _type_fallback_candidates(input_elem, label_text, profile, answers):
+            if value in state.tried:
+                continue
+            state.tried.add(value)
+            try:
+                input_elem.fill(value, timeout=500)
+                input_elem.evaluate("el => el.blur()")
+            except PlaywrightError:
+                log.info("Invalid-input fallback RETRY: question=%r; rejected %s format", label_text, source)
+                continue
+            state.value = value
+            changed += 1
+            log.info("Invalid-input fallback RETRY: question=%r; trying %s format; attempt=%d",
+                     label_text, source, len(state.tried) - 1)
+            break
+        else:
+            raise RuntimeError(f"Invalid-input fallback exhausted for {label_text!r}; no untried compatible value remains")
+    raise RuntimeError("Too many invalid fields appeared on one Easy Apply step")
+
+
+def _preserved_type_fallback(scope, input_elem, label_text: str, step_signature: str,
+                             states: dict[str, _TypeFallbackState]) -> str | None:
+    if not states:
+        return None
+    state = states.get(_type_fallback_key(scope, input_elem, label_text, step_signature))
+    if state is None:
+        return None
+    return _element_current_text(input_elem).strip() or state.value
+
+
+def _retry_invalid_type_validation(page, previous_signature: str, button_name: str,
+                                   states: dict[str, _TypeFallbackState], profile: dict, answers: dict) -> bool:
+    """Repair rejected types on the same step and retry its live Next/Submit control."""
+    scope = _get_active_modal(page)
+    if scope is None or _form_step_signature(scope) != previous_signature:
+        return False
+    if _delete_open_history_entries(page, scope):
+        scope = _get_active_modal(page) or scope
+    changed = _rotate_invalid_type_fields(page, scope, states, profile, answers)
+    if not changed:
+        return False
+    scope = _get_active_modal(page) or scope
+    if button_name == "Next":
+        button = _find_easy_apply_next_button(scope)
+    else:
+        button = _find_easy_apply_action_button(scope, _EASY_APPLY_SUBMIT_BUTTON_SELECTORS, _EASY_APPLY_SUBMIT_BUTTON_LABELS)
+    if button is None or not _click_action_button(button):
+        return False
+    page.wait_for_timeout(300)
+    return True
+
+
+def _rewrite_default_a_fields_to_four(scope, replacement: str = "4") -> int:
+    """Replace fallback 'a' values (legacy StepStone default: '4')."""
     rewritten = 0
     candidates = scope.query_selector_all("input, textarea")
     for input_elem in candidates:
@@ -3076,14 +3661,14 @@ def _rewrite_default_a_fields_to_four(scope) -> int:
             current_value = _element_current_text(input_elem).strip()
             if current_value != "a":
                 continue
-            input_elem.fill("4", timeout=1000)
+            input_elem.fill(replacement, timeout=500)
             rewritten += 1
         except Exception:
             continue
     return rewritten
 
 
-def _rewrite_range_validation_fields_to_four(scope) -> int:
+def _rewrite_range_validation_fields_to_four(scope, replacement: str = "4") -> int:
     """Replace values in visible inputs that are blocked by 0..99 validation feedback."""
     rewritten = 0
     candidates = scope.query_selector_all("input, textarea")
@@ -3139,17 +3724,17 @@ def _rewrite_range_validation_fields_to_four(scope) -> int:
                 continue
 
             current_value = _element_current_text(input_elem).strip()
-            if current_value == "4":
+            if current_value == replacement:
                 continue
 
-            input_elem.fill("4", timeout=1000)
+            input_elem.fill(replacement, timeout=500)
             rewritten += 1
         except Exception:
             continue
     return rewritten
 
 
-def _retry_numeric_validation_with_four(page, previous_scope_text: str, button, button_name: str) -> bool:
+def _retry_numeric_validation_with_one(page, previous_scope_text: str, button, button_name: str) -> bool:
     """Retry the current step when it appears blocked by a 0..99 numeric validation."""
     modal = _get_active_modal(page)
     scope = modal or page
@@ -3159,14 +3744,14 @@ def _retry_numeric_validation_with_four(page, previous_scope_text: str, button, 
     if "0" not in current_scope_text or "99" not in current_scope_text:
         return False
 
-    rewritten = _rewrite_range_validation_fields_to_four(scope)
+    rewritten = _rewrite_range_validation_fields_to_four(scope, replacement="1")
     if rewritten <= 0:
-        rewritten = _rewrite_default_a_fields_to_four(scope)
+        rewritten = _rewrite_default_a_fields_to_four(scope, replacement="1")
     if rewritten <= 0:
         return False
 
     log.info(
-        "Step unchanged after %s and 0/99 validation detected; rewrote %d field(s) to '4'",
+        "Step unchanged after %s and 0/99 validation detected; rewrote %d field(s) to '1'",
         button_name,
         rewritten,
     )
@@ -3274,7 +3859,8 @@ def _score_option(label_text: str, option_text: str, inferred_value: str | None,
     return score
 
 
-def _best_option_value(label_text: str, candidates: list[tuple[str, str]], inferred_value: str | None, profile: dict, answers: dict) -> str | None:
+def _best_option_value(label_text: str, candidates: list[tuple[str, str]], inferred_value: str | None,
+                       profile: dict, answers: dict, *, current_value: str | None = None) -> str | None:
     if not candidates:
         return None
 
@@ -3285,30 +3871,50 @@ def _best_option_value(label_text: str, candidates: list[tuple[str, str]], infer
         if score > best_score:
             best_text, best_value, best_score = text, value, score
     if best_score <= 0:
-        return _fallback_choice_value(candidates)
+        return _fallback_choice_value(candidates, current_value=current_value)
     return best_value
 
 
-def _fallback_choice_value(candidates: list[tuple[str, str]]) -> str | None:
-    """Pick a required choice when no semantic match is available."""
+def _fallback_choice_value(candidates: list[tuple[str, str]], *, current_value: str | None = None) -> str | None:
+    """Prefer Yes, then Ja; otherwise keep an answer or pick a random option."""
     if not candidates:
         return None
 
-    for text, value in candidates:
-        if _normalize_lookup_text(text) in _YES_OPTION_LABELS or _normalize_lookup_text(value) in _YES_OPTION_LABELS:
-            return value
+    for preferred in ("yes", "ja"):
+        for text, value in candidates:
+            if preferred in {_normalize_lookup_text(text), _normalize_lookup_text(value)}:
+                return value
 
-    return candidates[0][1]
+    if current_value is not None and any(value == current_value for _, value in candidates):
+        return current_value
+    return random_module.choice(candidates)[1]
 
 
 def _choice_option_text(input_elem, role: str) -> str:
-    """Read visible option text from LinkedIn's custom choice wrappers."""
+    """Read the option label, not an opaque input value or the whole question."""
     try:
         return (input_elem.evaluate(
             """(el, role) => {
                 const control = el.closest(`[role="${role}"]`);
-                if (!control) return '';
-                return (control.innerText || control.textContent || '').trim();
+                const labels = [...(el.labels || [])].map(label => label.innerText || label.textContent || '').join(' ').trim();
+                const labelled = (el.getAttribute('aria-labelledby') || '').split(/\\s+/)
+                    .map(id => el.ownerDocument.getElementById(id)?.textContent || '').join(' ').trim();
+                const wrapper = el.closest('label');
+                const explicit = labels || labelled || el.getAttribute('aria-label') ||
+                    (control && (control.innerText || control.textContent || '').trim()) ||
+                    (wrapper && (wrapper.innerText || wrapper.textContent || '').trim()) || '';
+                if (explicit) return explicit;
+                // SDUI can put the text in a sibling <p> while the associated
+                // <label> is an empty visual checkbox/radio proxy. Stop climbing
+                // before another choice is included, or we reach the question.
+                const boundary = el.closest('fieldset, [role="radiogroup"], [role="group"]');
+                const selector = `input[type="${role}"], [role="${role}"]:not(:has(input[type="${role}"]))`;
+                for (let row = el.parentElement; row && row !== boundary; row = row.parentElement) {
+                    if (row.matches('form, [role="dialog"], body') || row.querySelectorAll(selector).length > 1) break;
+                    const text = (row.innerText || row.textContent || '').trim();
+                    if (text) return text;
+                }
+                return '';
             }""",
             role,
         ) or "").strip()
@@ -3316,49 +3922,238 @@ def _choice_option_text(input_elem, role: str) -> str:
         return ""
 
 
-def _click_choice_input(scope, input_elem, role: str) -> bool:
-    """Click a radio/checkbox using LinkedIn's visible wrapper when possible."""
+def _choice_is_checked(input_elem) -> bool | None:
+    """Read live UI state; SDUI's ARIA wrapper overrides stale native state."""
     try:
-        clicked = input_elem.evaluate(
+        state = input_elem.evaluate(
+            """el => {
+                if (!el.isConnected) return 'detached';
+                const control = el.closest('[role="radio"], [role="checkbox"]');
+                return control ? (control.getAttribute('aria-checked') || '') : '';
+            }"""
+        )
+        if state in {"true", "false"}:
+            return state == "true"
+        if state == "detached":
+            return None
+        return input_elem.is_checked()
+    except Exception:
+        return None
+
+
+def _click_choice_input(scope, input_elem, role: str, *, checked: bool = True) -> bool:
+    """Click a choice and verify it, with no default 30-second locator waits."""
+    input_id = input_elem.get_attribute("id") or ""
+    if input_id:
+        input_elem = scope.query_selector(f'[id={json.dumps(input_id)}]') or input_elem
+
+    def current_state():
+        # A controlled form can replace the input during its click handler.
+        current = scope.query_selector(f'[id={json.dumps(input_id)}]') if input_id else None
+        return _choice_is_checked(current or input_elem)
+
+    if current_state() is checked:
+        return True
+
+    try:
+        input_elem.evaluate(
             """(el, role) => {
+                if (!el.isConnected || el.disabled) return false;
                 const control = el.closest(`[role="${role}"]`);
-                const target = control || el;
-                target.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' });
+                const target = control || el.labels?.[0] || el.closest('label') || el;
+                if (target.getAttribute('aria-disabled') === 'true') return false;
                 target.click();
                 return true;
             }""",
             role,
         )
-        if clicked:
+        if current_state() is checked:
             return True
     except Exception:
         pass
 
-    input_id = input_elem.get_attribute("id") or ""
-    if input_id:
+    # Some components require a real pointer click, rather than HTMLElement.click.
+    # Resolve from the existing handle immediately; never wait on a missing locator.
+    try:
+        target_handle = input_elem.evaluate_handle(
+            """(el, role) => el.closest(`[role="${role}"]`) || el.labels?.[0] || el.closest('label') || el""",
+            role,
+        )
         try:
-            label = scope.query_selector(f"label[for='{input_id}']")
-            if label and label.is_visible():
-                label.click(timeout=1000)
-                return True
-        except Exception:
-            pass
+            target = target_handle.as_element()
+            if target and target.is_visible():
+                target.click(timeout=500)
+        finally:
+            target_handle.dispose()
+        if current_state() is checked:
+            return True
+    except Exception:
+        pass
 
     try:
-        input_elem.check(timeout=1000, force=True)
-        return True
+        input_elem.set_checked(checked, timeout=500, force=True)
+        return current_state() is checked
     except Exception:
         return False
+
+
+def _choice_question_options(input_elem, role: str) -> tuple[str, list]:
+    """Find this question's peers, including unnamed native and ARIA choices.
+
+    All lookups are immediate and anchored on a real element. No DOM tokens,
+    classifier, polling, or long locator timeouts are used.
+    """
+    handle = None
+    try:
+        handle = input_elem.evaluate_handle(
+            """(el, role) => {
+                const selector = `input[type="${role}"], [role="${role}"]:not(:has(input[type="${role}"]))`;
+                const controls = root => [...root.querySelectorAll(selector)];
+                const group = el.closest(role === 'radio' ? '[role="radiogroup"], fieldset' : '[role="group"], fieldset');
+                const name = el.getAttribute('name');
+                let options;
+                if (role === 'checkbox' && el.required) {
+                    // Native required checkboxes (e.g. independent consents)
+                    // must each be checked, even inside a broader fieldset.
+                    options = [el];
+                } else if (group) {
+                    options = controls(group);
+                    // A broad fieldset can contain several named questions.
+                    if (role === 'radio' && name && !group.matches('[role="radiogroup"]') && !group.querySelector('legend') &&
+                        options.some(option => option.name && option.name !== name)) {
+                        options = options.filter(option => option.name === name);
+                    }
+                } else if (name) {
+                    options = controls(el.ownerDocument).filter(option => option.getAttribute('name') === name && option.form === el.form);
+                } else if (role === 'radio') {
+                    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+                        if (parent.matches('form, [role="dialog"], body') || parent.querySelector('fieldset, [role="radiogroup"]')) break;
+                        const peers = controls(parent);
+                        if (peers.length > 1) { options = peers; break; }
+                    }
+                }
+                options = (options || [el]).filter(option => {
+                    const target = option.closest(`[role="${role}"]`) || option.labels?.[0] || option;
+                    const shown = node => {
+                        const style = getComputedStyle(node);
+                        const box = node.getClientRects().length > 0 || (style.display === 'contents' &&
+                            [...node.querySelectorAll('*')].some(child => child.getClientRects().length > 0));
+                        return box && style.visibility !== 'hidden' && style.display !== 'none';
+                    };
+                    return !option.disabled && target.getAttribute('aria-disabled') !== 'true' &&
+                        (shown(target) || shown(option));
+                });
+                // A structural key isolates identically labelled Yes/No groups
+                // without changing the page or relying on optional name/id attrs.
+                const path = [];
+                for (let node = options[0]; node?.parentElement; node = node.parentElement) {
+                    path.unshift([...node.parentElement.children].indexOf(node));
+                }
+                return {key: path.join('/'), options};
+            }""",
+            role,
+        )
+        key_handle = handle.get_property("key")
+        options_handle = handle.get_property("options")
+        try:
+            key = key_handle.json_value()
+            radios = [prop.as_element() for prop in options_handle.get_properties().values()]
+            return f"{role}:{key}", [radio for radio in radios if radio is not None]
+        finally:
+            key_handle.dispose()
+            options_handle.dispose()
+    except Exception:
+        return "", []
+    finally:
+        if handle is not None:
+            handle.dispose()
+
+
+def _radio_question_options(input_elem) -> tuple[str, list]:
+    return _choice_question_options(input_elem, "radio")
+
+
+def _checkbox_question_options(input_elem) -> tuple[str, list]:
+    return _choice_question_options(input_elem, "checkbox")
+
+
+def _answer_checkbox_question(scope, checkboxes: list, label_text: str, profile: dict, answers: dict) -> bool:
+    """Answer a checkbox question once, not each unnamed option independently."""
+    if not checkboxes:
+        return False
+    candidates = [
+        (_choice_option_text(checkbox, "checkbox") or checkbox.get_attribute("value") or "", str(index))
+        for index, checkbox in enumerate(checkboxes)
+    ]
+    inferred = _infer_question_answer(label_text, profile, answers)
+    if len(checkboxes) == 1:
+        checkbox = checkboxes[0]
+        option_norm = _normalize_lookup_text(candidates[0][0])
+        if (checkbox.get_attribute("id") == "follow-company-checkbox" or
+                checkbox.get_attribute("name") == "follow-company" or
+                any(option_norm.startswith(token + " ") for token in _FOLLOW_COMPANY_LABEL_TOKENS)):
+            return False
+        desired = _normalize_lookup_text(str(inferred or ""))
+        if desired in _NO_OPTION_LABELS:
+            return _click_choice_input(scope, checkbox, "checkbox", checked=False)
+        if _choice_is_checked(checkbox):
+            return True
+        if desired not in _YES_OPTION_LABELS and not _field_requires_answer(checkbox, label_text):
+            return False
+        selected = "0"
+    else:
+        current = next((str(index) for index, checkbox in enumerate(checkboxes) if _choice_is_checked(checkbox)), None)
+        selected = _best_option_value(label_text, candidates, inferred, profile, answers, current_value=current)
+        if selected is None:
+            return False
+        # Yes/No questions sometimes use checkboxes too. Avoid contradictory
+        # selections, while preserving true multi-select answers in other groups.
+        if all(_normalize_lookup_text(text) in _YES_OPTION_LABELS | _NO_OPTION_LABELS for text, _ in candidates):
+            for index, checkbox in enumerate(checkboxes):
+                if str(index) != selected and _choice_is_checked(checkbox):
+                    if not _click_choice_input(scope, checkbox, "checkbox", checked=False):
+                        return False
+    success = _click_choice_input(scope, checkboxes[int(selected)], "checkbox")
+    log.info("Checkbox answer %s: question=%r; option=%r", "SUCCESS" if success else "FAILED",
+             label_text, candidates[int(selected)][0])
+    return success
+
+
+def _answer_radio_question(scope, radios: list, label_text: str, profile: dict, answers: dict) -> bool:
+    """Use a configured answer, Yes/Ja, or one stable random choice."""
+    candidates = [
+        (_choice_option_text(radio, "radio") or radio.get_attribute("value") or "", str(index))
+        for index, radio in enumerate(radios)
+    ]
+    if not candidates:
+        return False
+
+    if any(_normalize_lookup_text(text) == "pdf" or re.search(r"\.(?:pdf|docx?)\b", text, re.I)
+           for text, _ in candidates):
+        # Upload cards are document choices, not screening questions. The fresh
+        # résumé upload logic owns them; never switch to an older stored PDF.
+        return False
+
+    inferred = _infer_question_answer(label_text, profile, answers)
+    current = next((str(index) for index, radio in enumerate(radios) if _choice_is_checked(radio)), None)
+    selected = _best_option_value(label_text, candidates, inferred, profile, answers, current_value=current)
+    if selected is None:
+        return False
+    index = int(selected)
+    success = _click_choice_input(scope, radios[index], "radio")
+    log.info("Radio answer %s: question=%r; option=%r", "SUCCESS" if success else "FAILED",
+             label_text, candidates[index][0])
+    return success
 
 
 def _field_requires_answer(input_elem, label_text: str) -> bool:
     """Return True when a field looks required or is currently failing validation."""
     label_norm = _normalize_lookup_text(label_text)
-    if any(token in label_norm for token in _CONSENT_LABEL_TOKENS):
+    if label_text.rstrip().endswith("*") or any(token in label_norm for token in _CONSENT_LABEL_TOKENS):
         return True
 
     try:
-        if input_elem.get_attribute("required") is not None:
+        if input_elem.get_attribute("required") is not None or input_elem.get_attribute("aria-required") == "true":
             return True
     except Exception:
         pass
@@ -3554,24 +4349,197 @@ def _select_best_checkbox_option(scope, group_name: str, label_text: str, inferr
     return _select_checkbox_option(scope, group_name, best_value)
 
 
-def _repair_required_fields(scope, profile: dict, answers: dict) -> int:
+def _current_form_input(scope, input_elem, position: int):
+    """Refresh a field replaced by a controlled form, without locator polling."""
+    if input_elem.evaluate("el => el.isConnected"):
+        return input_elem
+    input_id = input_elem.get_attribute("id") or ""
+    if input_id:
+        current = scope.query_selector(f'[id={json.dumps(input_id)}]')
+        if current:
+            return current
+    current_inputs = scope.query_selector_all(_FORM_INPUT_SELECTOR)
+    return current_inputs[position] if position < len(current_inputs) else None
+
+
+def _open_history_editors(scope) -> list:
+    """Find only expanded education/experience editors inside this application scope."""
+    handle = scope.evaluate_handle(
+        """(root, labels) => {
+            const normalized = text => (text || '').normalize('NFKC').toLowerCase()
+                .replace(/[_-]/g, ' ').replace(/[^\\p{L}\\p{N}\\s+]/gu, ' ').trim().replace(/\\s+/g, ' ');
+            const shown = el => el.isConnected && el.getClientRects().length > 0 &&
+                getComputedStyle(el).visibility !== 'hidden';
+            const buttonLabels = button => [button.getAttribute('aria-label'), button.innerText,
+                button.textContent, button.value].filter(Boolean).map(normalized);
+            const headingSelector = 'h1, h2, h3, p, legend, [role="heading"]';
+            const headings = [...root.querySelectorAll(headingSelector)].filter(el =>
+                shown(el) && !el.closest('button, [role="button"]') &&
+                Object.values(labels.edit).some(values => values.includes(normalized(el.textContent))));
+            const editors = [];
+            const seen = new Set();
+            for (const heading of headings) {
+                const kind = Object.keys(labels.edit).find(key =>
+                    labels.edit[key].includes(normalized(heading.textContent)));
+                for (let parent = heading.parentElement; parent && root.contains(parent); parent = parent.parentElement) {
+                    // Never cross into a sibling entry or the whole application
+                    // looking for an unrelated Delete button.
+                    if (headings.filter(node => parent.contains(node)).length > 1) break;
+                    const fields = [...parent.querySelectorAll(
+                        'input:not([type="hidden"]):not([type="file"]):not([type="button"]):not([type="submit"]), ' +
+                        'select, textarea, [role="combobox"]')].filter(shown);
+                    const buttons = [...parent.querySelectorAll('button, [role="button"], input[type="button"]')]
+                        .filter(shown);
+                    const hasSave = buttons.some(button => buttonLabels(button).some(text =>
+                        ['save', 'speichern'].includes(text)));
+                    if (fields.length && hasSave) {
+                        const deletes = buttons.filter(button => buttonLabels(button).some(text =>
+                            labels.delete[kind].includes(text) || ['delete', 'remove', 'löschen', 'loschen'].includes(text)));
+                        if (!seen.has(parent)) editors.push({kind, editor: parent,
+                            button: deletes.length === 1 ? deletes[0] : null});
+                        seen.add(parent);
+                        break;
+                    }
+                    if (parent === root) break;
+                }
+            }
+            return editors;
+        }""",
+        {"edit": _HISTORY_EDITOR_LABELS, "delete": _HISTORY_DELETE_LABELS},
+    )
+    editors = []
+    try:
+        for item in handle.get_properties().values():
+            try:
+                kind = item.get_property("kind")
+                try:
+                    entry_kind = kind.json_value()
+                finally:
+                    kind.dispose()
+                editor = item.get_property("editor").as_element()
+                button_handle = item.get_property("button")
+                button = button_handle.as_element()
+                if button is None:
+                    button_handle.dispose()
+                editors.append((entry_kind, editor, button))
+            finally:
+                item.dispose()
+        return editors
+    finally:
+        handle.dispose()
+
+
+def _history_delete_confirmation(page, application_scope, kind: str, existing_dialogs=()):
+    """Confirm only an entry-deletion dialog opened by our scoped Delete click."""
+    for dialog in page.query_selector_all('[role="alertdialog"], [role="dialog"], dialog[open]'):
+        if not dialog.is_visible() or dialog.evaluate(
+            "(el, application) => el === application || el.contains(application)", application_scope,
+        ):
+            continue
+        if any(dialog.evaluate("(el, previous) => el === previous", previous) for previous in existing_dialogs):
+            continue
+        text = _normalize_lookup_text(_scope_text(dialog))
+        if not any(token in text for token in (kind, "entry", "eintrag", "berufserfahrung", "ausbildung")):
+            continue
+        if not any(token in text for token in ("delete", "remove", "löschen", "loschen")):
+            continue
+        # This feature removes application entries, never LinkedIn profile data.
+        if any(token in text for token in ("from your profile", "on your profile", "aus ihrem profil")):
+            continue
+        labels = {*_HISTORY_DELETE_LABELS[kind], "delete", "remove", "löschen", "loschen"}
+        for button in dialog.query_selector_all('button, [role="button"]'):
+            if not button.is_visible() or not button.is_enabled():
+                continue
+            button_text = _normalize_lookup_text(button.inner_text())
+            aria = _normalize_lookup_text(button.get_attribute("aria-label") or "")
+            if button_text in labels or aria in labels:
+                return button
+    return None
+
+
+def _delete_open_history_entries(page, scope) -> int:
+    """Remove expanded application history entries before any generic field filling."""
+    if scope is page:
+        # A missing Easy Apply modal is never permission to delete page/profile entries.
+        return 0
+    deleted = 0
+    for _ in range(20):
+        if not scope.evaluate("el => el.isConnected"):
+            scope = _get_active_modal(page) if page is not None else None
+            if scope is None:
+                raise RuntimeError("Easy Apply form disappeared while deleting an open history entry")
+        editors = _open_history_editors(scope)
+        if not editors:
+            return deleted
+        if page is None:
+            page = scope.owner_frame().page
+        kind, _, button = editors[0]
+        if button is None or not button.is_enabled():
+            raise RuntimeError(f"Open {kind} entry has no unique enabled Delete control; refusing to fill it")
+        before = sum(entry_kind == kind for entry_kind, _, _ in editors)
+        log.info("Easy Apply history entry START: deleting open %s instead of filling it", kind)
+        existing_dialogs = [dialog for dialog in page.query_selector_all(
+            '[role="alertdialog"], [role="dialog"], dialog[open]',
+        ) if dialog.is_visible()]
+        button.click(timeout=1500)
+        confirmed = False
+        for _ in range(20):
+            if not scope.evaluate("el => el.isConnected"):
+                scope = _get_active_modal(page)
+                if scope is None:
+                    raise RuntimeError("Easy Apply form disappeared before entry deletion could be verified")
+            remaining = _open_history_editors(scope)
+            if sum(entry_kind == kind for entry_kind, _, _ in remaining) < before:
+                deleted += 1
+                log.info("Easy Apply history entry SUCCESS: deleted open %s", kind)
+                break
+            if not confirmed:
+                confirmation = _history_delete_confirmation(page, scope, kind, existing_dialogs)
+                if confirmation is not None:
+                    confirmation.click(timeout=1500)
+                    confirmed = True
+                    continue
+            page.wait_for_timeout(100)
+        else:
+            raise RuntimeError(f"Delete {kind} did not close/remove the open entry; refusing to fill it")
+    raise RuntimeError("Too many open Easy Apply education/experience entries; refusing to fill them")
+
+
+def _repair_required_fields(scope, profile: dict, answers: dict, *, page=None,
+                            type_fallbacks: dict[str, _TypeFallbackState] | None = None) -> int:
     """Fill required fields left invalid after LinkedIn shows validation errors."""
-    repaired = 0
+    repaired = _delete_open_history_entries(page, scope)
+    if repaired:
+        active_page = page or scope.owner_frame().page
+        scope = _get_active_modal(active_page) or scope
+    step_signature = _form_step_signature(scope) if type_fallbacks else ""
     processed_choice_groups = set()
 
     try:
-        inputs = scope.query_selector_all("input, select, textarea")
+        inputs = scope.query_selector_all(_FORM_INPUT_SELECTOR)
     except Exception:
         return 0
 
-    for input_elem in inputs:
+    for position, input_elem in enumerate(inputs):
         try:
+            input_elem = _current_form_input(scope, input_elem, position)
+            if input_elem is None:
+                continue
             field_type = (input_elem.get_attribute("type") or "").lower()
-            field_name = input_elem.get_attribute("name") or ""
-            group_name = field_name or input_elem.get_attribute("id") or ""
+            field_role = (input_elem.get_attribute("role") or "").lower()
+            custom_choice = field_role in {"combobox", "listbox"} or input_elem.get_attribute("aria-haspopup") == "listbox"
+            if field_role in {"radio", "checkbox"}:
+                field_type = field_role
+            if field_type in {"file", "hidden", "button", "submit", "reset", "image"} and not custom_choice:
+                continue
             label_text = _extract_field_label(scope, input_elem)
-            choice_group_key = field_name or f"{field_type}:{_normalize_lookup_text(label_text)}" or group_name
             if not _field_requires_answer(input_elem, label_text):
+                continue
+
+            if custom_choice and _is_custom_choice_control(input_elem, label_text):
+                active_page = page or input_elem.owner_frame().page
+                if _answer_custom_choice(active_page, scope, input_elem, label_text, profile, answers):
+                    repaired += 1
                 continue
 
             try:
@@ -3579,42 +4547,14 @@ def _repair_required_fields(scope, profile: dict, answers: dict) -> int:
             except Exception:
                 tag_name = "unknown"
 
-            value = _infer_question_answer(label_text, profile, answers)
-
-            if field_type == "radio":
-                if choice_group_key in processed_choice_groups or _radio_group_has_checked_option(scope, group_name):
-                    processed_choice_groups.add(choice_group_key)
-                    continue
-                selected = False
-                if value:
-                    selected = _select_radio_group(scope, group_name, str(value))
-                if not selected:
-                    selected = _select_best_radio_option(scope, group_name, label_text, value, profile, answers)
-                if selected:
-                    repaired += 1
-                    processed_choice_groups.add(choice_group_key)
-                continue
-
-            if field_type == "checkbox":
+            if field_type in {"radio", "checkbox"}:
+                choice_group_key, choices = _choice_question_options(input_elem, field_type)
                 if choice_group_key in processed_choice_groups:
                     continue
-                try:
-                    if input_elem.is_checked():
-                        processed_choice_groups.add(choice_group_key)
-                        continue
-                except Exception:
-                    pass
-
-                selected = False
-                if not field_name:
-                    selected = _click_choice_input(scope, input_elem, "checkbox")
-                elif value and str(value).lower() in ["yes", "true", "selected"]:
-                    selected = _click_choice_input(scope, input_elem, "checkbox")
-                if not selected:
-                    selected = _select_best_checkbox_option(scope, group_name, label_text, value, profile, answers)
-                if selected:
+                processed_choice_groups.add(choice_group_key)
+                answer_choice = _answer_radio_question if field_type == "radio" else _answer_checkbox_question
+                if answer_choice(scope, choices, label_text, profile, answers):
                     repaired += 1
-                    processed_choice_groups.add(choice_group_key)
                 continue
 
             if tag_name == "select":
@@ -3627,9 +4567,17 @@ def _repair_required_fields(scope, profile: dict, answers: dict) -> int:
                 continue
 
             current_text = _element_current_text(input_elem).strip()
+            preserved = _preserved_type_fallback(scope, input_elem, label_text, step_signature, type_fallbacks or {})
+            if preserved is not None:
+                if current_text != preserved:
+                    _fill_text_input(input_elem, preserved)
+                    repaired += 1
+                continue
             if current_text and current_text.lower() != "a":
                 continue
-            text_value = str(value) if value else _fallback_text_answer(label_text, profile, answers)
+            if not input_elem.is_visible() or input_elem.is_disabled():
+                continue
+            text_value = _text_field_answer(input_elem, label_text, profile, answers)
             _fill_text_input(input_elem, text_value)
             repaired += 1
         except Exception as exc:
@@ -3639,7 +4587,8 @@ def _repair_required_fields(scope, profile: dict, answers: dict) -> int:
     return repaired
 
 
-def _retry_required_validation(page, previous_scope_text: str, button, button_name: str, profile: dict, answers: dict) -> bool:
+def _retry_required_validation(page, previous_scope_text: str, button, button_name: str, profile: dict, answers: dict,
+                               *, type_fallbacks: dict[str, _TypeFallbackState] | None = None) -> bool:
     """Retry after a click leaves the Easy Apply step blocked by required validation."""
     modal = _get_active_modal(page)
     scope = modal or page
@@ -3649,7 +4598,7 @@ def _retry_required_validation(page, previous_scope_text: str, button, button_na
     if not _has_required_validation(scope):
         return False
 
-    repaired = _repair_required_fields(scope, profile, answers)
+    repaired = _repair_required_fields(scope, profile, answers, page=page, type_fallbacks=type_fallbacks)
     if repaired <= 0:
         return False
 
@@ -3659,6 +4608,14 @@ def _retry_required_validation(page, previous_scope_text: str, button, button_na
         repaired,
     )
     page.wait_for_timeout(300)
+    # Removing an entry can rerender the entire application, including Next/Submit.
+    current_scope = _get_active_modal(page) or scope
+    if button_name == "Next":
+        button = _find_easy_apply_next_button(current_scope) or button
+    elif button_name == "Submit":
+        button = _find_easy_apply_action_button(
+            current_scope, _EASY_APPLY_SUBMIT_BUTTON_SELECTORS, _EASY_APPLY_SUBMIT_BUTTON_LABELS,
+        ) or button
     if not _click_action_button(button):
         return False
     page.wait_for_timeout(2000)
@@ -3687,7 +4644,9 @@ def _fallback_select_value(input_elem, label_text: str, profile: dict, answers: 
     """Choose a deterministic fallback option when inference fails."""
     candidates = _collect_select_candidates(input_elem)
     inferred_value = _infer_question_answer(label_text, profile, answers)
-    return _best_option_value(label_text, candidates, inferred_value, profile, answers)
+    current_text = _normalize_lookup_text(_element_current_text(input_elem))
+    current = next((value for text, value in candidates if _normalize_lookup_text(text) == current_text), None)
+    return _best_option_value(label_text, candidates, inferred_value, profile, answers, current_value=current)
 
 
 def _try_fill_select(input_elem, value: str, label_text: str) -> bool:
@@ -3904,6 +4863,16 @@ def _confirm_typeahead_input(page, input_elem, value: str) -> bool:
         return False
 
 
+def _application_submission_confirmed(page) -> bool:
+    text = " ".join(page.inner_text("body").casefold().split())
+    return any(phrase in text for phrase in (
+        "application sent", "application submitted", "application successfully submitted",
+        "application has been sent", "application has been submitted", "application was submitted",
+        "thank you for applying", "thank you for your application", "thanks for applying",
+        "bewerbung wurde gesendet", "bewerbung wurde eingereicht", "vielen dank für ihre bewerbung",
+    ))
+
+
 def _fill_and_submit_form(
     page,
     profile: dict,
@@ -3926,6 +4895,8 @@ def _fill_and_submit_form(
         blocked_progress_signature = ""
         blocked_progress_attempts = 0
         resume_uploaded = False
+        completed_uploads: set[str] = set()
+        type_fallbacks: dict[str, _TypeFallbackState] = {}
 
         while step < max_steps:
             step += 1
@@ -3941,7 +4912,7 @@ def _fill_and_submit_form(
 
             if not modal:
                 content = page.content().lower()
-                if any(x in content for x in ["application sent", "thank you", "successfully"]):
+                if _application_submission_confirmed(page):
                     return "APPLIED"
                 if "easy apply limit" in content and "tomorrow" in content:
                     log.warning("LinkedIn says today's Easy Apply limit has been reached")
@@ -3953,12 +4924,18 @@ def _fill_and_submit_form(
                 log.info("Dismissed LinkedIn safety reminder and continued applying")
                 continue
 
+            if _delete_open_history_entries(page, scope):
+                scope = _get_active_modal(page) or scope
+
             if _has_upload_format_error(scope):
                 log.info("Upload format validation is visible; skipping this job")
                 return "SKIPPED"
 
+            if _rotate_invalid_type_fields(page, scope, type_fallbacks, profile, answers):
+                scope = _get_active_modal(page) or scope
+
             # Find all input fields on this step
-            inputs = scope.query_selector_all("input, select, textarea")
+            inputs = scope.query_selector_all(_FORM_INPUT_SELECTOR)
             log.info(f"Found {len(inputs)} form fields on step {step}")
             step_signature = _form_step_signature(scope, inputs)
             if step_signature:
@@ -3983,48 +4960,15 @@ def _fill_and_submit_form(
             if field_types:
                 log.debug(f"Field types: {field_types}")
 
-            # Photo and resume upload can be the only required action on a step.
-            photo_input = _find_photo_upload_input(scope, photo_path)
-            if photo_input:
-                if photo_path:
-                    log.info(f"Uploading photo: {photo_path}")
-                    try:
-                        photo_input.set_input_files(photo_path)
-                        page.wait_for_timeout(2000)
-                    except Exception as e:
-                        log.warning(f"Could not upload photo: {e}")
-                elif _is_required_upload_input(scope, photo_input):
-                    log.info("Required photo upload field found, but no photo_path is configured; skipping this job")
-                    return "SKIPPED"
-
-            resume_input = _find_resume_upload_input(scope, resume_path) if resume_path else None
-            if resume_input and resume_path and (not require_fresh_resume or not resume_uploaded):
-                log.info(f"Uploading resume: {resume_path}")
-                try:
-                    resume_input.set_input_files(resume_path)
-                    page.wait_for_timeout(2000)
-                    if _has_upload_format_error(scope):
-                        log.info("Resume upload triggered format validation; skipping this job")
-                        return "SKIPPED"
-                    resume_uploaded = True
-                except Exception as e:
-                    log.warning(f"Could not upload resume: {e}")
-                    if require_fresh_resume:
-                        return "FAILED"
-            elif require_fresh_resume and not resume_uploaded:
-                upload_button = scope.query_selector("button[aria-label*='Upload resume'], button:has-text('Upload resume')")
-                if upload_button:
-                    try:
-                        with page.expect_file_chooser(timeout=5000) as chooser:
-                            upload_button.click()
-                        chooser.value.set_files(resume_path)
-                        page.wait_for_timeout(2000)
-                        if _has_upload_format_error(scope):
-                            return "FAILED"
-                        resume_uploaded = True
-                    except Exception:
-                        log.error("Could not upload the generated résumé; refusing a saved résumé fallback")
-                        return "FAILED"
+            # Every document request gets this job's CV, regardless of its label
+            # (résumé, transcript, cover letter, certificate, or an unseen upload).
+            uploads_ok, uploaded_resume_now = _upload_application_attachments(
+                page, scope, resume_path, photo_path, completed_uploads,
+            )
+            if not uploads_ok:
+                return "FAILED"
+            resume_uploaded = resume_uploaded or uploaded_resume_now
+            scope = _get_active_modal(page) or scope
 
             if _uncheck_follow_company_checkbox(scope):
                 if _is_review_submit_step(scope):
@@ -4035,23 +4979,33 @@ def _fill_and_submit_form(
             processed_choice_groups = set()
 
             # Fill fields
-            for input_elem in inputs:
+            for position, input_elem in enumerate(inputs):
                 try:
+                    if not scope.evaluate("el => el.isConnected"):
+                        scope = _get_active_modal(page) or scope
+                    input_elem = _current_form_input(scope, input_elem, position)
+                    if input_elem is None:
+                        continue
                     field_name = input_elem.get_attribute("name") or ""
                     field_type = (input_elem.get_attribute("type") or "").lower()
+                    field_role = (input_elem.get_attribute("role") or "").lower()
+                    custom_choice = field_role in {"combobox", "listbox"} or input_elem.get_attribute("aria-haspopup") == "listbox"
+                    if field_role in {"radio", "checkbox"}:
+                        field_type = field_role
+                    if field_type in {"file", "hidden", "button", "submit", "reset", "image"} and not custom_choice:
+                        continue
                     label_text = _extract_field_label(scope, input_elem)
-                    group_name = ""
+                    if custom_choice and _is_custom_choice_control(input_elem, label_text):
+                        _answer_custom_choice(page, scope, input_elem, label_text, profile, answers)
+                        continue
                     choice_group_key = ""
                     if field_type in {"radio", "checkbox"}:
-                        group_name = field_name or input_elem.get_attribute("id") or ""
-                        choice_group_key = field_name or f"{field_type}:{_normalize_lookup_text(label_text)}" or group_name
+                        choice_group_key, choices = _choice_question_options(input_elem, field_type)
                         if choice_group_key in processed_choice_groups:
                             continue
 
                     label_lower = label_text.lower()
                     log.debug(f"Field: {label_text[:40]}, type={field_type}, name={field_name}")
-
-                    value = _infer_question_answer(label_text, profile, answers)
 
                     # Fill field
                     # Get element tag name to handle select elements
@@ -4060,37 +5014,11 @@ def _fill_and_submit_form(
                     except:
                         tag_name = "unknown"
 
-                    if field_type == "radio":
-                        if _radio_group_has_checked_option(scope, group_name):
-                            processed_choice_groups.add(choice_group_key)
-                            log.info(f"Leaving preselected radio answer unchanged for '{label_text}'")
-                            continue
-                        selected = False
-                        if value:
-                            selected = _select_radio_group(scope, group_name, str(value))
-                        if not selected:
-                            selected = _select_best_radio_option(scope, group_name, label_text, value, profile, answers)
-                        if selected:
-                            processed_choice_groups.add(choice_group_key)
-                            log.info(f"Selected radio answer for '{label_text}'")
+                    if field_type in {"radio", "checkbox"}:
+                        processed_choice_groups.add(choice_group_key)
+                        answer_choice = _answer_radio_question if field_type == "radio" else _answer_checkbox_question
+                        answer_choice(scope, choices, label_text, profile, answers)
                         continue
-                    if field_type == "checkbox":
-                        selected = False
-                        try:
-                            if input_elem.is_checked():
-                                processed_choice_groups.add(choice_group_key)
-                                continue
-                        except Exception:
-                            pass
-                        if value and str(value).lower() in ["yes", "true", "selected"]:
-                            selected = _click_choice_input(scope, input_elem, "checkbox")
-                        if not selected and not field_name and _field_requires_answer(input_elem, label_text):
-                            selected = _click_choice_input(scope, input_elem, "checkbox")
-                        if not selected:
-                            selected = _select_best_checkbox_option(scope, group_name, label_text, value, profile, answers)
-                        if selected:
-                            processed_choice_groups.add(choice_group_key)
-                            log.info(f"Selected checkbox answer for '{label_text}'")
                     elif tag_name == "select":
                         current_text = _element_current_text(input_elem).lower()
                         if "email" in label_lower and current_text:
@@ -4110,12 +5038,17 @@ def _fill_and_submit_form(
                             continue
                         log.info(f"Successfully selected '{label_text}' = '{value}'")
                     else:
+                        if not input_elem.is_visible() or input_elem.is_disabled():
+                            continue
                         current_text = _element_current_text(input_elem)
                         if "email" in label_lower and current_text:
                             log.info(f"Leaving prefilled email field unchanged: '{current_text}'")
                             continue
 
-                        text_value = str(value) if value else _fallback_text_answer(label_text, profile, answers)
+                        preserved = _preserved_type_fallback(scope, input_elem, label_text, step_signature, type_fallbacks)
+                        if preserved is not None and current_text.strip() == preserved:
+                            continue
+                        text_value = preserved if preserved is not None else _text_field_answer(input_elem, label_text, profile, answers)
                         used_typeahead = False
                         if any(x in label_lower for x in ["location", "city"]) or (
                             (input_elem.get_attribute("role") or "").lower() == "combobox"
@@ -4156,15 +5089,17 @@ def _fill_and_submit_form(
                     log.warning(f"Could not click Next button on step {step}")
                     return "FAILED"
                 page.wait_for_timeout(2000)
-                if not _retry_required_validation(
+                retried_invalid_type = _retry_invalid_type_validation(page, step_signature, "Next", type_fallbacks, profile, answers)
+                if not retried_invalid_type and not _retry_required_validation(
                     page,
                     scope_text_before_action,
                     next_btn,
                     "Next",
                     profile,
                     answers,
+                    type_fallbacks=type_fallbacks,
                 ):
-                    _retry_numeric_validation_with_four(
+                    _retry_numeric_validation_with_one(
                         page,
                         scope_text_before_action,
                         next_btn,
@@ -4216,15 +5151,17 @@ def _fill_and_submit_form(
                     log.warning(f"Could not click Submit button on step {step}")
                     return "FAILED"
                 page.wait_for_timeout(2000)
-                if not _retry_required_validation(
+                retried_invalid_type = _retry_invalid_type_validation(page, step_signature, "Submit", type_fallbacks, profile, answers)
+                if not retried_invalid_type and not _retry_required_validation(
                     page,
                     scope_text_before_action,
                     submit_btn,
                     "Submit",
                     profile,
                     answers,
+                    type_fallbacks=type_fallbacks,
                 ):
-                    _retry_numeric_validation_with_four(
+                    _retry_numeric_validation_with_one(
                         page,
                         scope_text_before_action,
                         submit_btn,
@@ -4234,7 +5171,7 @@ def _fill_and_submit_form(
                 # Check for success message
                 page.wait_for_timeout(1000)
                 content = page.content().lower()
-                if any(x in content for x in ["application sent", "thank you", "confirmed", "successfully"]):
+                if _application_submission_confirmed(page):
                     log.info("Application submitted successfully!")
                     return "APPLIED"
 
@@ -4261,7 +5198,10 @@ def _fill_and_submit_form(
                             _close_easy_apply_modal(page)
                             return "SKIPPED"
 
-                return "APPLIED"  # Assume success
+                if current_modal:
+                    continue
+                log.warning("No application confirmation was found after Submit")
+                return "FAILED"
 
             # If the modal is still open but we cannot advance, treat it as a failure.
             if not inputs:

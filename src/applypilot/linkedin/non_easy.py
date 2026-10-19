@@ -21,10 +21,12 @@ from applypilot.apply.chrome import (
     launch_chrome,
     reset_worker_dir,
 )
+from applypilot.linkedin.filters import configured_title_exclusion, title_is_ignored
 from applypilot.linkedin.intelligent_apply import PreparationError, intelligent_enabled, intelligent_session
 from applypilot.linkedin.unified_apply import (
     _configured_language_resume_paths,
     _detect_job_language,
+    _extract_job_title_from_card,
     _job_language_allowed,
     _select_resume_path_for_job,
 )
@@ -139,6 +141,7 @@ def _close_application_tabs(context, keep):
 
 
 def validate_non_easy_config(settings: dict) -> None:
+    configured_title_exclusion(settings)
     paths = {}
     if not intelligent_enabled(settings):
         paths["resume_path"] = settings.get("resume_path")
@@ -330,6 +333,9 @@ Company: {job.get('company', 'Unknown')}
 
 == FILES ==
 Resume PDF (upload this): {resume_path}
+For every document upload request, upload this same Resume PDF again, even when
+the field requests a transcript, cover letter, certificate, or another attachment.
+Handle each requested upload separately; do not generate or look for another document.
 Photo (only for a photo/image upload field): {photo_path}
 If a photo is required but not configured, output RESULT:FAILED:missing_required_photo.
 Do not upload the resume into a photo field. Respect file type and size constraints;
@@ -733,6 +739,7 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
     job_title = config_dict.get("job_title", "")
     location = config_dict.get("location", "")
     title_keyword = config_dict.get("title_keyword", "").lower()
+    to_ignore = configured_title_exclusion(config_dict)
     max_applications = int(config_dict.get("max_applications", 20))
     scan_target = max(max_applications * 4, max_applications)
     max_pages = max(int(config_dict.get("max_scan_pages", 3)), 1)
@@ -798,7 +805,12 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
                     if not href or "/jobs/" not in href or href in seen_urls:
                         continue
 
-                    title_text = (card.text_content() or "").strip()
+                    card_title = _extract_job_title_from_card(card) if to_ignore else ""
+                    if title_is_ignored(card_title, to_ignore):
+                        seen_urls.add(href)
+                        log.info("Skipping title '%s': contains to_ignore '%s' (case-insensitive)", card_title, to_ignore)
+                        continue
+                    title_text = card_title or (card.text_content() or "").strip()
                     if title_keyword and title_keyword not in title_text.lower():
                         continue
 
@@ -992,6 +1004,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     job_title = config_dict.get("job_title", "")
     location = config_dict.get("location", "")
     title_keyword = config_dict.get("title_keyword", "").lower()
+    to_ignore = configured_title_exclusion(config_dict)
     max_applications = int(config_dict.get("max_applications", 20))
     max_pages = max(int(config_dict.get("max_scan_pages", 3)), 1)
     max_candidates = max(max_applications * 4, max_applications)
@@ -1014,6 +1027,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
             "easy_skipped": 0,
             "already_applied": 0,
             "language_skipped": 0,
+            "title_ignored": 0,
             "no_external_url": 0,
             "pages_scanned": 0,
         },
@@ -1080,7 +1094,14 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         if not linkedin_url or linkedin_url in seen_urls or "/jobs/view/" not in linkedin_url:
                             continue
 
-                        title_text = (card.text_content() or "").strip()
+                        card_title = _extract_job_title_from_card(card) if to_ignore else ""
+                        if title_is_ignored(card_title, to_ignore):
+                            seen_urls.add(linkedin_url)
+                            summary["skipped"] += 1
+                            summary["search_stats"]["title_ignored"] += 1
+                            log.info("Skipping title '%s': contains to_ignore '%s' (case-insensitive)", card_title, to_ignore)
+                            continue
+                        title_text = card_title or (card.text_content() or "").strip()
                         if title_keyword and title_keyword not in title_text.lower():
                             continue
 
@@ -1151,6 +1172,12 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             "title": title_text or "Unknown title",
                             "company": company,
                         }
+                        filter_title = details.get("title") or card_title
+                        if title_is_ignored(filter_title, to_ignore):
+                            summary["skipped"] += 1
+                            summary["search_stats"]["title_ignored"] += 1
+                            log.info("Skipping title '%s': contains to_ignore '%s' (case-insensitive)", filter_title, to_ignore)
+                            continue
                         if _was_applied(job, applied_keys):
                             summary["skipped"] += 1
                             summary["search_stats"]["already_applied"] += 1

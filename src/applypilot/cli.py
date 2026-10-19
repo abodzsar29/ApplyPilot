@@ -333,6 +333,14 @@ def linkedin_apply(
 
     intelligent = _prepare_intelligent_settings(config, config_file, setup=setup)
 
+    from applypilot.linkedin.filters import configured_title_exclusion, title_exclusion_label
+
+    try:
+        to_ignore = configured_title_exclusion(config) if not setup else ""
+    except ValueError as exc:
+        console.print(f"[red]Invalid application configuration:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
     # Check resume exists
     resume_path = Path(config["resume_path"])
     if not intelligent and not setup and not resume_path.exists():
@@ -380,6 +388,7 @@ def linkedin_apply(
     console.print(f"  Location: {config.get('location', 'N/A')}")
     console.print(f"  URL:     {computed_search_url}")
     console.print(f"  Keyword: {config.get('title_keyword', 'N/A')}")
+    console.print(f"  Ignore title: {title_exclusion_label(to_ignore)}")
     console.print(f"  Only EN: {config.get('only_english', False)}")
     console.print(f"  CV auto: {config.get('auto_select_resume_by_job_language', bool(english_resume_path_value or german_resume_path_value))}")
     console.print(f"  CV EN:   {english_resume_path_value or 'fallback'}")
@@ -389,6 +398,7 @@ def linkedin_apply(
     console.print(f"  Delay:   {config.get('delay', 0)}s")
     console.print(f"  Random:  {config.get('random', False)}")
     console.print("  Browser: Playwright (forms use no LLM)")
+    console.print("  Questions: configured answers -> Yes / Ja / random; text 'a', number '1'")
     console.print(f"  Dry run: {dry_run}")
     console.print(f"  Exact location: {exactlocation}")
     console.print(f"  Setup:   {setup}")
@@ -488,6 +498,7 @@ def linkedin_noneasy(
     _bootstrap()
 
     from applypilot.config import check_non_easy_provider_requirements
+    from applypilot.linkedin.filters import configured_title_exclusion, title_exclusion_label
     from applypilot.linkedin.non_easy import run_non_easy_apply, validate_non_easy_config
     from applypilot.qwen_mcp import get_configured_model, get_effective_model_and_provider
 
@@ -526,6 +537,7 @@ def linkedin_noneasy(
     console.print(f"  Title:    {config.get('job_title', 'N/A')}")
     console.print(f"  Location: {config.get('location', 'N/A')}")
     console.print(f"  Keyword:  {config.get('title_keyword', 'N/A')}")
+    console.print(f"  Ignore title: {title_exclusion_label(configured_title_exclusion(config))}")
     console.print(f"  Max:      {config.get('max_applications', 'N/A')}")
     console.print(f"  Provider: {provider}")
     console.print(f"  Browser model: {effective_model}")

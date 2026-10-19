@@ -123,6 +123,8 @@ class NonEasyTests(unittest.TestCase):
     def test_prompt_has_selected_cv_photo_and_conditional_mailbox(self):
         settings, _ = ne._settings_for_job(self.settings, GERMAN)
         prompt = ne._build_prompt(self.job, settings, dry_run=True)
+        self.assertIn("For every document upload request, upload this same Resume PDF again", prompt)
+        self.assertIn("transcript, cover letter, certificate", prompt)
         self.assertIn("German CV contents", prompt)
         self.assertNotIn("English CV contents", prompt)
         self.assertIn(str(self.root / "photo.png"), prompt)
@@ -191,7 +193,7 @@ class NonEasyTests(unittest.TestCase):
         self.assertEqual(captured, [prompt])
 
     def run_session(self, result="applied", *, settings=None, easy=False, description=None, dry_run=False, jobs=1,
-                    resolve_models=False):
+                    resolve_models=False, card_title="Engineer", detail_title=None):
         search, detail = Mock(url="about:blank"), Mock()
         search.is_closed.return_value = False
         mailbox = Mock(url=MAIL_URL)
@@ -230,12 +232,14 @@ class NonEasyTests(unittest.TestCase):
             manager = stack.enter_context(patch.object(ne, "sync_playwright"))
             manager.return_value.__enter__.return_value = playwright
             stack.enter_context(patch.object(ne, "_iter_result_cards", return_value=cards))
+            stack.enter_context(patch.object(ne, "_extract_job_title_from_card", return_value=card_title))
             stack.enter_context(patch.object(ne, "_is_easy_apply", return_value=easy))
             opener = stack.enter_context(patch.object(ne, "_open_external_application_page", side_effect=open_application))
             runner = stack.enter_context(patch.object(ne, "_run_external_application", side_effect=run_agent))
-            if description is not None:
+            if description is not None or detail_title is not None:
                 stack.enter_context(patch("applypilot.linkedin.scrape.parse_job", return_value={
-                    "description": description, "title": "Engineer", "company": "Employer"}))
+                    "description": description if description is not None else ENGLISH,
+                    "title": detail_title if detail_title is not None else "Engineer", "company": "Employer"}))
             summary = ne.run_non_easy_apply(settings or self.settings, dry_run=dry_run)
             if runner.called:
                 self.assertTrue(application.close.called)
@@ -289,6 +293,66 @@ class NonEasyTests(unittest.TestCase):
         self.assertEqual(summary["search_stats"]["easy_skipped"], 1)
         opener.assert_not_called()
 
+    def test_title_exclusion_skips_case_insensitive_card_match_before_external_click(self):
+        with self.assertLogs(ne.log, level="INFO") as logs:
+            summary, opener, runner = self.run_session(
+                settings=self.settings | {"to_ignore": "sCiEnTiSt"},
+                card_title="Climate Simulation & AI Scientist, Built Environment",
+            )
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["search_stats"]["title_ignored"], 1)
+        self.assertEqual(summary["search_stats"]["candidate_urls"], 0)
+        self.assertTrue(any("to_ignore" in message and "case-insensitive" in message for message in logs.output))
+        opener.assert_not_called()
+        runner.assert_not_called()
+
+    def test_title_exclusion_rechecks_full_detail_title_before_external_click(self):
+        summary, opener, runner = self.run_session(
+            settings=self.settings | {"to_ignore": "scientist"}, card_title="Climate Simulation ...",
+            detail_title="Climate Simulation & AI Scientist, Built Environment",
+        )
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["search_stats"]["title_ignored"], 1)
+        opener.assert_not_called()
+        runner.assert_not_called()
+
+    def test_title_exclusion_does_not_match_company_or_description_text(self):
+        # The fixture has PharmaHera in its company and description, not title.
+        summary, opener, runner = self.run_session(
+            "ready", settings=self.settings | {"to_ignore": "pharmahera"}, dry_run=True,
+        )
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["skipped"], 0)
+        opener.assert_called_once()
+        runner.assert_called_once()
+
+    def test_blank_title_exclusion_leaves_job_eligible(self):
+        summary, _, runner = self.run_session(
+            "ready", settings=self.settings | {"to_ignore": ""}, dry_run=True,
+        )
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["search_stats"]["title_ignored"], 0)
+        runner.assert_called_once()
+
+    def test_list_title_exclusions_match_any_entry_before_external_click(self):
+        summary, opener, runner = self.run_session(
+            settings=self.settings | {"to_ignore": ["senior", "sCiEnTiSt"]},
+            card_title="Climate Simulation & AI Scientist",
+        )
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["search_stats"]["title_ignored"], 1)
+        opener.assert_not_called()
+        runner.assert_not_called()
+
+    def test_list_title_exclusions_recheck_full_detail_title(self):
+        summary, opener, runner = self.run_session(
+            settings=self.settings | {"to_ignore": ["senior", "sCiEnTiSt"]},
+            card_title="Climate Simulation ...", detail_title="Climate Simulation & AI SCIENTIST",
+        )
+        self.assertEqual(summary["skipped"], 1)
+        opener.assert_not_called()
+        runner.assert_not_called()
+
     def test_two_jobs_keep_mailbox_and_distinguish_same_title_company(self):
         summary, _, runner = self.run_session(jobs=2, description=ENGLISH)
         self.assertEqual(summary["applied"], 2)
@@ -316,11 +380,23 @@ class NonEasyTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 1)
             self.assertIn("photo_path", result.output)
             runner.assert_not_called()
-            path.write_text(json.dumps(self.settings))
+            path.write_text(json.dumps(self.settings | {"to_ignore": True}))
+            result = CliRunner().invoke(app, ["linkedin-noneasy", "--config", str(path), "--dry-run"])
+            self.assertEqual(result.exit_code, 1)
+            self.assertIn("to_ignore", result.output)
+            runner.assert_not_called()
+            path.write_text(json.dumps(self.settings | {"to_ignore": "Scientist"}))
             result = CliRunner().invoke(app, ["linkedin-noneasy", "--config", str(path), "--dry-run"])
             self.assertEqual(result.exit_code, 0, result.output)
             self.assertIn("Ready (dry run):     1", result.output)
+            self.assertIn("Ignore title: Scientist", result.output)
+            self.assertEqual(runner.call_args.kwargs["config_dict"]["to_ignore"], "Scientist")
             self.assertTrue(runner.call_args.kwargs["dry_run"])
+            path.write_text(json.dumps(self.settings | {"to_ignore": ["senior", "lead", "Scientist"]}))
+            result = CliRunner().invoke(app, ["linkedin-noneasy", "--config", str(path), "--dry-run"])
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("Ignore title: senior, lead, Scientist", result.output)
+            self.assertEqual(runner.call_args.kwargs["config_dict"]["to_ignore"], ["senior", "lead", "Scientist"])
 
     def test_session_dry_run_and_failure_never_record_success(self):
         for result, dry_run in (("ready", True), ("applied", True), ("failed:missing_required_photo", False)):

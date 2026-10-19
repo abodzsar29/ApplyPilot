@@ -6,6 +6,7 @@ from applypilot.linkedin.unified_apply import (
     _collect_field_questions,
     _choose_dropdown_value,
     _detect_job_language,
+    _fallback_choice_value,
     _fallback_text_answer,
     _field_requires_answer,
     _find_easy_apply_action_button,
@@ -18,11 +19,16 @@ from applypilot.linkedin.unified_apply import (
     _infer_question_answer,
     _is_photo_upload_input,
     _is_resume_upload_input,
+    _find_cover_letter_upload_input,
+    _find_cover_letter_upload_button,
+    _find_document_upload_buttons,
+    _accept_tokens_allow_resume_path,
     _job_language_allowed,
     _linkedin_location_matches_config,
     _ordered_linkedin_job_cards,
     _radio_group_has_checked_option,
     _select_resume_path_for_job,
+    _text_field_answer,
     _uncheck_follow_company_checkbox,
 )
 
@@ -275,6 +281,17 @@ def test_extract_job_title_from_accessibility_label():
     assert _extract_job_title_from_card(card) == "Email Marketing / CRM Account Manager"
 
 
+def test_extract_job_title_prioritizes_job_link_over_detail_section_heading():
+    title = FakeElement(text="Climate Simulation & AI Scientist, Built Environment")
+    card = FakeElement(elements_by_selector={
+        "a[href*='/jobs/view/']": [title],
+        "h2": [FakeElement(text="About the job")],
+        "p": [FakeElement(text="infrared.city")],
+    })
+
+    assert _extract_job_title_from_card(card) == "Climate Simulation & AI Scientist, Built Environment"
+
+
 def test_linkedin_location_match_allows_city_with_radius():
     assert _linkedin_location_matches_config("Munich (50 mi)", "Munich, Bavaria, Germany")
 
@@ -299,6 +316,50 @@ def test_resume_upload_accepts_pdf_resume_field():
     )
 
     assert _is_resume_upload_input(FakePage({}), resume_input, "data/Anabell_Oeynhausen_Lebenslauf.pdf")
+
+
+def test_pdf_cover_letter_input_is_not_classified_as_the_resume_field():
+    cover = FakeElement(text="Upload cover letter", accept="application/pdf,.doc,.docx")
+    resume = FakeElement(text="Upload resume", accept="application/pdf")
+    scope = FakePage({"input[type='file']": [cover, resume]})
+
+    assert not _is_resume_upload_input(scope, cover, "data/AndrewBodzsarCV.pdf")
+    assert _is_resume_upload_input(scope, resume, "data/AndrewBodzsarCV.pdf")
+    assert _find_cover_letter_upload_input(scope) is cover
+
+
+def test_cover_letter_button_finder_skips_hidden_duplicates_and_other_upload_buttons():
+    hidden = FakeElement(text="Upload cover letter", visible=False)
+    resume = FakeElement(text="Upload resume")
+    cover = FakeElement(text="Upload cover letter")
+    scope = FakePage({"button, [role='button'], input[type='button']": [hidden, resume, cover]})
+
+    assert _find_cover_letter_upload_button(scope) is cover
+
+
+def test_upload_buttons_are_recognized_by_action_not_by_attachment_name():
+    transcript = FakeElement(text="Upload Transcript")
+    unknown = FakeElement(text="Upload a newly requested attachment")
+    choose = FakeElement(text="Choose file")
+    hidden = FakeElement(text="Upload Transcript", visible=False)
+    disabled = FakeElement(text="Upload evidence", enabled=False)
+    download = FakeElement(text="Download uploaded transcript")
+    scope = FakePage({"button, [role='button'], input[type='button']":
+                     [transcript, unknown, choose, hidden, disabled, download]})
+
+    assert _find_document_upload_buttons(scope) == [transcript, unknown, choose]
+
+
+def test_transcript_pdf_does_not_satisfy_the_resume_upload_requirement():
+    transcript = FakeElement(aria="Upload Transcript", accept="application/pdf")
+    assert not _is_resume_upload_input(FakePage({}), transcript, "data/AndrewBodzsarCV.pdf")
+
+
+def test_pdf_upload_acceptance_does_not_confuse_docx_only_with_pdf():
+    assert _accept_tokens_allow_resume_path([".pdf", ".docx"], "data/AndrewBodzsarCV.pdf")
+    assert _accept_tokens_allow_resume_path(["application/pdf"], "data/AndrewBodzsarCV.pdf")
+    assert not _accept_tokens_allow_resume_path([".docx"], "data/AndrewBodzsarCV.pdf")
+    assert not _accept_tokens_allow_resume_path(["image/*"], "data/AndrewBodzsarCV.pdf")
 
 
 def test_photo_upload_accepts_configured_image_field():
@@ -415,6 +476,49 @@ def test_unknown_binary_question_prefers_ja_option():
     assert selected == "Ja"
 
 
+def test_unknown_choices_try_yes_then_ja_before_random(monkeypatch):
+    def unexpected_random_choice(candidates):
+        raise AssertionError("Do not choose randomly when Yes or Ja is available")
+
+    monkeypatch.setattr("applypilot.linkedin.unified_apply.random_module.choice", unexpected_random_choice)
+    assert _fallback_choice_value([("No", "n"), ("Ja", "j"), ("Yes", "y")]) == "y"
+    assert _fallback_choice_value([("Nein", "n"), ("Ja", "j")]) == "j"
+    assert _fallback_choice_value([("No", "n"), ("Yes", "y")], current_value="n") == "y"
+
+
+def test_unseen_nonbinary_question_chooses_random_once_and_preserves_it(monkeypatch):
+    candidates = [("LinkedIn", "li"), ("Indeed", "indeed"), ("Other", "other")]
+    calls = []
+
+    def random_choice(options):
+        calls.append(options)
+        return options[1]
+
+    monkeypatch.setattr("applypilot.linkedin.unified_apply.random_module.choice", random_choice)
+    result = _best_option_value("How did you hear about us?", candidates, None, {}, {})
+    assert result == "indeed"
+    assert _best_option_value("How did you hear about us?", candidates, None, {}, {}, current_value=result) == result
+    assert calls == [candidates]
+
+
+def test_configured_choice_beats_yes_and_random(monkeypatch):
+    def unexpected_random_choice(candidates):
+        raise AssertionError("A configured answer must take priority")
+
+    monkeypatch.setattr("applypilot.linkedin.unified_apply.random_module.choice", unexpected_random_choice)
+    assert _best_option_value("Unknown question", [("Yes", "yes"), ("No", "no")], "No", {}, {}) == "no"
+    assert _best_option_value("Source", [("Other", "other"), ("LinkedIn", "li")], "LinkedIn", {}, {}) == "li"
+
+
+def test_select_candidates_include_opt_out_and_exclude_disabled_or_placeholder_options():
+    options = [FakeElement(text="Choose", value=""), FakeElement(text="Man", value="m", enabled=False),
+               FakeElement(text="I choose not to identify", value="private"), FakeElement(text="Woman", value="w")]
+    select = FakeElement(elements_by_selector={"option": options})
+    from applypilot.linkedin.unified_apply import _collect_select_candidates
+
+    assert _collect_select_candidates(select) == [("I choose not to identify", "private"), ("Woman", "w")]
+
+
 def test_choice_option_text_reads_visible_sdui_radio_wrapper_text():
     radio = FakeElement(text="Ja")
 
@@ -429,12 +533,45 @@ def test_salary_question_uses_configured_salary_answer():
         {},
         answers,
     ) == "60000-80000"
-    assert _fallback_text_answer("Expected Salary Range*", {}, {}) == "60000-80000 EUR"
+    assert _fallback_text_answer("Expected Salary Range*", {}, {}) == "a"
 
 
-def test_unknown_years_question_defaults_to_four():
-    assert _infer_question_answer("How many years of relevant experience do you have?", {}, {}) == "4"
-    assert _fallback_text_answer("Number of years", {}, {}) == "4"
+def test_unknown_count_questions_default_to_one():
+    assert _infer_question_answer("How many years of relevant experience do you have?", {}, {}) is None
+    assert _text_field_answer(FakeElement(), "Number of years", {}, {}) == "1"
+    assert _text_field_answer(FakeElement(), "How many pull requests have you reviewed?", {}, {}) == "1"
+
+
+def test_numeric_controls_use_one_without_typing_an_invalid_configured_value():
+    class NumericInput(FakeElement):
+        def __init__(self, attrs):
+            super().__init__()
+            self.attrs = attrs
+
+        def get_attribute(self, name, **kwargs):
+            return self.attrs.get(name)
+
+    for attrs in ({"type": "number"}, {"inputmode": "numeric"}, {"pattern": "[0-9]+"}, {"pattern": r"\d+"}):
+        field = NumericInput(attrs)
+        assert _text_field_answer(field, "Unmatched question", {}, {}) == "1"
+        assert _text_field_answer(field, "German", {}, {"German": "B2"}) == "1"
+        assert _text_field_answer(field, "Exact configured count", {}, {"Exact configured count": "12"}) == "12"
+
+
+def test_unmatched_text_questions_use_the_simple_a_fallback():
+    for question in (
+        "What package managers have you used?",
+        "What Physical AI / Robotics projects have you done?",
+        "Your Github handle and a project that you are proud of?",
+    ):
+        assert _infer_question_answer(question, {}, {}) is None
+        assert _fallback_text_answer(question, {}, {}) == "a"
+
+
+def test_work_authorization_does_not_match_german_language_fact_inside_germany():
+    assert _infer_question_answer(
+        "What is your work authorization status for Germany?", {}, {"German": "B2", "authorized_to_work": "Yes"},
+    ) == "Yes"
 
 
 def test_italian_phone_country_dropdown_uses_configured_country_code():
@@ -454,6 +591,13 @@ def test_consent_checkbox_label_is_treated_as_required():
     checkbox = FakeElement()
 
     assert _field_requires_answer(checkbox, "Personal data consent*")
+
+
+def test_question_asterisk_marks_unnamed_checkbox_group_required_without_input_required_attr():
+    checkbox = FakeElement()
+
+    assert _field_requires_answer(checkbox, "How did you hear about Distribusion?*")
+    assert _field_requires_answer(checkbox, "Gender identity*")
 
 
 def test_form_step_signature_uses_unique_field_questions():

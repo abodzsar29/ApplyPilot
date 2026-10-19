@@ -1,0 +1,138 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Open Easy Apply history entries</title>
+<!-- A visible profile editor outside Easy Apply must never be touched. -->
+<section id="profile-editor">
+    <p>Edit experience</p>
+    <input aria-label="Your title" value="Leave my profile alone">
+    <button type="button">Save</button>
+    <button type="button" id="profile-delete">Delete experience</button>
+</section>
+<div role="dialog" id="application" data-sdui-screen="jobs.EasyApplyModal">
+    <h2>Additional questions</h2>
+    <!-- The reported SDUI shape: heading and Save in one row, fields next,
+         and Delete experience at the bottom of the same entry container. -->
+    <div id="work-entry" class="history-editor i0lmlt i0laes i0lajk i0laoc i0las4" data-kind="experience">
+        <div class="i0lax0 i0lif5 i0ljmv i0ljl5">
+            <p>Edit experience</p>
+            <button type="button"><span><span>Save</span></span></button>
+        </div>
+        <div class="i0lmlt i0lax0 i0lifp">
+            <div><p>Your title*</p>
+                <div componentkey="easyApplyFieldFocus_ea_validation_p2_3_36214242442">
+                    <input required id="_r_cr_" aria-label="Your title" type="text" value="">
+                </div>
+            </div>
+            <div><p>Company</p>
+                <input id="_r_cs_" aria-label="Company" type="text" value="Original employer">
+            </div>
+            <div><p>Dates of employment</p>
+                <div><p>From</p>
+                    <select id="_r_ct_" aria-describedby="_r_cu_">
+                        <option value="">Month</option><option value="1">January</option><option value="2">February</option>
+                    </select>
+                    <p id="_r_cu_">This field is required</p>
+                    <div componentkey="easyApplyFieldFocus_ea_validation_p2_3_36214242610_start_year">
+                        <select id="_r_cv_" aria-describedby="_r_d0_">
+                            <option value="">Year</option><option value="2036">2036</option><option value="2026">2026</option>
+                        </select>
+                        <p id="_r_d0_">This field is required</p>
+                    </div>
+                </div>
+                <div><input id="_r_d1_" aria-label="I currently work here" type="checkbox">
+                    <label for="_r_d1_"></label><p>I currently work here</p></div>
+                <div><p>To</p>
+                    <select id="_r_d2_" aria-describedby="_r_d3_">
+                        <option value="">Month</option><option value="1">January</option>
+                    </select>
+                    <p id="_r_d3_">This field is required</p>
+                    <select id="_r_d4_" aria-describedby="_r_d5_">
+                        <option value="">Year</option><option value="2036">2036</option><option value="2026">2026</option>
+                    </select>
+                    <p id="_r_d5_">This field is required</p>
+                </div>
+            </div>
+            <div><p>City</p><input id="_r_d6_" aria-label="City" type="text" value="Berlin, Germany"></div>
+            <div><p>Description</p><textarea id="_r_d7_" aria-label="Description" rows="4"></textarea></div>
+        </div>
+        <button type="button" data-history-delete componentkey="f32cba12-66ea-4667-b604-cfaeeb828c44">
+            <span><span>Delete experience</span></span>
+        </button>
+    </div>
+    <div id="education-entry" class="history-editor" data-kind="education">
+        <div><p>Edit education</p><button type="button">Save</button></div>
+        <div><p>School*</p><input required id="school" aria-label="School" value="Original university"></div>
+        <div><p>Degree*</p><input required id="degree" aria-label="Degree"></div>
+        <div><p>Start year*</p><select required id="education-year" aria-label="Start year">
+            <option value="">Year</option><option value="2036">2036</option><option value="2020">2020</option>
+        </select></div>
+        <button type="button" data-history-delete>Delete education</button>
+    </div>
+    <div class="history-editor" id="hidden-editor" hidden>
+        <p>Edit experience</p><button type="button">Save</button>
+        <input aria-label="Your title" value="Hidden editor">
+        <button type="button" data-history-delete>Delete experience</button>
+    </div>
+    <section id="closed-entry"><p>Saved work experience</p><p>A real saved job</p>
+        <button type="button" id="closed-delete">Delete experience</button></section>
+    <label>Unrelated required question<input id="ordinary-question" required></label>
+    <button id="next" type="button" disabled>Next</button>
+</div>
+<script>
+(() => {
+    window.deletedHistoryEntries = [];
+    window.historyInputEvents = [];
+    window.historySnapshots = [];
+    window.historySaveClicks = 0;
+    window.closedEntryDeletes = 0;
+    window.profileDeletes = 0;
+    window.nextClicks = 0;
+    window.submitClicks = 0;
+    window.ordinaryAnswer = '';
+    window.deletionsUseConfirmation = false;
+    window.replaceApplicationOnDelete = false;
+    window.ignoreDelete = false;
+    const app = () => document.querySelector('#application');
+    const removeEntry = id => {
+        document.getElementById(id).remove();
+        window.deletedHistoryEntries.push(id);
+        if (window.replaceApplicationOnDelete) app().replaceWith(app().cloneNode(true));
+        app().querySelector('#next').disabled = [...app().querySelectorAll('.history-editor')]
+            .some(entry => entry.getClientRects().length > 0);
+    };
+    for (const type of ['input', 'change']) document.addEventListener(type, event => {
+        if (event.target.closest('#application .history-editor')) {
+            window.historyInputEvents.push(event.target.id + ':' + type);
+        }
+    });
+    document.addEventListener('click', event => {
+        const button = event.target.closest('button');
+        if (!button) return;
+        if (button.id === 'profile-delete') { window.profileDeletes++; return; }
+        if (button.id === 'closed-delete') { window.closedEntryDeletes++; return; }
+        if (button.closest('.history-editor') && button.textContent.trim() === 'Save') {
+            window.historySaveClicks++;
+        }
+        if (button.matches('[data-history-delete]')) {
+            const entry = button.closest('.history-editor');
+            window.historySnapshots.push([...entry.querySelectorAll('input, select, textarea')]
+                .map(field => ({id: field.id, value: field.value, checked: !!field.checked})));
+            if (window.ignoreDelete) return;
+            if (!window.deletionsUseConfirmation) { removeEntry(entry.id); return; }
+            const dialog = document.createElement('div');
+            dialog.setAttribute('role', 'alertdialog');
+            dialog.innerHTML = '<h2>Delete ' + entry.dataset.kind + '?</h2>' +
+                '<p>This entry will be removed from the application.</p>' +
+                '<button type="button">Cancel</button><button type="button" data-confirm-delete>Delete</button>';
+            dialog.querySelector('[data-confirm-delete]').onclick = () => { dialog.remove(); removeEntry(entry.id); };
+            document.body.append(dialog);
+        }
+        if (button.id === 'next') {
+            window.nextClicks++;
+            window.ordinaryAnswer = app().querySelector('#ordinary-question').value;
+            app().innerHTML = '<h2>Review your application</h2><button id="submit">Submit application</button>';
+        }
+        if (button.id === 'submit') window.submitClicks++;
+    });
+})();
+</script>

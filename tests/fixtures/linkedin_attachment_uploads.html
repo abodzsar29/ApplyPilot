@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Every attachment reuses the current CV</title>
+<div role="dialog" id="application">
+    <h2>Resume</h2>
+    <section>
+        <label>Resume<input id="resume" type="file" name="resume" accept=".pdf" hidden></label>
+        <button type="button" id="resume-upload">Upload resume</button>
+    </section>
+    <button type="button" id="next">Next</button>
+</div>
+<!-- File chooser inputs are outside the modal, as in SDUI. -->
+<input id="transcript-picker" type="file" accept="application/pdf" hidden>
+<input id="certificate-picker" type="file" accept=".pdf" hidden>
+<script>
+(() => {
+    const app = document.querySelector('#application');
+    window.uploads = {};
+    window.contents = {};
+    window.attachmentNextClicks = 0;
+    window.submitClicks = 0;
+    const uploaded = (name, input) => {
+        window.uploads[name] = (window.uploads[name] || 0) + 1;
+        window.contents[name] = input.files[0].text();
+    };
+    document.querySelector('#resume-upload').onclick = () => document.querySelector('#resume').click();
+    document.querySelector('#resume').onchange = event => uploaded('resume', event.target);
+    const refresh = () => {
+        // Rerender every remaining button with different generated IDs. Identity
+        // must not depend on those IDs or on keeping an old ElementHandle.
+        for (const button of app.querySelectorAll('[data-upload]')) {
+            const clone = button.cloneNode(true);
+            clone.id = 'generated-' + Math.random().toString(16).slice(2);
+            button.replaceWith(clone);
+        }
+        const ready = ['transcript', 'certificate', 'evidence'].every(name => window.uploads[name]);
+        document.querySelector('#attachments-next').disabled = !ready;
+    };
+    document.querySelector('#next').onclick = () => {
+        if (!window.uploads.resume) return;
+        app.innerHTML = `
+            <h2>Additional documents</h2>
+            <section><p>Transcript*</p>
+                <button type="button" data-upload="transcript">Upload Transcript</button>
+                <p class="validation">A transcript is required</p></section>
+            <section><p>Certification*</p>
+                <button type="button" data-upload="certificate">Upload Certificate</button>
+                <p class="validation">A certificate is required</p></section>
+            <section><label>Supporting evidence
+                <input id="evidence" type="file" name="evidence" accept=".pdf" required hidden></label>
+                <button type="button" data-upload="evidence">Choose file</button></section>
+            <button type="button" style="display:none">Upload Transcript</button>
+            <button type="button" disabled id="attachments-next">Next</button>`;
+        app.onclick = event => {
+            const button = event.target.closest('[data-upload]');
+            if (button) {
+                const target = button.dataset.upload;
+                document.querySelector(target === 'evidence' ? '#evidence' : '#' + target + '-picker').click();
+            }
+        };
+        document.querySelector('#evidence').onchange = event => {
+            uploaded('evidence', event.target);
+            refresh();
+        };
+        document.querySelector('#attachments-next').onclick = () => {
+            window.attachmentNextClicks++;
+            // Stay on the completed page once to exercise retry deduplication.
+            if (window.attachmentNextClicks === 1) return;
+            app.innerHTML = '<h2>Review your application</h2><button id="submit">Submit application</button>';
+            document.querySelector('#submit').onclick = () => window.submitClicks++;
+        };
+    };
+    for (const name of ['transcript', 'certificate']) {
+        document.querySelector('#' + name + '-picker').onchange = event => {
+            uploaded(name, event.target);
+            app.querySelector('[data-upload="' + name + '"]').parentElement.querySelector('.validation').remove();
+            refresh();
+        };
+    }
+})();
+</script>

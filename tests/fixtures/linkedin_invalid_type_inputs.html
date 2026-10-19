@@ -1,0 +1,113 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SDUI invalid input feedback</title>
+<div role="dialog" id="application" data-sdui-screen="jobs.EasyApplyModal">
+    <h2>Aanvullende vragen</h2>
+    <div class="i0lmlt i0llri i0lax0 i0lifp i0ljmv i0ljma i0ljml i0lijp i0lhv9">
+        <p>Hoeveel jaar werkervaring hebt u met Microsoft Azure?*</p>
+        <div componentkey="easyApplyFieldFocus_ea_validation_p2_0_32108894068">
+            <div><input required id="_r_pd_" data-field="azure" aria-describedby="_r_pd_-info"
+                aria-label="Hoeveel jaar werkervaring hebt u met Microsoft Azure?" type="text" value="a"></div>
+            <div data-testid="text-input-helper-text" id="_r_pd_-info">
+                <p data-error="azure">Invalid input</p>
+                <div><p aria-live="polite"><span>1/20</span><span>1 of 20 characters</span></p></div>
+            </div>
+        </div>
+    </div>
+    <div class="i0lmlt i0llri i0lax0 i0lifp i0ljmv i0ljma i0ljml i0lijp i0lhv9">
+        <p>Hoeveel jaar werkervaring hebt u met Kunstmatige intelligentie?*</p>
+        <div componentkey="easyApplyFieldFocus_ea_validation_p2_0_32108894092">
+            <div><input required id="_r_pe_" data-field="ai" aria-describedby="_r_pe_-info"
+                aria-label="Hoeveel jaar werkervaring hebt u met Kunstmatige intelligentie?" type="text" value="a"></div>
+            <div data-testid="text-input-helper-text" id="_r_pe_-info">
+                <p data-error="ai">Invalid input</p>
+                <div><p aria-live="polite"><span>1/20</span><span>1 of 20 characters</span></p></div>
+            </div>
+        </div>
+    </div>
+    <div>
+        <p>Moet u nu of in de toekomst worden gesponsord voor een werkvisum?*</p>
+        <fieldset role="radiogroup">
+            <div role="radio" aria-checked="true" tabindex="0">
+                <div><input id="_r_pi_" type="radio" name="visa" checked><label for="_r_pi_"></label></div>
+                <div><p>Ja</p></div>
+            </div>
+            <div role="radio" aria-checked="false" tabindex="0">
+                <div><input id="_r_ph_" type="radio" name="visa"><label for="_r_ph_"></label></div>
+                <div><p>Nee</p></div>
+            </div>
+        </fieldset>
+    </div>
+    <label>Ordinary text<input id="ordinary" data-field="ordinary" value="a"></label>
+    <input id="token" type="hidden" value="keep-token">
+    <button type="button" id="review">Review</button>
+</div>
+<script>
+(() => {
+    window.fillEvents = [];
+    window.reviewClicks = 0;
+    window.submitClicks = 0;
+    window.radioChanges = 0;
+    window.reviewValues = [];
+    window.replaceOnInput = false;
+    window.replaceOnReview = false;
+    window.repeatAcceptedStepOnce = false;
+    window.alwaysReject = false;
+    window.expected = {azure: 'number', ai: 'number'};
+    const app = () => document.querySelector('#application');
+    const rerender = () => {
+        const original = app();
+        const clone = original.cloneNode(true);
+        for (const field of original.querySelectorAll('input, textarea')) {
+            const target = [...clone.querySelectorAll('input, textarea')].find(other => other.id === field.id);
+            target.value = field.value;
+            target.checked = field.checked;
+            // SDUI may replace every React-generated ID, but the field's stable
+            // validation component key still identifies the same question.
+            if (field.dataset.field === 'azure' || field.dataset.field === 'ai') {
+                const id = 'generated-' + Math.random().toString(16).slice(2);
+                const helper = clone.querySelector('[id="' + field.getAttribute('aria-describedby') + '"]');
+                target.id = id;
+                target.setAttribute('aria-describedby', id + '-info');
+                helper.id = id + '-info';
+            }
+        }
+        original.replaceWith(clone);
+    };
+    document.addEventListener('input', event => {
+        if (!event.target.dataset.field) return;
+        window.fillEvents.push({field: event.target.dataset.field, value: event.target.value});
+        if (window.replaceOnInput) rerender();
+    });
+    document.addEventListener('change', event => {
+        if (event.target.type === 'radio') window.radioChanges++;
+    });
+    document.addEventListener('click', event => {
+        const button = event.target.closest('button');
+        if (!button) return;
+        if (button.id === 'submit') {
+            window.submitClicks++;
+            app().remove();
+            document.body.insertAdjacentHTML('beforeend', '<p>Application submitted successfully</p>');
+            return;
+        }
+        if (button.id !== 'review') return;
+        window.reviewClicks++;
+        const values = Object.fromEntries([...app().querySelectorAll('[data-field]')]
+            .map(field => [field.dataset.field, field.value]));
+        window.reviewValues.push(values);
+        let valid = true;
+        for (const name of ['azure', 'ai']) {
+            const accepted = !window.alwaysReject && (window.expected[name] === 'number'
+                ? /^\d+$/.test(values[name]) : /^[a-z]+$/i.test(values[name]));
+            app().querySelector('[data-error="' + name + '"]').hidden = accepted;
+            valid = valid && accepted;
+        }
+        if (!valid || (window.repeatAcceptedStepOnce && window.reviewClicks === 1)) {
+            if (window.replaceOnReview) rerender();
+            return;
+        }
+        app().innerHTML = '<h2>Review your application</h2><button id="submit">Submit application</button>';
+    });
+})();
+</script>

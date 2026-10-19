@@ -1,0 +1,57 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CV reused as a cover letter</title>
+<div role="dialog" id="application">
+    <h2>Resume</h2>
+    <label>Resume<input id="resume" type="file" name="resume" accept=".pdf" hidden></label>
+    <button id="next" type="button">Next</button>
+</div>
+<!-- SDUI opens the file picker from a button; the file input may be outside the modal. -->
+<input id="cover-picker" type="file" accept="application/pdf" hidden>
+<script>
+(() => {
+    window.resumeUploads = 0;
+    window.coverUploads = 0;
+    window.coverNextClicks = 0;
+    window.submitClicks = 0;
+    window.resumeContents = '';
+    window.coverContents = '';
+    const picker = document.querySelector('#cover-picker');
+    const app = document.querySelector('#application');
+    document.querySelector('#resume').onchange = event => {
+        window.resumeUploads++;
+        window.resumeContents = event.target.files[0].text();
+    };
+    picker.onchange = () => {
+        window.coverUploads++;
+        window.coverContents = picker.files[0].text();
+        document.querySelector('#easyApplyUploadedCoverLetterRef').textContent = picker.files[0].name;
+        document.querySelector('#cover-required')?.remove();
+    };
+    document.querySelector('#next').onclick = () => {
+        if (!document.querySelector('#resume').files.length) return;
+        app.innerHTML = `
+            <h2>Cover letter</h2>
+            <div class="i0lmlt i0lax0 i0lifp i0ljmv i0ljma i0ljml i0lijp i0lhv9 i0lmlu">
+                <fieldset aria-describedby="error-message-_r_hm_" role="radiogroup">
+                    <div class="i0ll57 i0la1s i0lmlu" id="easyApplyUploadedCoverLetterRef" componentkey="easyApplyUploadedCoverLetterRef"></div>
+                </fieldset>
+                <button class="i0lmel i0lmek i0ls2 i0la18 i0lg86 i0ll32 i0ll5l i0lmeq i0lmen i0lmem i0layw i0ljl5 i0ljnf i0lhvh" type="button" componentkey="0a6f27a9-f8c5-417e-a5e9-65b236dc67df">
+                    <span class="i0lme8 i0lme3 i0ligt i0ljl5 i0ls2 i0la18 i0layw i0lii9 i0ljmt i0ll32 i0ll5l i0lkrw i0lkr7 i0lmfc i0lmfl i0lmfi i0lme5 i0lhmx i0lmft">
+                        <span class="i0ll5s i0ll90 i0lmp7 i0ll3y i0lg86 i0ll5q i0lmf3">Upload cover letter</span>
+                    </span>
+                </button>
+                <p id="cover-required" class="i0ll5s i0ll1y i0ll1i i0ll3q i0ll3u i0ll32 i0ll46 i0lhv9 i0lgzn i0ll5q i0lmci">A cover letter is required</p>
+            </div>
+            <button id="cover-next" type="button">Next</button>`;
+        app.querySelector('button[componentkey]').onclick = () => picker.click();
+        document.querySelector('#cover-next').onclick = () => {
+            window.coverNextClicks++;
+            // Keep the completed step once to check that retries do not upload again.
+            if (!picker.files.length || window.coverNextClicks === 1) return;
+            app.innerHTML = '<h2>Review your application</h2><button id="submit">Submit application</button>';
+            document.querySelector('#submit').onclick = () => { window.submitClicks++; };
+        };
+    };
+})();
+</script>
