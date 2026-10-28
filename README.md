@@ -128,7 +128,33 @@ Job search queries, target titles, locations, boards. Run multiple searches with
 API keys and runtime config: `NON_EASY_PROVIDER`, `NON_EASY_MODEL`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `QWEN_MODEL`, `DASHSCOPE_API_KEY`, `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
 
 ### `config/linkedin_apply.json`
-LinkedIn Easy Apply config. Supports `company_blacklist`, a list of company names to skip before the bot clicks `Easy Apply`. Set `browser` to `chrome` or `brave` to launch that installed browser instead of the default Playwright Chromium browser. Optional browser-context settings include `locale`, `timezone_id`, `geolocation`, `permissions`, `user_agent`, `viewport`, `device_scale_factor`, `accept_language`, and `extra_http_headers`. Set `search_url` only to reuse a LinkedIn jobs route; the generated `job_title`, `location`, and Easy Apply filter still come from config so stale copied URLs cannot override them. Set `"old_url": true` to preserve the copied `search_url` parameters while replacing its `keywords` value with `job_title` from config. Set `use_search_results_url` to `true` to open LinkedIn's `/jobs/search-results/` route instead of `/jobs/search/`. Add intentional extra query values with `search_params`, for example a fresh `geoId` or `distance`. For phone dropdowns, set `profile.phone_country` to the country name LinkedIn shows, for example `United Kingdom`.
+LinkedIn application config, shared by `linkedin-apply` and `linkedin-noneasy`.
+
+Set `"company_blacklist": ["Crossing Hurdles", "Avaloq"]` to skip those companies
+before résumé generation or opening the application. Both commands use the same
+matching rules: capitalization, accents, punctuation, and repeated whitespace are
+normalized, and either name containing the other counts as a match (for example,
+`Avaloq` matches `Avaloq Group AG`). Matching uses the company name, not the job
+title or description. A missing or empty list disables the filter; blank entries
+are ignored. Non-Easy Apply also accepts `null` to disable it, logs every blacklist
+skip, and reports a `Company blacklisted` count in its summary. Blacklist skips do
+not consume its application limit or create application-history records.
+
+Set `browser` to `chrome` or `brave` to launch that installed browser instead of the default Playwright Chromium browser. Optional browser-context settings include `locale`, `timezone_id`, `geolocation`, `permissions`, `user_agent`, `viewport`, `device_scale_factor`, `accept_language`, and `extra_http_headers`. Set `search_url` only to reuse a LinkedIn jobs route; the generated `job_title`, `location`, and Easy Apply filter still come from config so stale copied URLs cannot override them. Set `"old_url": true` to preserve the copied `search_url` parameters while replacing its `keywords` value with `job_title` from config. Set `use_search_results_url` to `true` to open LinkedIn's `/jobs/search-results/` route instead of `/jobs/search/`. Add intentional extra query values with `search_params`, for example a fresh `geoId` or `distance`. For phone dropdowns, set `profile.phone_country` to the country name LinkedIn shows, for example `United Kingdom`.
+
+If LinkedIn displays a different search location, Easy Apply corrects it through the location button/popover or legacy inline input, selects the matching suggestion, and verifies the updated location before processing jobs. An unresolved location mismatch still stops the run to avoid applying in the wrong place.
+
+Both LinkedIn application commands honor `max_scan_pages` in this JSON file (a positive
+integer, for example `2000`). It limits search-result pages, while `max_applications`
+limits successful applications (or ready applications in a dry run); skipped/failed
+jobs do not consume the application limit. Without `max_scan_pages`, Easy Apply scans
+all available pages and Non-Easy Apply retains its default of three pages.
+Both commands poll for up to ten seconds for fresh job IDs after clicking Next,
+ignoring temporary empty/stale results. Their summaries show pages scanned and an
+explicit scan stop reason: `no_next_page` when no enabled Next control remains,
+`pagination_no_new_results` for a loading/no-progress timeout, or
+`max_scan_pages_reached` / `max_applications_reached` for configured limits. A
+timeout is not reported as proof that all remaining jobs were exhausted.
 
 Set `"to_ignore": ["senior", "lead", "scientist"]` to skip job titles containing
 **any** listed text in `linkedin-apply` and `linkedin-noneasy`, regardless of
@@ -140,6 +166,151 @@ Missing, null, empty, or whitespace-only values (including an empty list) disabl
 are logged and skipped before résumé tailoring or application handoff, whether
 Intelligent Apply is enabled or not. `title_keyword` remains the separate positive
 title filter; a job must pass both filters.
+
+### Shared application history and company cooldown
+
+Every application route now shares `application_history` in the existing
+`~/.applypilot/applypilot.db` SQLite database (or the `APPLYPILOT_DIR` location):
+`linkedin-apply`, `linkedin-noneasy`, StepStone, the legacy URL-list/simple apply
+runner, and the original `apply` workers. A successful submission records the
+company identity and display name, job URL/title, external application URL,
+source command, and UTC application time. Canonical job keys prevent duplicate
+records; ordinary tracking parameters do not create a new job identity.
+
+Set `"company_cooldown_days": 30` in your LinkedIn or StepStone JSON config. This
+is a rolling 30-day window, not a calendar month. Missing values default to 30;
+`0` disables the company cooldown but still records successful applications.
+The original worker command accepts `applypilot apply --company-cooldown-days 30`.
+`apply --gen` only generates a debugging prompt; if you submit an application
+outside the managed runners, use `apply --mark-applied URL` to add that success
+to the shared history.
+The standalone pipeline's tailoring and cover-letter stages use the same default
+or `company_cooldown_days` in `~/.applypilot/profile.json`.
+
+The check runs before application filling/uploads and job-specific résumé
+generation. Tailoring/cover-letter pipeline stages also skip companies currently
+on cooldown. Skips log the previous successful application date. A failure, a
+dry run, setup mode, or just preparing a résumé does not start a cooldown.
+The existing permanent exact-job duplicate check in non-Easy Apply remains in
+place independently of the company cooldown.
+
+Names are matched exactly after Unicode/case, accent, whitespace and punctuation
+normalization, never by blacklist-style substring matching. Known company URLs
+(including LinkedIn company IDs/slugs) connect name aliases. Corporate suffixes
+are not guessed away. Two known, different LinkedIn company IDs remain distinct.
+When an employer cannot be identified from stored data or page metadata, the
+runner logs a warning and uses a job-specific identity rather than treating all
+"Unknown company" postings as one employer. Cross-job company protection is not
+possible for those unidentified employers. A job-board hostname is never used
+as if it were the hiring company.
+
+On first use, successful records with valid timestamps are automatically imported
+from `linkedin_noneasy_applied.jsonl` and existing applied pipeline jobs. Imports
+are idempotent and preserve the old file. Invalid/missing timestamps are not
+replaced with today's date; invalid JSONL records are warned about and skipped.
+Older records cannot provide a company cooldown when no employer identity was
+originally saved or can be recovered. No historical Easy Apply submissions are
+invented: only newly recorded successes and available legacy evidence are used.
+
+Parallel workers atomically check and reserve a company using SQLite transactions.
+A heartbeat renews the ten-minute reservation during long applications. Normal
+failures release it; a crashed process's reservation expires. If saving a reported
+success fails, the run stops and briefly retains its reservation to reduce the
+risk of an immediate duplicate. Check the actual application status before
+retrying after such an uncertain outcome. Database errors never silently disable
+the protection. History matching, migration, and reservations make no LLM/API
+requests.
+
+### Search pagination (`linkedin-apply` and `linkedin-noneasy`)
+
+Set `"max_scan_pages": 20` in `config/linkedin_apply.json` to scan up to 20
+LinkedIn results pages. This must be a positive integer; when absent, Easy Apply
+scans all available pages and Non-Easy Apply defaults to 3. It is independent of
+`max_applications`. Non-Easy Apply's existing candidate safety cap of four times
+`max_applications` also applies to that mode; neither limit guarantees that many
+successful applications when jobs are skipped or fail.
+
+Both application modes reuse the same pagination checks and support LinkedIn's
+newer icon-only Next button. After clicking, they wait up to 10 seconds
+for new job IDs rather than treating an unchanged or temporarily empty page as
+successful pagination. The CLI prints the page limit, pages scanned, and scan stop
+reason (such as `max_scan_pages_reached`, `no_next_page`, or
+`pagination_no_new_results`). Repeated pages do not trigger duplicate applications.
+
+### External job-board filter (`linkedin-noneasy` only)
+
+Set `"jobboard_filter": true` in `config/linkedin_apply.json` to apply only when
+the external application URL's hostname matches an entry in the project-root
+`jobboards.json` (the current working directory, not `config/jobboards.json`).
+JSON booleans are recommended; the strings `"true"` and `"false"` are also accepted.
+Missing or `false` keeps the existing unrestricted external-site behavior.
+
+The file groups hostname strings by job board, for example:
+
+```json
+{
+  "ashby": ["jobs.ashbyhq.com"],
+  "greenhouse": ["job-boards.greenhouse.io", "boards.greenhouse.io"],
+  "personio": ["*.jobs.personio.de", "*-jobs.personio.de"]
+}
+```
+
+Matching is case-insensitive and applies to the parsed hostname only, never text
+in the URL path or query. Plain entries match exactly. An explicit `*` matches a
+non-empty part of a **single** hostname label, so `*.jobs.personio.de` matches
+`acme.jobs.personio.de`, not `jobs.personio.de` or `x.acme.jobs.personio.de`.
+Do not include schemes, paths, or ports in the file.
+
+The bot checks the actual landed URL after LinkedIn's Apply click and rechecks
+it before browser-agent handoff, including after résumé preparation. Unmatched
+sites are logged and skipped without filling forms or recording an application;
+initially unmatched sites also skip résumé generation. The browser agent is
+instructed to check the same allowlist before entering data, uploading, or
+submitting after later redirects. This is application filtering, not a network
+firewall; normal page assets and the configured verification mailbox are not
+blocked. When enabled, a missing, malformed, or empty allowlist stops the run
+before the browser opens, rather than silently disabling the filter.
+
+### Configured answers on external applications
+
+`linkedin-noneasy` passes the **complete** `profile` and `answers` objects to its
+browser agent, including full-question keys, lists, nested mappings, booleans,
+and zero experience. Screening overrides take precedence over normal mappings.
+Only these applicant sections are included, not unrelated top-level credentials.
+
+On Greenhouse, a bounded Playwright prefill first resolves known fields directly
+from config, then applies the external-question defaults below. It fills contact details and clicks the real options in React Select
+dropdowns, including asynchronous city suggestions; typing into a search box is
+not treated as a committed answer. It preserves successful selections across
+input re-renders and reports unresolved fields to the agent. Hidden required
+mirror inputs, file uploads, and submission are not handled by this prefill.
+The existing browser agent still completes and validates the application.
+
+Use exact question keys in `answers` for employer-specific questions. Explicit
+answers, including No/false/zero, override every fallback. For combined
+work-authorization-without-sponsorship questions, the prefill
+uses both `authorized_to_work` and `visa_sponsorship`, rather than mistakenly
+answering the sponsorship question alone. Residence comes from `profile.city`,
+not the advertised job location.
+
+For `linkedin-noneasy`, unanswered permission, qualifications, skills, experience,
+proficiency, and availability questions use the most favorable available choice.
+Questions asking whether a visa/sponsorship is needed, whether there are unspent
+convictions, or whether there is a client/partner/competitor employment conflict
+use the negative/least adverse choice. Negation matters: authorization **without**
+sponsorship is affirmative; confirming **no** convictions is affirmative.
+If no suitable semantic choice exists, select a random enabled, non-placeholder
+option and preserve it on retries. Unknown free text uses `a`, numbers use `1`,
+and dates/email/URLs use compatible formats. These user-requested defaults are
+logged as `fallback.*` assumptions, not verified applicant facts.
+
+This policy is passed to every external browser agent, not only Greenhouse.
+Unknown answers are no longer a permitted reason to skip a job. An agent that
+still reports an unknown-answer failure gets a fresh same-application retry.
+If it refuses again, the run stops explicitly instead of silently failing that
+job and continuing. Actual broken controls, missing options, validation errors,
+CAPTCHAs, and login/upload failures can still prevent completion; the policy
+does not bypass those technical constraints or the jobboard allowlist.
 
 ### Screening-question fallback
 

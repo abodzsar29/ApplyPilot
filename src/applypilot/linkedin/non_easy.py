@@ -10,10 +10,12 @@ import time
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
+from applypilot.application_history import ApplicationHistory, HistoryError, cooldown_days
 from applypilot.apply.chrome import (
     BASE_CDP_PORT,
     cleanup_worker,
@@ -22,12 +24,22 @@ from applypilot.apply.chrome import (
     reset_worker_dir,
 )
 from applypilot.linkedin.filters import configured_title_exclusion, title_is_ignored
+from applypilot.linkedin.greenhouse import prefill_greenhouse_application
 from applypilot.linkedin.intelligent_apply import PreparationError, intelligent_enabled, intelligent_session
+from applypilot.linkedin.jobboards import JobboardFilter, load_jobboard_filter
+from applypilot.linkedin.non_easy_questions import UNKNOWN_QUESTION_POLICY
+from applypilot.linkedin.pagination import advance_results_page, wait_for_fresh_cards
+from applypilot.linkedin.pagination import configured_max_scan_pages as _configured_max_scan_pages
 from applypilot.linkedin.unified_apply import (
+    _click_action_button,
     _configured_language_resume_paths,
     _detect_job_language,
+    _extract_company_name,
     _extract_job_title_from_card,
+    _find_linkedin_next_page_button,
+    _is_blacklisted_company,
     _job_language_allowed,
+    _normalize_company_name,
     _select_resume_path_for_job,
 )
 from applypilot.qwen_mcp import QwenMCPAgent, get_configured_model, get_effective_model_and_provider
@@ -36,6 +48,10 @@ log = logging.getLogger(__name__)
 
 LINKEDIN_BASE_URL = "https://www.linkedin.com"
 PROTONMAIL_INBOX_URL = "https://mail.proton.me/u/0/inbox"
+
+
+class AnswerFallbackError(RuntimeError):
+    """The browser agent refused the answer policy even after a same-job retry."""
 
 
 def _history_path() -> Path:
@@ -140,8 +156,35 @@ def _close_application_tabs(context, keep):
                 pass
 
 
-def validate_non_easy_config(settings: dict) -> None:
+def _configured_company_blacklist(settings: dict) -> tuple[str, ...]:
+    """Use the same normalized company-name matching as Easy Apply."""
+    companies = settings.get("company_blacklist")
+    if companies is None:
+        return ()
+    if not isinstance(companies, list) or any(not isinstance(name, str) for name in companies):
+        raise ValueError("company_blacklist must be a list of strings or null")
+    return tuple(dict.fromkeys(
+        normalized for name in companies if (normalized := _normalize_company_name(name))
+    ))
+
+
+def _non_easy_company_name(detail_page, card=None) -> str:
+    """Read modern job-card labels as well as legacy job-detail company names."""
+    company = _extract_company_name(card if card is not None else detail_page, detail_page)
+    if company:
+        return company
+    try:
+        element = detail_page.query_selector("a.topcard__org-name-link")
+        return (element.text_content() or "").strip() if element else ""
+    except Exception:
+        return ""
+
+
+def validate_non_easy_config(settings: dict) -> JobboardFilter | None:
+    cooldown_days(settings)
     configured_title_exclusion(settings)
+    _configured_company_blacklist(settings)
+    _configured_max_scan_pages(settings)
     paths = {}
     if not intelligent_enabled(settings):
         paths["resume_path"] = settings.get("resume_path")
@@ -158,6 +201,7 @@ def validate_non_easy_config(settings: dict) -> None:
         except OSError as exc:
             raise ValueError(f"{label} cannot be read: {path}") from exc
     _mailbox_context(settings)
+    return load_jobboard_filter(settings)
 
 
 def _settings_for_job(settings: dict, description: str) -> tuple[dict | None, str]:
@@ -215,25 +259,8 @@ def _read_resume_text(resume_path: Path) -> str:
 
 
 def _answer_bank_summary(answers: dict) -> str:
-    """Render recurring answers and experience years for the agent prompt."""
-    lines: list[str] = []
-
-    for key in ("visa_sponsorship", "authorized_to_work", "onsite"):
-        value = answers.get(key)
-        if value:
-            lines.append(f"- {key}: {value}")
-
-    for key, value in sorted(answers.items()):
-        if key.endswith("_level") and value:
-            lines.append(f"- {key}: {value}")
-
-    years_experience = answers.get("years_experience", {}) or {}
-    if years_experience:
-        lines.append("- years_experience:")
-        for skill, years in sorted(years_experience.items()):
-            lines.append(f"  - {skill}: {years}")
-
-    return "\n".join(lines) if lines else "- none provided"
+    """Preserve every configured answer, including exact questions, false, and zero."""
+    return json.dumps(answers, ensure_ascii=False, indent=2)
 
 
 def _screening_override_summary(answers: dict) -> str:
@@ -303,17 +330,38 @@ Mailbox URL: {mailbox_url}
   details. If required credentials are unavailable, output RESULT:LOGIN_ISSUE.
 """
 
-    profile_lines = [
-        f"First name: {profile.get('first_name', '')}",
-        f"Last name: {profile.get('last_name', '')}",
-        f"Email: {profile.get('email', '')}",
-        f"Phone country code: {profile.get('phone_country_code', '')}",
-        f"Phone number: {profile.get('phone_number', '')}",
-        f"City: {profile.get('city', '')}",
-    ]
+    jobboard_filter = load_jobboard_filter(config_dict)
+    jobboard_section = ""
+    if jobboard_filter:
+        jobboard_section = f"""
+== JOB-BOARD FILTER ==
+Allowed application hostnames: {json.dumps(jobboard_filter.patterns)}
+Only fill, upload documents, or submit on these application hosts. Compare the
+actual HTTP(S) URL hostname case-insensitively, not the URL path or query.
+A '*' matches a non-empty part of one hostname label, never a dot.
+Check the current URL after navigation, redirects, or opening an application tab,
+and again before entering personal information, uploading, or submitting. If an
+application redirects to an unlisted hostname, do not continue or rediscover it;
+output RESULT:FAILED:jobboard_filtered. The separately configured verification
+mailbox may still be used only for the EMAIL VERIFICATION process, not as an
+application destination.
+"""
+
+    profile_summary = json.dumps(profile, ensure_ascii=False, indent=2)
     answer_bank = _answer_bank_summary(answers)
     screening_overrides = _screening_override_summary(answers)
     education_summary = _education_summary(answers)
+    prefill_report = json.dumps(config_dict.get("_configured_prefill", []), ensure_ascii=False, indent=2)
+    continuation = ""
+    if config_dict.get("_answer_fallback_retry"):
+        continuation = """
+== CONTINUE THE SAME APPLICATION ==
+The previous turn reported an unknown/missing question answer. That is NOT a
+terminal result. Inspect a fresh snapshot of the CURRENT application and apply
+MISSING-ANSWER FALLBACK to the unanswered fields now. Choose real options using
+the browser tools. Do not rediscover the job, repeat successful uploads, or stop
+because a fact is missing. A valid default is explicitly authorized by the user.
+"""
     captcha_section = _build_captcha_section()
     submit_instruction = (
         "Do NOT click the final Submit/Apply button. Review the form, then output RESULT:READY."
@@ -342,7 +390,7 @@ Do not upload the resume into a photo field. Respect file type and size constrai
 if a required upload is rejected, output RESULT:FAILED:upload_rejected.
 
 == APPLICANT PROFILE ==
-{chr(10).join(profile_lines)}
+{profile_summary}
 
 == STANDARD ANSWERS ==
 {answer_bank}
@@ -353,17 +401,28 @@ if a required upload is rejected, output RESULT:FAILED:upload_rejected.
 == EDUCATION ==
 {education_summary}
 
+== CONFIGURED PREFILL REPORT ==
+{prefill_report}
+Fields marked filled were set using real browser actions. Preserve
+them unless the page shows a validation error or they contradict an explicit
+configured override. Fields marked needs_agent or retry_with_agent still need
+attention; do not treat a failed prefill as an answered question.
+Entries with source fallback.* used the user-requested default policy, not a
+verified applicant fact. Preserve valid fallback selections on retries unless
+an explicit configured answer takes precedence.
+
 == RESUME TEXT ==
 {resume_text or "Not available as text. Use the uploaded resume PDF plus the profile/answer bank above."}
 {mailbox_section}
+{jobboard_section}
 
 == CORE RULES ==
 1. Never pause and wait for a human. Either answer, skip safely, or fail with a clear RESULT code.
    Do not merely describe an action you intend to take: invoke the browser tool in the same turn.
-2. Answer work authorization, sponsorship, citizenship, licenses, education credentials, criminal history, and security clearance truthfully from the provided profile/answers only.
-3. For common screening questions not explicitly listed, infer the best truthful answer from the profile, answer bank, resume text, and job page.
-4. For open-ended required questions, write concise factual answers. Use the job description and the candidate profile. Do not invent employers, projects, degrees, certifications, or years.
-5. If a question is optional and you lack enough truthful information, leave it blank.
+2. Configured profile/answer facts and explicit overrides take precedence. Use the MISSING-ANSWER FALLBACK only when no configured or supported answer is available.
+3. For common screening questions not explicitly listed, use equivalent configured answers or profile/CV facts, then the user-requested favorable/negative/random fallback.
+4. For open-ended required questions, use concise configured facts where available; otherwise use the type-compatible placeholder from MISSING-ANSWER FALLBACK instead of fabricating a biography.
+5. Missing information is never a reason to fail or skip a job. Commit an actual fallback answer for required questions and continue.
 6. Never sign in through Google, Microsoft, Okta, Auth0, or any SSO provider. If required, output RESULT:FAILED:sso_required.
 7. Never grant camera, microphone, location, screen-sharing, identity-verification, or biometric permissions.
 8. Never stop just because the form structure is unfamiliar. Read the page, inspect labels/options, and continue.
@@ -371,20 +430,58 @@ if a required upload is rejected, output RESULT:FAILED:upload_rejected.
 
 == QUESTION POLICY ==
 - FIRST: check SCREENING OVERRIDES. If the visible question text substantially matches an override, use that override answer exactly.
+- APPLICANT PROFILE and STANDARD ANSWERS contain the complete configured JSON,
+  not just common fields. Look up exact question keys first (ignoring case,
+  punctuation, and required-field asterisks), then equivalent wording. Explicit
+  false, No, and numeric 0 are real answers, not missing data. Respect lists and
+  nested education/experience mappings. Never ignore a configured answer just
+  because its key is a full question instead of a short predefined identifier.
 - Prefer deterministic answers from the provided profile and answer bank.
 - For location / commute / willing-to-work-onsite threshold questions, use answers.onsite when present.
 - For visa / sponsorship / work permit / require support questions, use answers.visa_sponsorship when present.
 - For authorized-to-work questions, use answers.authorized_to_work when present.
+- A question about authorization WITHOUT visa sponsorship is not asking whether
+  sponsorship is required. If authorized_to_work is Yes and visa_sponsorship is
+  No, the combined answer is Yes. Use an explicit matching question override
+  first; never copy visa_sponsorship=No into an authorization-without-sponsorship
+  field merely because its text mentions visas.
 - For degree and field-of-study questions, use EDUCATION first. Treat that section as the source of truth for bachelor's, master's, highest education, and Computer Science field checks.
 - If EDUCATION provides explicit booleans such as computer_science_bachelors, computer_science_masters, or computer_science_bachelors_or_masters, use them directly for matching yes/no questions.
 - If EDUCATION provides bachelors_field or masters_field, use those exact fields when asked what subject the degree is in.
 - For yes/no tool questions: if the tool clearly matches a skill listed in years_experience with > 0 years, answer Yes.
 - For "years of experience" questions: use the matching years_experience value when present.
 - For open text such as "Why are you interested?" or "Tell us about yourself": write 2-3 sentences grounded in the visible job description and the provided profile/resume.
-- If a required question would force fabrication, output RESULT:FAILED:unknown_required_question.
+{UNKNOWN_QUESTION_POLICY}
+
+== CUSTOM DROPDOWNS AND VALIDATION ==
+- Inspect the actual tag. Use browser_select_option only on native <select>
+  elements. Greenhouse's input[role="combobox"] controls are React Select
+  widgets, not native selects, even when aria-haspopup is "true".
+- Match a control by its associated label/accessible name (aria-labelledby also
+  supplies a name), or its actual current input ID. Do not guess aria-label
+  selectors, use a nonexistent <combobox> tag, or reuse stale snapshot refs.
+- For a custom dropdown: click that control, type the configured answer when it
+  is searchable, inspect its open listbox, and CLICK the matching visible option.
+  Options can be portalled outside the form. Do not use select_option, patch
+  input.value with JavaScript, or assume that typing commits the answer.
+- Verify the selected-value display and linked validation state after choosing.
+  A React Select search input normally becomes empty AFTER a successful choice;
+  its .value alone does not tell you whether the question is answered. A selected
+  label with aria-invalid=true or a required-field error is not yet verified:
+  re-open the control, click the actual option, blur, and check a fresh snapshot.
+- For Location (City), use profile.city (the applicant's residence, NOT the job
+  location). Wait for a matching city/region/country suggestion and click it.
+  Do not click Locate me or request geolocation permission.
+- Ignore aria-hidden required mirror inputs, hidden country-search inputs,
+  honeypots, and CAPTCHA textareas. Fill the visible labeled control instead.
+- Do not press Enter on a closed dropdown: it can submit the entire form before
+  other fields are complete. Before final submission, fix visible required-field
+  errors, refreshing snapshots after rerenders. Never submit repeatedly without
+  changing an unresolved field.
 
 == PROCESS ==
-1. Start by listing tabs/windows and select the page matching the external application URL above, allowing redirects to the employer's ATS. Exclude mailbox tabs, including mailbox login pages. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
+{continuation}
+1. Start by listing tabs/windows and select the page matching the external application URL above, allowing redirects to the employer's ATS only when permitted by JOB-BOARD FILTER if enabled. Exclude mailbox tabs, including mailbox login pages. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
 2. If no external tab is already open, navigate directly to the external application URL as a fallback.
 3. Read the page with browser_snapshot. Use the visible page content/HTML structure to understand the form.
 4. Upload the resume PDF when asked.
@@ -407,6 +504,8 @@ RESULT:FAILED:reason
 
 == GIVE UP CONDITIONS ==
 - Same page after 3 attempts with no progress -> RESULT:FAILED:stuck
+- Apply MISSING-ANSWER FALLBACK before counting unsuccessful attempts. Missing
+  knowledge is not a technical failure or a reason to declare the job stuck.
 - Job is closed or no longer accepting applications -> RESULT:EXPIRED
 - Broken page / unusable site -> RESULT:FAILED:page_error
 """
@@ -740,9 +839,10 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
     location = config_dict.get("location", "")
     title_keyword = config_dict.get("title_keyword", "").lower()
     to_ignore = configured_title_exclusion(config_dict)
+    blacklisted_companies = _configured_company_blacklist(config_dict)
     max_applications = int(config_dict.get("max_applications", 20))
     scan_target = max(max_applications * 4, max_applications)
-    max_pages = max(int(config_dict.get("max_scan_pages", 3)), 1)
+    max_pages = _configured_max_scan_pages(config_dict)
 
     if not job_title or not location:
         raise ValueError("job_title and location are required")
@@ -759,8 +859,10 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
     stats = {
         "candidate_urls": 0,
         "easy_skipped": 0,
+        "company_blacklisted": 0,
         "no_external_url": 0,
         "pages_scanned": 0,
+        "stop_reason": "",
     }
 
     with sync_playwright() as p:
@@ -774,23 +876,18 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
             page.wait_for_timeout(3000)
 
             page_num = 1
-            seen_page_markers: set[str] = set()
+            scanned_urls: set[str] = set()
+            job_cards = _wait_for_result_cards(page)
             while len(candidates) < scan_target and page_num <= max_pages:
-                job_cards = _iter_result_cards(page)
                 if not job_cards:
+                    stats["stop_reason"] = "no_results"
                     break
 
-                page_marker = ""
-                for card in job_cards[:5]:
-                    href = _job_url_from_result_card(card)
-                    if href:
-                        page_marker = href
-                        break
-                if page_marker and page_marker in seen_page_markers:
-                    log.info("LinkedIn scan stopped: repeated results page %s", page_num)
+                page_urls = _result_card_urls(job_cards)
+                if not page_urls - scanned_urls:
+                    stats["stop_reason"] = "repeated_results_page"
                     break
-                if page_marker:
-                    seen_page_markers.add(page_marker)
+                scanned_urls.update(page_urls)
 
                 stats["pages_scanned"] = page_num
                 log.info(
@@ -821,17 +918,20 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
                         break
 
                 if len(candidates) >= scan_target:
+                    stats["stop_reason"] = "candidate_limit_reached"
                     break
+                if page_num >= max_pages:
+                    stats["stop_reason"] = "max_scan_pages_reached"
+                    break
+                job_cards, reason = _next_results_page(page, page_num, page_urls)
+                if reason:
+                    stats["stop_reason"] = reason
+                    break
+                page_num += 1
 
-                next_btn = page.query_selector("button[aria-label*='next'], a[aria-label*='next'], button:has-text('Next')")
-                if not next_btn:
-                    break
-                try:
-                    next_btn.click()
-                    page.wait_for_timeout(2000)
-                    page_num += 1
-                except Exception:
-                    break
+            log.info("LinkedIn scan stopped: %s; pages=%s/%s; candidates=%s",
+                     stats["stop_reason"] or "candidate_limit_reached", stats["pages_scanned"],
+                     max_pages, len(candidates))
 
             stats["candidate_urls"] = len(candidates)
 
@@ -849,19 +949,24 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
                         log.info("Skipped Easy Apply job: %s", candidate["linkedin_url"])
                         continue
 
+                    company = _non_easy_company_name(detail_page)
+                    if blacklisted_companies and not company:
+                        from applypilot.linkedin.scrape import parse_job
+
+                        try:
+                            company = parse_job(detail_page.content(), candidate["linkedin_url"])["company"]
+                        except (ValueError, PlaywrightTimeoutError):
+                            pass
+                    if _is_blacklisted_company(company, blacklisted_companies):
+                        stats["company_blacklisted"] += 1
+                        log.info("Skipping blacklisted company '%s': %s", company, candidate["linkedin_url"])
+                        continue
+
                     application_url = _extract_external_apply_url(detail_page)
                     if not application_url:
                         stats["no_external_url"] += 1
                         log.info("No external URL found: %s", candidate["linkedin_url"])
                         continue
-
-                    company = ""
-                    try:
-                        company_elem = detail_page.query_selector("a.topcard__org-name-link, .job-details-jobs-unified-top-card__company-name a, .job-details-jobs-unified-top-card__company-name")
-                        if company_elem:
-                            company = (company_elem.text_content() or "").strip()
-                    except Exception:
-                        pass
 
                     found_jobs.append({
                         "linkedin_url": candidate["linkedin_url"],
@@ -893,7 +998,33 @@ def _run_external_application(
     port: int,
     dry_run: bool,
 ) -> tuple[str, int]:
+    """Never silently abandon a job on a model's missing-answer refusal."""
+    total_duration = 0
+    for attempt in range(2):
+        settings = config_dict if attempt == 0 else {**config_dict, "_answer_fallback_retry": True}
+        result, duration = _run_external_application_once(provider, model, agent, job, settings, port, dry_run)
+        total_duration += duration
+        reason = result.removeprefix("failed:").split(":", 1)[0]
+        if not result.startswith("failed:") or reason not in {
+            "unknown_required_question", "unknown_answer", "missing_answer", "unanswered_question", "unsupported_question",
+        }:
+            return result, total_duration
+        log.warning("Agent reported an unanswered question; applying default policy on the same application (attempt %s/2)",
+                    attempt + 1)
+    raise AnswerFallbackError("Browser agent did not execute the required answer fallback after a same-job retry; "
+                              "stopping rather than silently skipping this job")
+
+
+def _run_external_application_once(
+    provider: str, model: str, agent: QwenMCPAgent | None, job: dict, config_dict: dict, port: int, dry_run: bool,
+) -> tuple[str, int]:
     """Run the configured browser agent against a single external application URL."""
+    jobboard_filter = load_jobboard_filter(config_dict)
+    if jobboard_filter:
+        if not jobboard_filter.matches(job.get("application_url", "")):
+            log.info("Skipping external application: jobboard_filter hostname not in %s", jobboard_filter.path)
+            return "failed:jobboard_filtered", 0
+        config_dict = {**config_dict, "_jobboard_filter": jobboard_filter}
     if provider == "claude":
         start = time.time()
         prompt = _build_prompt(job, config_dict, dry_run=dry_run)
@@ -929,7 +1060,8 @@ def _run_external_application(
         proc.stdin.close()
 
         text_parts: list[str] = []
-        log_file = config.LOG_DIR / f"linkedin_noneasy_claude_{int(start)}.log"
+        suffix = "_answer_retry" if config_dict.get("_answer_fallback_retry") else ""
+        log_file = config.LOG_DIR / f"linkedin_noneasy_claude_{int(start)}{suffix}.log"
         with open(log_file, "w", encoding="utf-8") as lf:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -962,7 +1094,8 @@ def _run_external_application(
     start = time.time()
     prompt = _build_prompt(job, config_dict, dry_run=dry_run)
 
-    log_file = config.LOG_DIR / f"linkedin_noneasy_{provider}_{int(start)}.log"
+    suffix = "_answer_retry" if config_dict.get("_answer_fallback_retry") else ""
+    log_file = config.LOG_DIR / f"linkedin_noneasy_{provider}_{int(start)}{suffix}.log"
     output = agent.run_prompt(prompt, log_path=log_file)
     status = _extract_result(output)
     duration_ms = int((time.time() - start) * 1000)
@@ -998,6 +1131,26 @@ def _job_url_from_result_card(card) -> str:
     return f"{LINKEDIN_BASE_URL}/jobs/view/{match.group(1)}/"
 
 
+def _result_card_urls(cards) -> set[str]:
+    return {url for card in cards if (url := _job_url_from_result_card(card))}
+
+
+def _wait_for_result_cards(page, previous_urls: set[str] | None = None) -> list:
+    """Allow up to ten seconds for results, requiring new jobs after pagination."""
+    return wait_for_fresh_cards(
+        page, read_cards=_iter_result_cards, card_keys=_result_card_urls,
+        previous_keys=previous_urls, wait=_safe_wait_for_timeout,
+    )
+
+
+def _next_results_page(page, page_num: int, previous_urls: set[str]) -> tuple[list, str]:
+    """Reuse the Easy Apply/scraper paginator, then verify that results changed."""
+    return advance_results_page(
+        page, page_num, previous_urls, find_next=_find_linkedin_next_page_button,
+        click_next=_click_action_button, wait_cards=_wait_for_result_cards, logger=log,
+    )
+
+
 def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                headless: bool = False, dry_run: bool = False) -> dict:
     """Process LinkedIn non-Easy-Apply jobs directly from search results."""
@@ -1005,15 +1158,20 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
     location = config_dict.get("location", "")
     title_keyword = config_dict.get("title_keyword", "").lower()
     to_ignore = configured_title_exclusion(config_dict)
+    blacklisted_companies = _configured_company_blacklist(config_dict)
     max_applications = int(config_dict.get("max_applications", 20))
-    max_pages = max(int(config_dict.get("max_scan_pages", 3)), 1)
+    max_pages = _configured_max_scan_pages(config_dict)
     max_candidates = max(max_applications * 4, max_applications)
 
     if not job_title or not location:
         raise ValueError("job_title and location are required")
 
-    validate_non_easy_config(config_dict)
+    jobboard_filter = validate_non_easy_config(config_dict)
+    if jobboard_filter:
+        log.info("Jobboard filter enabled: %d hostname patterns from %s",
+                 len(jobboard_filter.patterns), jobboard_filter.path)
     applied_keys = _load_applied_job_keys()
+    history = ApplicationHistory(config_dict)
     preparer = config_dict.get("_intelligent_preparer")
 
     summary = {
@@ -1028,8 +1186,12 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
             "already_applied": 0,
             "language_skipped": 0,
             "title_ignored": 0,
+            "company_blacklisted": 0,
+            "company_cooldown": 0,
+            "jobboard_filtered": 0,
             "no_external_url": 0,
             "pages_scanned": 0,
+            "stop_reason": "",
         },
         "jobs": [],
     }
@@ -1071,12 +1233,19 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
 
                 page_num = 1
                 seen_urls: set[str] = set()
+                scanned_urls: set[str] = set()
                 inspected = 0
+                cards = _wait_for_result_cards(search_page)
 
                 while page_num <= max_pages and inspected < max_candidates and summary["found"] < max_applications:
-                    cards = _iter_result_cards(search_page)
                     if not cards:
+                        summary["search_stats"]["stop_reason"] = "no_results"
                         break
+                    page_urls = _result_card_urls(cards)
+                    if not page_urls - scanned_urls:
+                        summary["search_stats"]["stop_reason"] = "repeated_results_page"
+                        break
+                    scanned_urls.update(page_urls)
 
                     summary["search_stats"]["pages_scanned"] = page_num
                     log.info(
@@ -1137,17 +1306,12 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             log.info("Skipped Easy Apply job: %s", linkedin_url)
                             continue
 
-                        company = "Unknown company"
-                        try:
-                            company_elem = detail_page.query_selector(
-                                "a.topcard__org-name-link, "
-                                ".job-details-jobs-unified-top-card__company-name a, "
-                                ".job-details-jobs-unified-top-card__company-name"
-                            )
-                            if company_elem:
-                                company = (company_elem.text_content() or "").strip() or "Unknown company"
-                        except Exception:
-                            pass
+                        company = _non_easy_company_name(detail_page, card) or "Unknown company"
+                        if _is_blacklisted_company(company, blacklisted_companies):
+                            summary["skipped"] += 1
+                            summary["search_stats"]["company_blacklisted"] += 1
+                            log.info("Skipping blacklisted company '%s': %s", company, linkedin_url)
+                            continue
 
                         # Parse only the description so English navigation text
                         # does not influence the language filter.
@@ -1167,10 +1331,17 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 summary["failed"] += 1
                                 continue
 
+                        if _is_blacklisted_company(company, blacklisted_companies):
+                            summary["skipped"] += 1
+                            summary["search_stats"]["company_blacklisted"] += 1
+                            log.info("Skipping blacklisted company '%s': %s", company, linkedin_url)
+                            continue
+
                         job = {
                             "linkedin_url": linkedin_url,
                             "title": title_text or "Unknown title",
                             "company": company,
+                            "company_url": details.get("company_url", ""),
                         }
                         filter_title = details.get("title") or card_title
                         if title_is_ignored(filter_title, to_ignore):
@@ -1193,22 +1364,64 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                  "pending intelligent preparation" if preparer else job_settings["resume_path"],
                                  job_settings.get("photo_path") or "not configured")
 
+                        application_attempt = history.attempt(job, "linkedin-noneasy", dry_run=dry_run)
+                        if not application_attempt.allowed:
+                            summary["skipped"] += 1
+                            summary["search_stats"]["company_cooldown"] += 1
+                            application_attempt.close()
+                            continue
                         prepared = None
                         outcome = "failed"
                         try:
+                            application_page, application_url = None, None
+                            if jobboard_filter:
+                                # Inspect the landed destination before spending a résumé API call.
+                                application_page, application_url = _open_external_application_page(detail_page)
+                                if not application_page:
+                                    summary["skipped"] += 1
+                                    summary["search_stats"]["no_external_url"] += 1
+                                    outcome = "skipped"
+                                    log.info("No external application page opened after Apply click: %s", linkedin_url)
+                                    continue
+                                application_url = application_page.url
+                                if not jobboard_filter.matches(application_url):
+                                    summary["skipped"] += 1
+                                    summary["search_stats"]["jobboard_filtered"] += 1
+                                    outcome = "skipped"
+                                    log.info("Skipping external site %s: jobboard_filter hostname not in %s",
+                                             application_url, jobboard_filter.path)
+                                    continue
+                                job_settings = {**job_settings, "_jobboard_filter": jobboard_filter}
                             if preparer:
                                 prepared = preparer.prepare({**details, **job})
                                 prepared.verify_published()
                                 job_settings = {**job_settings, "resume_path": str(prepared.published_pdf),
                                                 "_intelligent_resume_text": prepared.text,
                                                 "_intelligent_pdf_sha256": prepared.pdf_sha256}
-                            application_page, application_url = _open_external_application_page(detail_page)
+                            if not jobboard_filter:
+                                application_page, application_url = _open_external_application_page(detail_page)
                             if not application_page:
                                 summary["skipped"] += 1
                                 summary["search_stats"]["no_external_url"] += 1
                                 outcome = "skipped"
                                 log.info("No external application page opened after Apply click: %s", linkedin_url)
                                 continue
+
+                            prefill_report = prefill_greenhouse_application(application_page, job_settings)
+                            if prefill_report:
+                                job_settings = {**job_settings, "_configured_prefill": prefill_report}
+
+                            if jobboard_filter:
+                                # The page can redirect again while the job-specific résumé is prepared.
+                                application_url = application_page.url
+                                if not jobboard_filter.matches(application_url):
+                                    summary["skipped"] += 1
+                                    summary["search_stats"]["jobboard_filtered"] += 1
+                                    outcome = "skipped"
+                                    log.info("Skipping redirected site %s: jobboard_filter hostname not in %s",
+                                             application_url, jobboard_filter.path)
+                                    continue
+                                log.info("Jobboard filter matched application host: %s", urlparse(application_url).hostname)
 
                             job["application_url"] = application_url or ""
                             summary["jobs"].append(job)
@@ -1223,7 +1436,14 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 port=port,
                                 dry_run=dry_run,
                             )
-                            if dry_run and result in {"ready", "applied"}:
+                            if jobboard_filter and result == "failed:jobboard_filtered":
+                                summary["found"] -= 1
+                                summary["jobs"].pop()
+                                summary["skipped"] += 1
+                                summary["search_stats"]["jobboard_filtered"] += 1
+                                outcome = "skipped"
+                                log.info("Application skipped after redirect: jobboard_filter reported an unlisted host")
+                            elif dry_run and result in {"ready", "applied"}:
                                 summary["ready"] += 1
                                 outcome = "ready"
                             elif not dry_run and result == "applied":
@@ -1231,8 +1451,9 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 outcome = "applied"
                                 applied_keys.add(_job_registry_key(job))
                                 try:
+                                    application_attempt.success(job)
                                     _record_applied_job(job)
-                                except OSError:
+                                except (OSError, HistoryError):
                                     log.exception("Application submitted but history could not be saved; stopping to prevent duplicates")
                                     summary["stopped_reason"] = "history_write_failed"
                                     return summary
@@ -1242,6 +1463,11 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 if result == "failed:provider_credit_low":
                                     summary["stopped_reason"] = "provider_credit_low"
                                     return summary
+                        except AnswerFallbackError as exc:
+                            outcome = "stopped"
+                            summary["stopped_reason"] = "answer_fallback_not_executed"
+                            log.error("%s", exc)
+                            return summary
                         except PreparationError as exc:
                             log.error("%s", exc)
                             summary["failed"] += 1
@@ -1254,26 +1480,31 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                             log.exception("Application failed after intelligent preparation: %s", linkedin_url)
                             summary["failed"] += 1
                         finally:
+                            application_attempt.close()
                             try:
                                 if prepared:
                                     prepared.finish(outcome)
                             finally:
                                 _close_application_tabs(context, (search_page, detail_page, mailbox_page))
 
-                    if summary["found"] >= max_applications or inspected >= max_candidates:
+                    if summary["found"] >= max_applications:
+                        summary["search_stats"]["stop_reason"] = "max_applications_reached"
                         break
+                    if inspected >= max_candidates:
+                        summary["search_stats"]["stop_reason"] = "candidate_limit_reached"
+                        break
+                    if page_num >= max_pages:
+                        summary["search_stats"]["stop_reason"] = "max_scan_pages_reached"
+                        break
+                    cards, reason = _next_results_page(search_page, page_num, page_urls)
+                    if reason:
+                        summary["search_stats"]["stop_reason"] = reason
+                        break
+                    page_num += 1
 
-                    next_btn = search_page.query_selector(
-                        "button[aria-label*='next'], a[aria-label*='next'], button:has-text('Next')"
-                    )
-                    if not next_btn:
-                        break
-                    try:
-                        next_btn.click()
-                        search_page.wait_for_timeout(2000)
-                        page_num += 1
-                    except Exception:
-                        break
+                log.info("LinkedIn scan stopped: %s; pages=%s/%s; candidates=%s",
+                         summary["search_stats"]["stop_reason"] or "max_applications_reached",
+                         summary["search_stats"]["pages_scanned"], max_pages, inspected)
             finally:
                 _close_application_tabs(context, (search_page, detail_page))
                 try:

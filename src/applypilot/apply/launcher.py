@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.live import Live
 
 from applypilot import config
+from applypilot.application_history import ApplicationHistory, HistoryError, cooldown_days
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
@@ -88,7 +89,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
+                worker_id: int = 0, excluded_urls=()) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
@@ -100,20 +101,23 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         Job dict or None if the queue is empty.
     """
     conn = get_connection()
+    excluded = sorted(excluded_urls)
+    excluded_clause = "AND url NOT IN (" + ",".join("?" for _ in excluded) + ")" if excluded else ""
     try:
         conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
+            row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, location, full_description, cover_letter_path, company, company_url, strategy
                 FROM jobs
                 WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
                   AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                  AND (apply_status IS NULL OR apply_status != 'in_progress')
+                  {excluded_clause}
                 LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+            """, [target_url, target_url, like, like] + excluded).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
@@ -129,7 +133,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                       fit_score, location, full_description, cover_letter_path, company, company_url, strategy
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
                   AND (apply_status IS NULL OR apply_status = 'failed')
@@ -137,9 +141,10 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                   AND fit_score >= ?
                   {site_clause}
                   {url_clauses}
+                  {excluded_clause}
                 ORDER BY fit_score DESC, url
                 LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"]] + params + excluded).fetchone()
 
         if not row:
             conn.rollback()
@@ -194,6 +199,10 @@ def mark_result(url: str, status: str, error: str | None = None,
             WHERE url = ?
         """, (status, error or "unknown", duration_ms, task_id, url))
     conn.commit()
+    if status == "applied":
+        row = conn.execute("SELECT * FROM jobs WHERE url=?", (url,)).fetchone()
+        if row:
+            ApplicationHistory().record(dict(row), "apply")
 
 
 def release_lock(url: str) -> None:
@@ -256,6 +265,7 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
         reason: Failure reason (only for status='failed').
     """
     conn = get_connection()
+    job = conn.execute("SELECT * FROM jobs WHERE url=?", (url,)).fetchone()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
         conn.execute("""
@@ -270,6 +280,8 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
             WHERE url = ?
         """, (reason or "manual", url))
     conn.commit()
+    if status == "applied" and job:
+        ApplicationHistory().record(dict(job), "apply:manual")
 
 
 def reset_failed() -> int:
@@ -295,7 +307,21 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
+            model: str = "sonnet", dry_run: bool = False, company_cooldown_days: int = 30) -> tuple[str, int]:
+    history = ApplicationHistory({"company_cooldown_days": company_cooldown_days})
+    with history.attempt(job, "apply", dry_run=dry_run) as attempt:
+        if not attempt.allowed:
+            return "skipped:" + attempt.reason, 0
+        result, duration = _run_job_once(job, port, worker_id, model, dry_run)
+        if dry_run and result == "applied":
+            return "ready", duration
+        if result == "applied":
+            attempt.success(job)
+        return result, duration
+
+
+def _run_job_once(job: dict, port: int, worker_id: int = 0,
+                  model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
@@ -465,8 +491,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
 
+        final_result = next((line.strip().strip('`*"').strip() for line in reversed(output.splitlines())
+                             if line.strip().strip('`*"').strip().startswith("RESULT:")), "")
+        if dry_run and final_result in {"RESULT:READY", "RESULT:APPLIED (dry run)"}:
+            return "ready", duration_ms
         for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
-            if f"RESULT:{result_status}" in output:
+            if final_result == f"RESULT:{result_status}":
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")
@@ -548,7 +578,7 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str = "sonnet", dry_run: bool = False, company_cooldown_days: int = 30) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -569,6 +599,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     jobs_done = 0
     empty_polls = 0
     port = BASE_CDP_PORT + worker_id
+    excluded_urls: set[str] = set()
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -578,7 +609,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, excluded_urls=excluded_urls)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -592,6 +623,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             # Use Event.wait for interruptible sleep
             if _stop_event.wait(timeout=POLL_INTERVAL):
                 break  # Stop was requested during wait
+            excluded_urls.clear()
             continue
 
         empty_polls = 0
@@ -602,12 +634,17 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
+                                            model=model, dry_run=dry_run, company_cooldown_days=company_cooldown_days)
 
-            if result == "skipped":
+            if result.startswith("skipped"):
                 release_lock(job["url"])
+                excluded_urls.add(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
+            elif result == "ready":
+                release_lock(job["url"])
+                excluded_urls.add(job["url"])
+                add_event(f"[W{worker_id}] Ready (dry run): {job['title'][:30]}")
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
@@ -622,6 +659,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
 
+        except HistoryError:
+            logger.exception("Application history could not be checked/saved; stopping all workers")
+            _stop_event.set()
+            raise
         except KeyboardInterrupt:
             release_lock(job["url"])
             if _stop_event.is_set():
@@ -653,7 +694,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str = "sonnet",
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1, company_cooldown_days: int = 30) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -670,6 +711,7 @@ def main(limit: int = 1, target_url: str | None = None,
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
     _stop_event.clear()
+    cooldown_days({"company_cooldown_days": company_cooldown_days})
 
     config.ensure_dirs()
     console = Console()
@@ -737,6 +779,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    company_cooldown_days=company_cooldown_days,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -760,6 +803,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            company_cooldown_days=company_cooldown_days,
                         ): i
                         for i in range(workers)
                     }
@@ -818,17 +862,21 @@ def _run_linkedin_job(job_url: str, config: dict, port: int, worker_id: int = 0,
         # Apply to job using simple Playwright approach
         # Use the CDP port that the worker Chrome is running on
         cdp_port = port if port else (9222 + worker_id)
-        result = apply_to_job(job_url, config, profile_dir, port=cdp_port)
+        result = apply_to_job(job_url, config, profile_dir, port=cdp_port, dry_run=dry_run)
 
         duration_ms = int((time.time() - start) * 1000)
 
         if result == "APPLIED":
             return ("applied", duration_ms)
+        elif result == "READY":
+            return ("dry_run", duration_ms)
         elif result.startswith("SKIPPED"):
             return (f"skipped:{result.split(':')[1]}", duration_ms)
         else:
             return (result, duration_ms)
 
+    except HistoryError:
+        raise
     except Exception as e:
         logger.exception("Error in simple apply")
         duration_ms = int((time.time() - start) * 1000)
@@ -838,7 +886,7 @@ def _run_linkedin_job(job_url: str, config: dict, port: int, worker_id: int = 0,
 def run_linkedin_apply(job_urls: list[str], config_dict: dict,
                        model: str = "haiku", dry_run: bool = False,
                        headless: bool = False, workers: int = 1) -> dict:
-    """Apply to LinkedIn jobs from a URL list (no DB dependency).
+    """Apply to LinkedIn URLs without a pipeline queue; use the shared history DB.
 
     Args:
         job_urls: List of LinkedIn job URLs to apply to.
@@ -873,6 +921,7 @@ def run_linkedin_apply(job_urls: list[str], config_dict: dict,
     applied_count = 0
     skipped_count = 0
     failed_count = 0
+    ready_count = 0
     port = BASE_CDP_PORT
 
     chrome_proc = None
@@ -902,9 +951,7 @@ def run_linkedin_apply(job_urls: list[str], config_dict: dict,
                         applied_count += 1
                         update_state(0, jobs_applied=applied_count)
                     elif result == "dry_run":
-                        # Treat dry_run as success for counting
-                        applied_count += 1
-                        update_state(0, jobs_applied=applied_count)
+                        ready_count += 1
                     elif result.startswith("skipped"):
                         skipped_count += 1
                         update_state(0, jobs_done=applied_count + skipped_count + failed_count)
@@ -913,6 +960,8 @@ def run_linkedin_apply(job_urls: list[str], config_dict: dict,
                         update_state(0, jobs_failed=failed_count,
                                      jobs_done=applied_count + skipped_count + failed_count)
 
+                except HistoryError:
+                    raise
                 except KeyboardInterrupt:
                     console.print("\n[red]Interrupted[/red]")
                     break
@@ -939,6 +988,7 @@ def run_linkedin_apply(job_urls: list[str], config_dict: dict,
 
     return {
         "applied": applied_count,
+        "ready": ready_count,
         "skipped": skipped_count,
         "failed": failed_count,
     }

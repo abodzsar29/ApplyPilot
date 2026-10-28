@@ -15,8 +15,10 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from applypilot import config
+from applypilot.application_history import ApplicationHistory, HistoryError, page_job_metadata
 from applypilot.linkedin.filters import configured_title_exclusion, title_is_ignored
 from applypilot.linkedin.intelligent_apply import PreparationError, intelligent_session
+from applypilot.linkedin.pagination import advance_results_page, configured_max_scan_pages, wait_for_fresh_cards
 
 log = logging.getLogger(__name__)
 
@@ -247,7 +249,8 @@ _NO_OPTION_LABELS = {
 _LINKEDIN_NEXT_PAGE_SELECTORS = [
     "button[data-testid='pagination-controls-next-button-visible']",
     "button[aria-label*='View next page']",
-    "button[aria-label*='next']",
+    "button[aria-label*='next' i]",
+    "a[aria-label*='next' i]",
     "button:has-text('Next')",
 ]
 
@@ -875,6 +878,17 @@ def _open_easy_apply_for_job(page, job_url: str, *, record=None, timeout_ms: int
     raise RuntimeError(f"Could not open Easy Apply for job {job_id}: {reason}")
 
 
+_LINKEDIN_LOCATION_EDITOR_SELECTOR = ", ".join((
+    "[componentkey='LocationTypeahead_TextEditor'][contenteditable='true']",
+    "[contenteditable='true'][aria-label*='location' i]",
+    "input[id*='jobs-search-box-location']",
+    ".jobs-search-box__input--location input",
+    "input[aria-label*='location' i]",
+    "input[placeholder*='location' i]",
+    "input[componentkey*='Location' i]",
+))
+
+
 def _normalize_location_text(value: str) -> str:
     """Normalize location labels for resilient text matching."""
     normalized = unicodedata.normalize("NFKD", value or "")
@@ -941,7 +955,7 @@ def _ensure_configured_linkedin_search_location(page, location: str) -> bool:
         active_location,
         location,
     )
-    if not _ensure_active_linkedin_search_location(page, location, contenteditable=True):
+    if not _ensure_active_linkedin_search_location(page, location):
         log.error(
             "LinkedIn location mismatch could not be corrected. Page shows '%s', config expects '%s'",
             active_location,
@@ -1033,35 +1047,49 @@ def _active_linkedin_search_keyword(page) -> str:
 
 
 def _active_linkedin_search_location(page) -> str:
-    """Read the visible LinkedIn location label in the new jobs layout."""
+    """Read the committed location label, or the legacy inline location input."""
     try:
         location_text = page.evaluate(
-            """() => {
-                const marker = document.querySelector('svg#location-marker-small');
-                const container = marker && marker.closest('div');
-                const text = container && container.querySelector('p');
-                return text ? (text.textContent || '').trim() : '';
-            }"""
+            r"""editorSelector => {
+                const visible = el => el && el.getClientRects().length > 0
+                    && getComputedStyle(el).visibility !== 'hidden';
+                const text = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                const controls = document.querySelectorAll(
+                    'button[aria-label*="location" i], [role="button"][aria-label*="location" i], '
+                    + '[aria-label*="location" i]:has(p)'
+                );
+                for (const control of controls) {
+                    if (!visible(control)) continue;
+                    const label = text([...control.querySelectorAll('p')].find(visible) || control);
+                    if (label && !/^(?:(?:change|edit|search(?: by)?) )?location$/i.test(label)) return label;
+                }
+                for (const marker of document.querySelectorAll('svg[id^="location-marker"]')) {
+                    if (!visible(marker)) continue;
+                    let node = marker.parentElement;
+                    for (let depth = 0; node && node !== document.body && depth < 5; depth++, node = node.parentElement) {
+                        const label = [...node.querySelectorAll('p')].find(visible);
+                        if (label && text(label)) return text(label);
+                    }
+                }
+                // Contenteditable text is only a draft in a popover, not an applied location.
+                const popovers = [...controls].flatMap(control =>
+                    ['aria-controls', 'aria-owns'].flatMap(attr =>
+                        (control.getAttribute(attr) || '').split(/\s+/).filter(Boolean)
+                    ).map(id => document.getElementById(id)).filter(Boolean)
+                );
+                for (const input of document.querySelectorAll(editorSelector)) {
+                    if (input.tagName !== 'INPUT' || !visible(input) || !input.value.trim()) continue;
+                    if (input.closest('[role="dialog"], [role="listbox"]') || popovers.some(el => el.contains(input))) continue;
+                    return input.value.trim();
+                }
+                return '';
+            }""",
+            _LINKEDIN_LOCATION_EDITOR_SELECTOR,
         )
         if location_text:
             return str(location_text).strip()
     except Exception:
         pass
-
-    selectors = [
-        "button[aria-label*='Location']",
-        "[aria-label*='Location'] p",
-    ]
-    for selector in selectors:
-        try:
-            elem = page.query_selector(selector)
-            if not elem:
-                continue
-            text = (elem.text_content() or "").strip()
-            if text:
-                return text
-        except Exception:
-            continue
     return ""
 
 
@@ -1234,48 +1262,70 @@ def _ensure_easy_apply_search_filter(page) -> bool:
         return False
 
 
-def _fill_location_contenteditable(page, location: str) -> bool:
-    """Fill LinkedIn's newer contenteditable location popover."""
-    editor_selector = (
-        "[componentkey='LocationTypeahead_TextEditor'][contenteditable='true'], "
-        "[contenteditable='true'][aria-label='Location']"
-    )
-
-    try:
-        editor = page.locator(editor_selector).first
-        editor.wait_for(state="visible", timeout=3000)
-        editor.click()
-        try:
-            editor.fill(location, timeout=1000)
-        except Exception:
-            page.keyboard.press("Control+A")
-            page.keyboard.type(location, delay=20)
-        page.wait_for_timeout(700)
-
-        top_result = page.locator(
-            "[componentkey='semanticSearchBoxLocationList'] a[href*='/jobs/search-results/']"
-        ).first
-        try:
-            top_result.wait_for(state="visible", timeout=5000)
-            result_text = (top_result.text_content(timeout=500) or "").strip()
-            log.info("Selecting top LinkedIn location result: %s", result_text or "<unknown>")
-            top_result.click(timeout=2000)
-            page.wait_for_load_state("domcontentloaded", timeout=15000)
-            page.wait_for_timeout(1500)
+def _wait_for_linkedin_location_match(page, location: str, *, timeout_ms: int = 5000) -> bool:
+    """Allow asynchronous location selection/navigation to update the search header."""
+    for elapsed in range(0, timeout_ms + 1, 200):
+        if _linkedin_location_matches_config(_active_linkedin_search_location(page), location):
             return True
-        except Exception as exc:
-            log.debug("Could not select top LinkedIn location result: %s", exc)
-
-        page.keyboard.press("Enter")
-        page.wait_for_timeout(1500)
-        return True
-    except Exception as exc:
-        log.debug("Could not fill LinkedIn contenteditable location popover: %s", exc)
-        return False
+        if elapsed < timeout_ms:
+            page.wait_for_timeout(200)
+    return False
 
 
-def _ensure_active_linkedin_search_location(page, location: str, *, contenteditable: bool = False) -> bool:
-    """Set the visible LinkedIn search location when the URL was normalized differently."""
+def _select_linkedin_location_suggestion(page, editor, location: str, *, timeout_ms: int = 3000) -> bool:
+    """Select a matching location, never an unrelated top suggestion or keyword result."""
+    for elapsed in range(0, timeout_ms + 1, 200):
+        try:
+            result = editor.evaluate(
+                r"""(editor, target) => {
+                    const visible = el => el && el.getClientRects().length > 0
+                        && getComputedStyle(el).visibility !== 'hidden';
+                    const normalize = value => (value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+                        .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+                    const expected = normalize(target);
+                    const primary = normalize(target.split(',')[0]);
+                    const scopes = [...document.querySelectorAll('[componentkey="semanticSearchBoxLocationList"]')];
+                    for (const attr of ['aria-controls', 'aria-owns']) {
+                        for (const id of (editor.getAttribute(attr) || '').split(/\s+/).filter(Boolean)) {
+                            const scope = document.getElementById(id);
+                            if (scope) scopes.push(scope);
+                        }
+                    }
+                    const legacy = editor.closest('.jobs-search-box__input--location');
+                    if (legacy) scopes.push(legacy);
+                    if (!scopes.some(visible)) scopes.push(...document.querySelectorAll('[role="listbox"]'));
+                    const options = [...new Set(scopes.filter(visible).flatMap(scope => [...scope.querySelectorAll(
+                        '[role="option"], a[href*="/jobs/search"], li'
+                    )]))].filter(el => visible(el) && !el.closest('[aria-disabled="true"], [disabled]'));
+                    const score = el => {
+                        const label = normalize(el.innerText || el.textContent);
+                        if (label === expected) return 3;
+                        if (` ${label} `.includes(` ${expected} `)) return 2;
+                        return label === primary ? 1 : 0;
+                    };
+                    const match = options.filter(el => score(el) > 0).sort((a, b) => score(b) - score(a))[0];
+                    if (!match) return { clicked: false };
+                    const text = (match.innerText || match.textContent || '').trim();
+                    match.scrollIntoView({block: 'nearest'});
+                    match.click();
+                    return { clicked: true, text };
+                }""",
+                location,
+                timeout=1000,
+            )
+            if result.get("clicked"):
+                log.info("Selecting LinkedIn location result: %s", result.get("text") or location)
+                return True
+        except PlaywrightError as exc:
+            log.debug("Location suggestions changed while selecting: %s", exc)
+            break
+        if elapsed < timeout_ms:
+            page.wait_for_timeout(200)
+    return False
+
+
+def _ensure_active_linkedin_search_location(page, location: str) -> bool:
+    """Set the configured location through either the modern popover or legacy input."""
     target = (location or "").strip()
     if not target:
         return False
@@ -1285,54 +1335,77 @@ def _ensure_active_linkedin_search_location(page, location: str, *, contentedita
         return True
 
     try:
-        clicked = page.evaluate(
-            """() => {
-                const marker = document.querySelector('svg#location-marker-small');
-                let clickable = marker && marker.closest('[role="button"], button, a');
-                if (!clickable && marker) {
-                    let node = marker.parentElement;
-                    while (node && node !== document.body) {
-                        if (node.querySelector('svg#location-marker-small') && node.querySelector('p')) {
-                            clickable = node;
-                            break;
+        editor = page.locator(f":is({_LINKEDIN_LOCATION_EDITOR_SELECTOR}):visible").first
+        if not editor.count():
+            # The reader and opener must support the same labelled controls: newer
+            # layouts need not contain the old location-marker-small SVG at all.
+            clicked = False
+            for attempt in range(12):
+                opened = page.evaluate(
+                    r"""() => {
+                        const visible = el => el && el.getClientRects().length > 0
+                            && getComputedStyle(el).visibility !== 'hidden';
+                        const controls = [...document.querySelectorAll(
+                            'button[aria-label*="location" i], [role="button"][aria-label*="location" i], '
+                            + '[aria-label*="location" i]:has(p)'
+                        )].filter(visible);
+                        let clickable = controls.find(control => {
+                            const label = [...control.querySelectorAll('p')].find(visible) || control;
+                            const text = (label.innerText || label.textContent || '').replace(/\s+/g, ' ').trim();
+                            return text && !/^(?:(?:change|edit|search(?: by)?) )?location$/i.test(text);
+                        });
+                        const marker = [...document.querySelectorAll('svg[id^="location-marker"]')].find(visible);
+                        if (!clickable && marker) clickable = marker.closest('[role="button"], button, a');
+                        if (!clickable) clickable = controls[0];
+                        if (!clickable && marker) {
+                            let node = marker.parentElement;
+                            while (node && node !== document.body) {
+                                if (node.querySelector('p')) { clickable = node; break; }
+                                node = node.parentElement;
+                            }
                         }
-                        node = node.parentElement;
-                    }
-                }
-                if (!clickable) return false;
-                clickable.scrollIntoView({ block: 'center', inline: 'center' });
-                clickable.click();
-                return true;
-            }"""
-        )
-        if not clicked:
-            return False
+                        if (!clickable) return { clicked: false, popupIds: [] };
+                        const popupIds = ['aria-controls', 'aria-owns'].flatMap(attr =>
+                            (clickable.getAttribute(attr) || '').split(/\s+/).filter(Boolean)
+                        );
+                        clickable.scrollIntoView({ block: 'center', inline: 'center' });
+                        clickable.click();
+                        return { clicked: true, popupIds };
+                    }"""
+                )
+                clicked = opened.get("clicked", False)
+                if clicked:
+                    # A generic text editor is safe only within the location
+                    # control's own popover, never elsewhere in the search page.
+                    scoped_editors = [
+                        f"[id={json.dumps(popup_id)}] :is(input:not([type]), input[type='text'], "
+                        "input[type='search'], [contenteditable='true'])"
+                        for popup_id in opened.get("popupIds", [])
+                    ]
+                    if scoped_editors:
+                        editor = page.locator(
+                            f":is({_LINKEDIN_LOCATION_EDITOR_SELECTOR}, {', '.join(scoped_editors)}):visible"
+                        ).first
+                if clicked or editor.count():
+                    break
+                if attempt < 11:
+                    page.wait_for_timeout(250)
+            if not clicked and not editor.count():
+                log.warning("Could not find a visible LinkedIn location search control")
+                return False
+            editor.wait_for(state="visible", timeout=3000)
 
-        page.wait_for_timeout(500)
-        if contenteditable and _fill_location_contenteditable(page, target):
-            updated_location = _active_linkedin_search_location(page)
-            if not updated_location or _normalize_location_text(updated_location) == _normalize_location_text(target):
-                return True
-
-        inputs = [
-            "input[aria-label*='Location']",
-            "input[placeholder*='Location']",
-            "input[placeholder*='location']",
-            "input[role='combobox']",
-            "input[type='text']",
-        ]
-        for selector in inputs:
-            try:
-                field = page.locator(selector).last
-                field.wait_for(state="visible", timeout=2000)
-                field.fill(target)
-                page.wait_for_timeout(300)
-                page.keyboard.press("Enter")
-                page.wait_for_load_state("domcontentloaded", timeout=15000)
-                page.wait_for_timeout(2000)
-                return _normalize_location_text(_active_linkedin_search_location(page)) == _normalize_location_text(target)
-            except Exception:
-                continue
+        editor.click(timeout=2000)
+        try:
+            editor.fill(target, timeout=2000)
+        except PlaywrightError:
+            # Some older contenteditable implementations require keyboard events.
+            editor.press("ControlOrMeta+A", timeout=1000)
+            editor.press("Backspace", timeout=1000)
+            editor.press_sequentially(target, delay=20, timeout=2000)
+        if not _select_linkedin_location_suggestion(page, editor, target):
+            editor.press("Enter", timeout=2000)
+        return _wait_for_linkedin_location_match(page, target)
     except Exception as exc:
         log.warning("Failed to update LinkedIn search location to '%s': %s", target, exc)
 
@@ -1507,6 +1580,28 @@ def _find_linkedin_next_page_button(page):
     return None
 
 
+def _linkedin_result_card_keys(cards) -> set[str]:
+    """Use job identity, not tracking parameters or DOM nodes, to detect fresh results."""
+    return {
+        _linkedin_job_id(url) or url.split("?", 1)[0]
+        for card in cards if (url := _extract_job_url_from_card(card))
+    }
+
+
+def _wait_for_linkedin_job_cards(page, previous_keys: set[str] | None = None) -> list:
+    return wait_for_fresh_cards(
+        page, read_cards=_find_linkedin_job_cards, card_keys=_linkedin_result_card_keys,
+        previous_keys=previous_keys,
+    )
+
+
+def _next_linkedin_results_page(page, page_num: int, previous_keys: set[str]) -> tuple[list, str]:
+    return advance_results_page(
+        page, page_num, previous_keys, find_next=_find_linkedin_next_page_button,
+        click_next=_click_action_button, wait_cards=_wait_for_linkedin_job_cards, logger=log,
+    )
+
+
 @intelligent_session
 def search_and_apply(
     config_dict: dict,
@@ -1540,6 +1635,7 @@ def search_and_apply(
     to_ignore = configured_title_exclusion(config_dict) if not setup else ""
     raw_delay = config_dict.get("delay", 0)
     randomize_page_jobs = _config_flag_enabled(config_dict.get("random", False))
+    max_pages = configured_max_scan_pages(config_dict, default=None) if not setup else None
     blacklisted_companies = tuple(
         _normalize_company_name(company)
         for company in company_blacklist
@@ -1562,13 +1658,20 @@ def search_and_apply(
     failed = 0
     preparer = config_dict.get("_intelligent_preparer")
     seen_intelligent_jobs = set()
+    history = None if setup else ApplicationHistory(config_dict)
+    company_skipped = 0
+    search_stats = {"pages_scanned": 0, "candidate_urls": 0, "stop_reason": ""}
+    seen_result_pages = set()
 
     def summary(*, extra_failure=0, stopped_reason=None):
         result = {"applied": applied, "skipped": skipped, "failed": failed + extra_failure}
-        if preparer:
+        result["company_cooldown_skipped"] = company_skipped
+        result["search_stats"] = dict(search_stats)
+        if preparer or dry_run:
             result["ready"] = ready
         if stopped_reason:
             result["stopped_reason"] = stopped_reason
+            result["search_stats"]["stop_reason"] = stopped_reason
         return result
 
     try:
@@ -1614,6 +1717,7 @@ def search_and_apply(
                 _ensure_easy_apply_search_filter(page)
 
             # Process jobs on current page
+            job_cards = None
             while applied + ready < max_applications:
                 if _find_easy_apply_limit_modal(page):
                     log.warning("LinkedIn Easy Apply limit reached for today; stopping run")
@@ -1623,16 +1727,28 @@ def search_and_apply(
                     _ensure_easy_apply_search_filter(page)
                     if not _ensure_configured_linkedin_search_location(page, location):
                         return summary(extra_failure=1)
-                log.info(f"Looking for jobs (applied: {applied}/{max_applications})")
+                log.info("Scanning LinkedIn Easy Apply results page %s/%s (applied: %s/%s)",
+                         search_stats["pages_scanned"] + 1, max_pages or "all", applied, max_applications)
 
                 # Find job cards. LinkedIn has both legacy card containers and
                 # newer SDUI button-like cards keyed as job-card-component-ref-*.
-                job_cards = _find_linkedin_job_cards(page)
+                if job_cards is None:
+                    job_cards = _wait_for_linkedin_job_cards(page)
                 log.info(f"Found {len(job_cards)} job cards on page")
 
                 if not job_cards:
-                    log.info("No more job cards found")
+                    search_stats["stop_reason"] = "initial_results_timeout"
+                    log.warning("No readable LinkedIn job cards appeared within 10 seconds on the initial page")
                     break
+
+                page_keys = _linkedin_result_card_keys(job_cards)
+                page_fingerprint = frozenset(page_keys)
+                if page_fingerprint in seen_result_pages:
+                    search_stats["stop_reason"] = "repeated_results_page"
+                    log.warning("LinkedIn returned a previously scanned results page; stopping to avoid a loop")
+                    break
+                seen_result_pages.add(page_fingerprint)
+                search_stats["pages_scanned"] += 1
 
                 ordered_job_cards = _ordered_linkedin_job_cards(job_cards, randomize_page_jobs)
                 if randomize_page_jobs:
@@ -1646,12 +1762,14 @@ def search_and_apply(
                         break
 
                     prepared = None
+                    application_attempt = None
                     try:
                         # Get job URL
                         job_url = _extract_job_url_from_card(card)
                         if not job_url:
                             log.debug(f"Card {idx}: No job URL found")
                             continue
+                        search_stats["candidate_urls"] += 1
                         if preparer:
                             identity = re.search(r"/jobs/view/(?:[^/?]*-)?(\d+)", job_url)
                             job_key = identity[1] if identity else job_url
@@ -1739,6 +1857,13 @@ def search_and_apply(
                             skipped += 1
                             continue
 
+                        application_job = dict(details) if details else page_job_metadata(page, job_url)
+                        application_job.update(url=job_url, company=(details or {}).get("company") or company_name)
+                        application_attempt = history.attempt(application_job, "linkedin-apply", dry_run=dry_run)
+                        if not application_attempt.allowed:
+                            company_skipped += 1
+                            skipped += 1
+                            continue
                         if preparer:
                             prepared = preparer.prepare(details)
                             prepared.verify_published()
@@ -1779,8 +1904,11 @@ def search_and_apply(
                             require_fresh_resume=bool(prepared),
                         )
 
+                        if dry_run and result == "APPLIED":
+                            result = "READY"
                         if result == "APPLIED":
                             applied += 1
+                            application_attempt.success(application_job)
                             log.info(f"Successfully applied to job {idx}")
                         elif result == "READY":
                             ready += 1
@@ -1813,6 +1941,9 @@ def search_and_apply(
                             )
                             page.wait_for_timeout(int(apply_delay_seconds * 1000))
 
+                    except HistoryError as e:
+                        log.error("Application history error; stopping to prevent duplicate submissions: %s", e)
+                        return summary(stopped_reason="history_error")
                     except PreparationError as e:
                         log.error("%s", e)
                         failed += 1
@@ -1829,19 +1960,20 @@ def search_and_apply(
                         if preparer:
                             _close_easy_apply_modal(page)
                         continue
+                    finally:
+                        if application_attempt:
+                            application_attempt.close()
 
-                # Try to go to next page if we haven't reached max
-                if applied + ready < max_applications:
-                    next_btn = _find_linkedin_next_page_button(page)
-                    if next_btn:
-                        log.info("Going to next page")
-                        if not _click_action_button(next_btn):
-                            log.info("LinkedIn next page button was present but could not be clicked")
-                            break
-                        page.wait_for_timeout(2000)
-                    else:
-                        log.info("No next page button found")
-                        break
+                if applied + ready >= max_applications:
+                    search_stats["stop_reason"] = "max_applications_reached"
+                    break
+                if max_pages is not None and search_stats["pages_scanned"] >= max_pages:
+                    search_stats["stop_reason"] = "max_scan_pages_reached"
+                    break
+                job_cards, reason = _next_linkedin_results_page(page, search_stats["pages_scanned"], page_keys)
+                if reason:
+                    search_stats["stop_reason"] = reason
+                    break
 
             browser.close()
 
@@ -1852,7 +1984,8 @@ def search_and_apply(
         if preparer:
             return summary(extra_failure=1, stopped_reason="intelligent_run_failed")
 
-    log.info(f"Final results: applied={applied}, skipped={skipped}, failed={failed}")
+    log.info("Final results: applied=%s, skipped=%s, failed=%s; pages_scanned=%s; scan_stop_reason=%s",
+             applied, skipped, failed, search_stats["pages_scanned"], search_stats["stop_reason"])
     return summary()
 
 

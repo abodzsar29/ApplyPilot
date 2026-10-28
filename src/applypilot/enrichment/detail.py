@@ -559,6 +559,10 @@ def scrape_detail_page(page, url: str) -> dict:
         result["elapsed"] = time.time() - t0
         return result
 
+    from applypilot.application_history import page_job_metadata
+
+    metadata = page_job_metadata(page, url)
+    result.update(company=metadata["company"], company_url=metadata["company_url"])
     intel = collect_detail_intelligence(page)
 
     # Tier 1: JSON-LD
@@ -665,8 +669,10 @@ def scrape_site_batch(
                     stats[status] += 1
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
-                        "detail_scraped_at = ?, detail_error = NULL WHERE url = ?",
-                        (result.get("full_description"), result.get("application_url"), now, url),
+                        "detail_scraped_at = ?, detail_error = NULL, "
+                        "company=COALESCE(NULLIF(?, ''), company), company_url=COALESCE(NULLIF(?, ''), company_url) WHERE url = ?",
+                        (result.get("full_description"), result.get("application_url"), now,
+                         result.get("company"), result.get("company_url"), url),
                     )
                 else:
                     stats["error"] += 1

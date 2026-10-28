@@ -4,12 +4,13 @@ import logging
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
-from applypilot import config
+from applypilot import config as app_config
+from applypilot.application_history import ApplicationHistory, HistoryError, page_job_metadata
 
 log = logging.getLogger(__name__)
 
 
-def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222) -> str:
+def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222, dry_run: bool = False) -> str:
     """Apply to a LinkedIn job using the persistent browser context.
 
     Args:
@@ -24,12 +25,14 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
     profile = config.get("profile", {})
     answers = config.get("answers", {})
     resume_path = config.get("resume_path", "")
+    history = ApplicationHistory(config)
+    application_attempt = None
 
     try:
         with sync_playwright() as p:
             # Use the same persistent context that search uses
             # This ensures we have the LinkedIn session
-            linkedin_profile = str(config.CHROME_WORKER_DIR / "linkedin-search")
+            linkedin_profile = str(app_config.CHROME_WORKER_DIR / "linkedin-search")
 
             browser = p.chromium.launch_persistent_context(
                 linkedin_profile,
@@ -105,6 +108,10 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
                     log.info(f"No Easy Apply button found. Page buttons: {button_texts}")
                     return "SKIPPED:no_easy_apply"
 
+                job = page_job_metadata(page, full_url)
+                application_attempt = history.attempt(job, "linkedin-simple", dry_run=dry_run)
+                if not application_attempt.allowed:
+                    return "SKIPPED:" + application_attempt.reason
                 log.info("Found Easy Apply button, clicking...")
                 easy_apply_btn.click()
                 page.wait_for_timeout(2000)
@@ -124,6 +131,8 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
                 # Submit form
                 submit_btn = page.query_selector("button:has-text('Submit'), button:has-text('Continue')")
                 if submit_btn:
+                    if dry_run:
+                        return "READY"
                     log.info("Clicking submit button")
                     submit_btn.click()
                     page.wait_for_timeout(3000)
@@ -132,18 +141,23 @@ def apply_to_job(job_url: str, config: dict, profile_dir: str, port: int = 9222)
                     success = page.query_selector("text='Application sent', text='Thank you'")
                     if success or "confirmation" in page.url.lower():
                         log.info("Application submitted successfully")
+                        application_attempt.success(job)
                         return "APPLIED"
                     else:
                         log.info("Form submitted but no confirmation detected")
-                        return "APPLIED"
+                        return "FAILED:submission_unconfirmed"
                 else:
                     log.warning("Could not find submit button")
                     return "FAILED:submit_button_not_found"
 
             finally:
+                if application_attempt:
+                    application_attempt.close()
                 page.close()
                 browser.close()
 
+    except HistoryError:
+        raise
     except Exception as e:
         log.error(f"Error applying to job: {e}")
         import traceback

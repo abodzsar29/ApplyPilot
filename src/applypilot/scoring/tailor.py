@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from applypilot.application_history import ApplicationHistory
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
@@ -483,8 +484,12 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     completed = 0
     results: list[dict] = []
     stats: dict[str, int] = {"approved": 0, "failed_validation": 0, "failed_judge": 0, "error": 0}
+    history = ApplicationHistory(profile)
 
     for job in jobs:
+        with history.attempt(job, "tailor-check", dry_run=True) as check:
+            if not check.allowed:
+                continue
         completed += 1
         try:
             tailored, report = tailor_resume(resume_text, job, profile,

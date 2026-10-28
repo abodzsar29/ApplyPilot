@@ -1,11 +1,34 @@
-Berlin:
-
 Ashby
 Greenhouse
 join.com
 
-London:
+
 jobs.lever.co
 adzuna
 workable
+personio.de
 
+
+
+
+  "adzuna": [
+    "www.adzuna.com",
+    "www.adzuna.co.uk",
+    "www.adzuna.com.au",
+    "www.adzuna.at",
+    "www.adzuna.be",
+    "www.adzuna.com.br",
+    "www.adzuna.ca",
+    "www.adzuna.fr",
+    "www.adzuna.de",
+    "www.adzuna.in",
+    "www.adzuna.it",
+    "www.adzuna.com.mx",
+    "www.adzuna.nl",
+    "www.adzuna.co.nz",
+    "www.adzuna.pl",
+    "www.adzuna.sg",
+    "www.adzuna.co.za",
+    "www.adzuna.es",
+    "www.adzuna.ch"
+  ],

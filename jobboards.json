@@ -1,0 +1,32 @@
+{
+  "ashby": [
+    "jobs.ashbyhq.com"
+  ],
+  "greenhouse": [
+    "job-boards.greenhouse.io",
+    "job-boards.us.greenhouse.io",
+    "job-boards.eu.greenhouse.io",
+    "boards.greenhouse.io",
+    "boards.us.greenhouse.io",
+    "boards.eu.greenhouse.io"
+  ],
+  "join.com": [
+    "join.com",
+    "www.join.com"
+  ],
+  "lever": [
+    "jobs.lever.co",
+    "jobs.eu.lever.co"
+  ],
+  "workable": [
+    "apply.workable.com",
+    "jobs.workable.com",
+    "careers.workable.com",
+    "*.workable.com"
+  ],
+  "personio.de": [
+    "*.jobs.personio.de",
+    "*.jobs.personio.com",
+    "*-jobs.personio.de"
+  ]
+}

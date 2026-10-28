@@ -12,6 +12,7 @@ from urllib.parse import quote, urlencode, urljoin
 from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 from applypilot import config
+from applypilot.application_history import ApplicationHistory, HistoryError, page_job_metadata
 from applypilot.linkedin.unified_apply import (
     _browser_launch_options,
     _choose_dropdown_value,
@@ -1480,6 +1481,7 @@ def _apply_to_stepstone_job(
 ) -> str:
     job_page = context.new_page()
     application_page = None
+    application_attempt = None
     try:
         if not _goto_stepstone_job_page(job_page, job_url, referer=referer):
             return "SKIPPED"
@@ -1490,6 +1492,11 @@ def _apply_to_stepstone_job(
             log.info("Skipping StepStone job because title does not match keyword: %s", job_url)
             return "SKIPPED"
 
+        job = page_job_metadata(job_page, job_url)
+        history = config_dict.get("_application_history") or ApplicationHistory(config_dict)
+        application_attempt = history.attempt(job, "stepstone", dry_run=dry_run)
+        if not application_attempt.allowed:
+            return "SKIPPED"
         application_page = _click_application_start_button(job_page, context)
         if not application_page:
             log.info("StepStone job has no clickable application start button: %s", job_url)
@@ -1503,7 +1510,12 @@ def _apply_to_stepstone_job(
 
         _replace_main_cv_if_present(application_page, resume_path)
         _fill_stepstone_fields(application_page, profile, answers)
-        return _submit_stepstone_application(application_page, profile, answers, dry_run=dry_run)
+        result = _submit_stepstone_application(application_page, profile, answers, dry_run=dry_run)
+        if not dry_run and result == "APPLIED":
+            application_attempt.success(job | {"application_url": application_page.url})
+        return "READY" if dry_run and result == "APPLIED" else result
+    except HistoryError:
+        raise
     except PlaywrightTimeoutError as exc:
         log.warning("StepStone timeout while applying to %s: %s", job_url, exc)
         return "FAILED"
@@ -1511,6 +1523,8 @@ def _apply_to_stepstone_job(
         log.exception("StepStone error while applying to %s: %s", job_url, exc)
         return "FAILED"
     finally:
+        if application_attempt:
+            application_attempt.close()
         for page_to_close in (application_page, job_page):
             try:
                 if page_to_close and not page_to_close.is_closed():
@@ -1572,6 +1586,9 @@ def search_and_apply(
     skipped = 0
     failed = 0
     seen_urls: set[str] = set()
+    if not setup:
+        config_dict = {**config_dict, "_application_history": ApplicationHistory(config_dict)}
+    ready = 0
 
     with sync_playwright() as p:
         profile_dir = config.CHROME_WORKER_DIR / "stepstone-search"
@@ -1592,7 +1609,7 @@ def search_and_apply(
             _ensure_quick_apply_filter(page, config_dict)
 
             scanned_pages = 0
-            while applied < max_applications and scanned_pages < max_pages:
+            while applied + ready < max_applications and scanned_pages < max_pages:
                 scanned_pages += 1
                 urls = [url for url in _find_stepstone_job_urls(page) if url not in seen_urls]
                 log.info("Found %d StepStone job card(s) on page %d", len(urls), scanned_pages)
@@ -1600,7 +1617,7 @@ def search_and_apply(
                     break
 
                 for job_url in urls:
-                    if applied >= max_applications:
+                    if applied + ready >= max_applications:
                         break
                     seen_urls.add(job_url)
                     log.info("Processing StepStone job: %s", job_url)
@@ -1613,6 +1630,8 @@ def search_and_apply(
                     )
                     if result == "APPLIED":
                         applied += 1
+                    elif result == "READY":
+                        ready += 1
                     elif result == "SKIPPED":
                         skipped += 1
                     else:
@@ -1621,10 +1640,10 @@ def search_and_apply(
                     if apply_delay_seconds > 0:
                         page.wait_for_timeout(int(apply_delay_seconds * 1000))
 
-                if applied < max_applications and not _go_to_next_results_page(page):
+                if applied + ready < max_applications and not _go_to_next_results_page(page):
                     break
         finally:
             browser.close()
 
     log.info("Final StepStone results: applied=%d, skipped=%d, failed=%d", applied, skipped, failed)
-    return {"applied": applied, "skipped": skipped, "failed": failed}
+    return {"applied": applied, "ready": ready, "skipped": skipped, "failed": failed}

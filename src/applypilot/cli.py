@@ -157,6 +157,8 @@ def apply(
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    company_cooldown_days: int = typer.Option(30, "--company-cooldown-days", min=0,
+                                            help="Skip companies applied to within this many days; 0 disables."),
 ) -> None:
     """Launch auto-apply to submit job applications."""
     _bootstrap()
@@ -253,6 +255,7 @@ def apply(
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
+        company_cooldown_days=company_cooldown_days,
     )
 
 
@@ -334,9 +337,11 @@ def linkedin_apply(
     intelligent = _prepare_intelligent_settings(config, config_file, setup=setup)
 
     from applypilot.linkedin.filters import configured_title_exclusion, title_exclusion_label
+    from applypilot.linkedin.pagination import configured_max_scan_pages
 
     try:
         to_ignore = configured_title_exclusion(config) if not setup else ""
+        max_scan_pages = configured_max_scan_pages(config, default=None) if not setup else None
     except ValueError as exc:
         console.print(f"[red]Invalid application configuration:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -395,6 +400,8 @@ def linkedin_apply(
     console.print(f"  CV DE:   {german_resume_path_value or 'fallback'}")
     console.print(f"  Photo:   {photo_path_value or 'N/A'}")
     console.print(f"  Max:     {config.get('max_applications', 'N/A')}")
+    console.print(f"  Max scan pages: {max_scan_pages or 'all available'}")
+    console.print(f"  Company cooldown: {config.get('company_cooldown_days', 30)} days")
     console.print(f"  Delay:   {config.get('delay', 0)}s")
     console.print(f"  Random:  {config.get('random', False)}")
     console.print("  Browser: Playwright (forms use no LLM)")
@@ -434,6 +441,11 @@ def linkedin_apply(
         console.print(f"  Ready:    {result['ready']}")
     console.print(f"  Skipped:  {result['skipped']}")
     console.print(f"  Failed:   {result['failed']}")
+    console.print(f"  Company cooldown skipped: {result.get('company_cooldown_skipped', 0)}")
+    console.print(f"  Pages scanned: {result.get('search_stats', {}).get('pages_scanned', 0)}")
+    console.print(f"  Jobs inspected: {result.get('search_stats', {}).get('candidate_urls', 0)}")
+    if result.get("search_stats", {}).get("stop_reason"):
+        console.print(f"  Scan stop reason: {result['search_stats']['stop_reason']}")
     if result.get("stopped_reason") == "easy_apply_limit_reached":
         console.print("\n[yellow]LinkedIn Easy Apply limit reached for today. Stopping run; try again tomorrow.[/yellow]")
     elif result.get("stopped_reason"):
@@ -521,7 +533,7 @@ def linkedin_noneasy(
             raise typer.Exit(code=1)
 
     try:
-        validate_non_easy_config(config)
+        jobboard_filter = validate_non_easy_config(config)
         effective_model, provider = get_effective_model_and_provider(
             model, model_override=get_configured_model(config, "browser_model"),
         )
@@ -538,7 +550,12 @@ def linkedin_noneasy(
     console.print(f"  Location: {config.get('location', 'N/A')}")
     console.print(f"  Keyword:  {config.get('title_keyword', 'N/A')}")
     console.print(f"  Ignore title: {title_exclusion_label(configured_title_exclusion(config))}")
+    console.print(f"  Jobboard filter: {'enabled' if jobboard_filter else 'disabled'}")
+    if jobboard_filter:
+        console.print(f"  Jobboards: {jobboard_filter.path} ({len(jobboard_filter.patterns)} hostname patterns)")
     console.print(f"  Max:      {config.get('max_applications', 'N/A')}")
+    console.print(f"  Max scan pages: {config.get('max_scan_pages', 3)}")
+    console.print(f"  Company cooldown: {config.get('company_cooldown_days', 30)} days")
     console.print(f"  Provider: {provider}")
     console.print(f"  Browser model: {effective_model}")
     console.print(f"  Only EN:  {config.get('only_english', False)}")
@@ -563,7 +580,14 @@ def linkedin_noneasy(
     console.print(f"  Applied:             {result['applied']}")
     console.print(f"  Ready (dry run):     {result['ready']}")
     console.print(f"  Skipped:             {result['skipped']}")
+    console.print(f"  Company blacklisted: {result.get('search_stats', {}).get('company_blacklisted', 0)}")
+    console.print(f"  Company cooldown:    {result.get('search_stats', {}).get('company_cooldown', 0)}")
+    if jobboard_filter:
+        console.print(f"  Jobboard filtered:   {result.get('search_stats', {}).get('jobboard_filtered', 0)}")
     console.print(f"  Failed:              {result['failed']}")
+    console.print(f"  Pages scanned:       {result.get('search_stats', {}).get('pages_scanned', 0)}")
+    if result.get("search_stats", {}).get("stop_reason"):
+        console.print(f"  Scan stop reason:    {result['search_stats']['stop_reason']}")
     if result.get("stopped_reason"):
         console.print(f"[yellow]Stopped:[/yellow] {result['stopped_reason']}")
 
@@ -626,6 +650,7 @@ def stepstone_apply(
     console.print(f"  Delay:    {config.get('delay', 0)}s")
     console.print(f"  Dry run:  {dry_run}")
     console.print(f"  Setup:    {setup}")
+    console.print(f"  Company cooldown: {config.get('company_cooldown_days', 30)} days")
     console.print()
 
     if setup:
@@ -633,17 +658,23 @@ def stepstone_apply(
     else:
         console.print("[cyan]Starting StepStone Quick Apply...[/cyan]")
 
-    result = search_and_apply(
-        config_dict=config,
-        max_applications=int(config.get("max_applications", 1)),
-        title_keyword=str(config.get("title_keyword", "") or ""),
-        headless=headless,
-        dry_run=dry_run,
-        setup=setup,
-    )
+    try:
+        result = search_and_apply(
+            config_dict=config,
+            max_applications=int(config.get("max_applications", 1)),
+            title_keyword=str(config.get("title_keyword", "") or ""),
+            headless=headless,
+            dry_run=dry_run,
+            setup=setup,
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(f"[red]StepStone apply stopped:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     console.print("\n[bold]Summary:[/bold]")
     console.print(f"  Applied:  {result['applied']}")
+    if "ready" in result:
+        console.print(f"  Ready:    {result['ready']}")
     console.print(f"  Skipped:  {result['skipped']}")
     console.print(f"  Failed:   {result['failed']}")
 

@@ -32,6 +32,9 @@ class IntelligentRunnerTests(unittest.TestCase):
         manager = self.stack.enter_context(patch.object(ia, "IntelligentApplySession"))
         manager.return_value.__enter__.return_value = self.session
         self.events = []
+        self.history_root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.stack.enter_context(patch.object(easy.config, "DB_PATH", self.history_root / "applypilot.db"))
+        self.stack.enter_context(patch.object(easy.config, "APP_DIR", self.history_root))
 
     def run_easy(self, *, descriptions=None, card_titles=None, detail_titles=None, config_overrides=None,
                  preparation_error=None, result="APPLIED",
@@ -97,7 +100,7 @@ class IntelligentRunnerTests(unittest.TestCase):
         filler = self.stack.enter_context(patch.object(easy, "_fill_and_submit_form", side_effect=fill))
         settings = {"job_title": "Engineer", "location": "Berlin", "resume_path": "/old.pdf",
                     "resume_paths": {"english": "/wrong-language-cv.pdf"}, "profile": {}, "answers": {},
-                    "only_english": True, "intelligent_apply": True} | (config_overrides or {})
+                    "only_english": True, "intelligent_apply": True, "company_cooldown_days": 0} | (config_overrides or {})
         summary = easy.search_and_apply(settings, max_applications=len(descriptions), dry_run=result == "READY",
                                         title_keyword=settings.get("title_keyword", ""))
         return summary, filler, generated

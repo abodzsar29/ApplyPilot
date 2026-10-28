@@ -24,6 +24,7 @@ class NonEasyTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.stack.enter_context(patch.object(ne.config, "APP_DIR", self.root))
+        self.stack.enter_context(patch.object(ne.config, "DB_PATH", self.root / "applypilot.db"))
         self.stack.enter_context(patch.object(ne.config, "LOG_DIR", self.root))
         for name in ("fallback.pdf", "english.pdf", "german.pdf", "photo.png"):
             (self.root / name).write_bytes(b"test file")
@@ -31,6 +32,7 @@ class NonEasyTests(unittest.TestCase):
         (self.root / "german.txt").write_text("German CV contents")
         self.settings = {
             "job_title": "Engineer", "location": "Berlin", "max_applications": 2,
+            "company_cooldown_days": 0,
             "profile": {"email": "candidate@example.test"}, "answers": {},
             "resume_path": str(self.root / "fallback.pdf"),
             "resume_paths": {"english": str(self.root / "english.pdf"),
@@ -193,7 +195,8 @@ class NonEasyTests(unittest.TestCase):
         self.assertEqual(captured, [prompt])
 
     def run_session(self, result="applied", *, settings=None, easy=False, description=None, dry_run=False, jobs=1,
-                    resolve_models=False, card_title="Engineer", detail_title=None):
+                    resolve_models=False, card_title="Engineer", detail_title=None, application_urls=None,
+                    landed_urls=None, same_tab=False):
         search, detail = Mock(url="about:blank"), Mock()
         search.is_closed.return_value = False
         mailbox = Mock(url=MAIL_URL)
@@ -208,10 +211,16 @@ class NonEasyTests(unittest.TestCase):
             context.pages.append(detail)
             return detail
         context.new_page.side_effect = new_page
-        application = Mock()
+        application = detail if same_tab else Mock()
+        self.application = application
+        destinations = iter(application_urls or [EXTERNAL_URL] * jobs)
+        landed = iter(landed_urls) if landed_urls else None
         def open_application(page):
-            context.pages.append(application)
-            return application, EXTERNAL_URL
+            if application not in context.pages:
+                context.pages.append(application)
+            url = next(destinations)
+            application.url = next(landed) if landed else url
+            return application, url
         cards = []
         for index in range(jobs):
             card = Mock()
@@ -220,6 +229,8 @@ class NonEasyTests(unittest.TestCase):
             cards.append(card)
         def run_agent(**kwargs):
             mailbox.close.assert_not_called()
+            if isinstance(result, Exception):
+                raise result
             return result, 1
         playwright = Mock()
         playwright.chromium.connect_over_cdp.return_value = Mock(contexts=[context])
@@ -241,7 +252,7 @@ class NonEasyTests(unittest.TestCase):
                     "description": description if description is not None else ENGLISH,
                     "title": detail_title if detail_title is not None else "Engineer", "company": "Employer"}))
             summary = ne.run_non_easy_apply(settings or self.settings, dry_run=dry_run)
-            if runner.called:
+            if runner.called and not same_tab:
                 self.assertTrue(application.close.called)
             self.assertTrue(mailbox.close.called)
             return summary, opener, runner

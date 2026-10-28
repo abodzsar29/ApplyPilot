@@ -218,7 +218,8 @@ class PreparedApplication:
         if self.finalized:
             return
         try:
-            outcome = "SUCCESS" if result in {"applied", "ready"} else "SKIPPED" if result == "skipped" else "FAILED"
+            outcome = ("SUCCESS" if result in {"applied", "ready"} else
+                       "SKIPPED" if result == "skipped" else "STOPPED" if result == "stopped" else "FAILED")
             self.audit.record("application", outcome, f"Application outcome: {result}")
         except OSError as exc:
             raise PreparationError("logs", f"Application outcome={result}, but audit write failed",

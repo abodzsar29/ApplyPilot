@@ -92,6 +92,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Discovery stage (smart_extract / job_search)
             url                   TEXT PRIMARY KEY,
             title                 TEXT,
+            company               TEXT,
+            company_url           TEXT,
             salary                TEXT,
             description           TEXT,
             location              TEXT,
@@ -147,6 +149,8 @@ _ALL_COLUMNS: dict[str, str] = {
     # Discovery
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
+    "company": "TEXT",
+    "company_url": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
@@ -349,10 +353,10 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, company, company_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), site, strategy, now, job.get("company"), job.get("company_url")),
             )
             new += 1
         except sqlite3.IntegrityError:

@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Local Greenhouse application controls</title></head>
+<body>
+<main class="job-post">
+  <h1>Software Engineer - Customer Facing Applied AI</h1>
+  <p>Job location: Edinburgh, UK</p>
+  <div class="application--container">
+    <form id="application-form">
+      <label for="first_name">First Name*</label><input id="first_name" type="text" aria-invalid="false">
+      <label for="last_name">Last Name*</label><input id="last_name" type="text" aria-invalid="false">
+      <label for="email">Email*</label><input id="email" type="text" aria-invalid="false">
+      <fieldset class="phone-input"><legend>Phone</legend>
+        <div id="country-field"></div>
+        <input id="phone-search" style="display:none" type="search" aria-label="Search">
+        <label for="phone">Phone*</label><input id="phone" type="tel" aria-invalid="false">
+      </fieldset>
+      <div id="candidate-location-field"></div>
+      <div id="question_auth-field"></div>
+      <div id="question_age-field"></div>
+      <div id="question_privacy-field"></div>
+      <div id="question_competitor-field"></div>
+      <label for="years">How many years of Python experience?</label><input id="years" type="number">
+      <label for="notice">What is your current notice period?</label><textarea id="notice"></textarea>
+      <label for="native">Native configured option</label>
+      <select id="native"><option value="">Select...</option value="yes">Yes</option><option value="no">No</option></select>
+      <label for="unknown">An unknown factual question</label><input id="unknown" type="text">
+      <input id="mirror-unrelated" aria-hidden="true" required tabindex="-1" value="">
+      <input id="resume" type="file" aria-label="Resume/CV">
+      <textarea id="g-recaptcha-response" style="display:none"></textarea>
+      <button type="submit">Submit application</button>
+    </form>
+  </div>
+</main>
+<div id="decoy" role="listbox"><div id="decoy-option" role="option">Yes</div></div>
+<div id="react-portal-mount-point"></div>
+<script>
+window.selections = {};
+window.optionClicks = [];
+window.submitCount = 0;
+window.mirrorWrites = 0;
+window.decoyClicks = 0;
+document.getElementById('decoy-option').onclick = () => window.decoyClicks++;
+window.unresponsive = false;
+window.emptySuggestions = false;
+window.hidden = document.getElementById('mirror-unrelated');
+window.hidden.addEventListener('input', () => window.mirrorWrites++);
+document.getElementById('application-form').addEventListener('submit', event => {
+  event.preventDefault(); window.submitCount++;
+});
+const dropdowns = {
+  country: {label: 'Country', options: ['United Kingdom +44', 'Germany +49'], display: '+44'},
+  'candidate-location': {label: 'Location (City)', options: ['Berlin, Berlin, Germany', 'Edinburgh, UK'], async: true},
+  question_auth: {label: 'Are you authorized to work in the United Kingdom without visa sponsorship?',
+                  options: ['No', 'Yes'], display: 'Yes'},
+  question_age: {label: 'Are you 18 years of age or older?', options: ['No', 'Yes']},
+  question_privacy: {label: 'Job Applicant Data Privacy Notice', options: ['I decline', 'I agree']},
+  question_competitor: {label: 'Are you currently employed by a client, partner, or competitor of Addepar?',
+                        options: ['Yes', 'No']}
+};
+function renderDropdown(id) {
+  const data = dropdowns[id];
+  const selected = window.selections[id];
+  const display = selected ? (id === 'country' ? '+44' : selected) : data.display;
+  const parent = document.getElementById(`${id}-field`);
+  parent.innerHTML = `<div class="field-wrapper"><div class="select"><div class="select__container">
+    <label id="${id}-label" for="${id}">${data.label}*</label>
+    <div class="select-shell"><div class="select__control">
+      <div class="select__value-container">
+        ${display ? `<div class="select__single-value">${display}</div>` : '<div class="select__placeholder">Select...</div>'}
+        <div class="select__input-container"><input id="${id}" role="combobox" type="text"
+          aria-labelledby="${id}-label" aria-errormessage="${id}-error"
+          aria-describedby="${id}-error" aria-invalid="${!selected}" aria-required="true"
+          aria-expanded="false" aria-haspopup="true" value=""></div>
+      </div></div></div>
+    ${selected ? '' : `<input required tabindex="-1" aria-hidden="true" value="">`}
+    </div>${selected ? '' : `<p id="${id}-error">This field is required.</p>`}</div></div>`;
+  const input = document.getElementById(id);
+  input.addEventListener('click', () => openMenu(id));
+  input.addEventListener('input', () => openMenu(id));
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      document.getElementById('react-portal-mount-point').innerHTML = '';
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-controls');
+    }
+  });
+}
+let cityTimer;
+function openMenu(id) {
+  const input = document.getElementById(id);
+  const data = dropdowns[id];
+  input.setAttribute('aria-expanded', 'true');
+  input.setAttribute('aria-controls', `${id}-listbox`);
+  const draw = () => {
+    if (!input.isConnected) return;
+    const root = document.getElementById('react-portal-mount-point');
+    root.innerHTML = `<div id="${id}-listbox" role="listbox"></div>`;
+    const query = input.value.toLowerCase().replace(/,/g, '').split(/\s+/).filter(Boolean);
+    const choices = window.emptySuggestions && id === 'candidate-location' ? [] : data.options;
+    for (const text of choices) {
+      if (!query.every(word => text.toLowerCase().includes(word))) continue;
+      const option = document.createElement('div');
+      option.setAttribute('role', 'option'); option.textContent = text;
+      option.addEventListener('click', () => {
+        window.optionClicks.push([id, text]);
+        if (window.unresponsive && id === 'question_auth') return;
+        window.selections[id] = text;
+        root.innerHTML = '';
+        // A real React Select commit replaces the input; its search value stays empty.
+        renderDropdown(id);
+      });
+      document.getElementById(`${id}-listbox`).appendChild(option);
+    }
+  };
+  if (data.async) {
+    clearTimeout(cityTimer);
+    document.getElementById('react-portal-mount-point').innerHTML = '';
+    cityTimer = setTimeout(draw, 120);
+  } else draw();
+}
+for (const id of Object.keys(dropdowns)) renderDropdown(id);
+window.addTestDropdown = (id, label, options) => {
+  dropdowns[id] = {label, options};
+  const field = document.createElement('div'); field.id = `${id}-field`;
+  document.getElementById('application-form').appendChild(field);
+  renderDropdown(id);
+};
+</script>
+</body>
+</html>

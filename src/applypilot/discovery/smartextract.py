@@ -108,10 +108,10 @@ def _store_jobs_filtered(
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, company, company_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), site, strategy, now, job.get("company"), job.get("company_url")),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -740,6 +740,10 @@ def execute_json_ld(intel: dict, plan: dict) -> list[dict]:
                 job[field] = None
                 continue
             job[field] = resolve_json_path(entry, path)
+        organization = entry.get("hiringOrganization") or {}
+        if isinstance(organization, dict):
+            job["company"] = organization.get("name")
+            job["company_url"] = organization.get("sameAs") or organization.get("url")
         jobs.append(job)
     return jobs
 

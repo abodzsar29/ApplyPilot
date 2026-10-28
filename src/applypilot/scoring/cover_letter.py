@@ -11,6 +11,7 @@ import re
 import time
 from datetime import datetime, timezone
 
+from applypilot.application_history import ApplicationHistory
 from applypilot.config import COVER_LETTER_DIR, RESUME_PATH, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
@@ -230,8 +231,12 @@ def run_cover_letters(min_score: int = 7, limit: int = 20,
     completed = 0
     results: list[dict] = []
     error_count = 0
+    history = ApplicationHistory(profile)
 
     for job in jobs:
+        with history.attempt(job, "cover-check", dry_run=True) as check:
+            if not check.allowed:
+                continue
         completed += 1
         try:
             letter = generate_cover_letter(resume_text, job, profile,
