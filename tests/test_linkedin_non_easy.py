@@ -26,6 +26,11 @@ class NonEasyTests(unittest.TestCase):
         self.stack.enter_context(patch.object(ne.config, "APP_DIR", self.root))
         self.stack.enter_context(patch.object(ne.config, "DB_PATH", self.root / "applypilot.db"))
         self.stack.enter_context(patch.object(ne.config, "LOG_DIR", self.root))
+        # Most runner tests isolate filtering/handoffs, not the search UI.
+        self.location_guard = self.stack.enter_context(patch.object(
+            ne, "_ensure_configured_linkedin_search_location", return_value=True,
+        ))
+        self.stack.enter_context(patch.object(ne, "_log_active_linkedin_search_state"))
         for name in ("fallback.pdf", "english.pdf", "german.pdf", "photo.png"):
             (self.root / name).write_bytes(b"test file")
         (self.root / "english.txt").write_text("English CV contents")

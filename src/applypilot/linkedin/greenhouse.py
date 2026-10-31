@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import Error as PlaywrightError
 
+from applypilot.linkedin.email_verification import is_verification_field
 from applypilot.linkedin.jobboards import load_jobboard_filter
 from applypilot.linkedin.non_easy_questions import choose_fallback_option, fallback_text
 from applypilot.linkedin.unified_apply import (
@@ -263,6 +264,10 @@ def prefill_greenhouse_application(page, settings: dict) -> list[dict]:
             continue
         input_type = (control.get_attribute("type") or "text").lower()
         if input_type not in {"text", "search", "tel", "email", "url", "number", "date"}:
+            continue
+        if is_verification_field(control):
+            # A security code is not an ordinary screening answer: never put a
+            # configured/default 'a' or '1' into one of its character boxes.
             continue
         question = _extract_field_label(form, control)
         if field_id == "country" and control.evaluate("el => !!el.closest('.phone-input')"):

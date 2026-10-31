@@ -255,12 +255,12 @@ class IntelligentRunnerTests(unittest.TestCase):
             result.finish.assert_called_once_with("applied")
         self.assertEqual(len(ne._load_applied_job_keys()), 2)
 
-    def test_non_easy_preparation_failure_does_not_open_external_form_or_record_history(self):
+    def test_non_easy_preparation_failure_does_not_run_agent_or_record_history(self):
         harness = self.non_easy_harness()
         self.session.prepare.side_effect = ia.PreparationError("llm_response", "invalid")
         summary, opener, runner = harness.run_session(settings=harness.settings | {"intelligent_apply": True})
         self.assertEqual(summary["failed"], 1)
-        opener.assert_not_called()
+        opener.assert_called_once()  # Inspect the destination before paying to prepare a CV.
         runner.assert_not_called()
         self.assertFalse(ne._history_path().exists())
 

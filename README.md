@@ -142,7 +142,12 @@ not consume its application limit or create application-history records.
 
 Set `browser` to `chrome` or `brave` to launch that installed browser instead of the default Playwright Chromium browser. Optional browser-context settings include `locale`, `timezone_id`, `geolocation`, `permissions`, `user_agent`, `viewport`, `device_scale_factor`, `accept_language`, and `extra_http_headers`. Set `search_url` only to reuse a LinkedIn jobs route; the generated `job_title`, `location`, and Easy Apply filter still come from config so stale copied URLs cannot override them. Set `"old_url": true` to preserve the copied `search_url` parameters while replacing its `keywords` value with `job_title` from config. Set `use_search_results_url` to `true` to open LinkedIn's `/jobs/search-results/` route instead of `/jobs/search/`. Add intentional extra query values with `search_params`, for example a fresh `geoId` or `distance`. For phone dropdowns, set `profile.phone_country` to the country name LinkedIn shows, for example `United Kingdom`.
 
-If LinkedIn displays a different search location, Easy Apply corrects it through the location button/popover or legacy inline input, selects the matching suggestion, and verifies the updated location before processing jobs. An unresolved location mismatch still stops the run to avoid applying in the wrong place.
+If LinkedIn displays a different search location, both `linkedin-apply` and
+`linkedin-noneasy` correct it through the location button/popover or legacy inline
+input, select the matching suggestion, and verify the updated location before
+processing jobs. An unresolved location mismatch still stops the run to avoid
+applying in the wrong place. Non-Easy Apply's discovery-only search uses the same
+correction logic.
 
 Both LinkedIn application commands honor `max_scan_pages` in this JSON file (a positive
 integer, for example `2000`). It limits search-result pages, while `max_applications`
@@ -270,6 +275,34 @@ submitting after later redirects. This is application filtering, not a network
 firewall; normal page assets and the configured verification mailbox are not
 blocked. When enabled, a missing, malformed, or empty allowlist stops the run
 before the browser opens, rather than silently disabling the filter.
+
+### Missing or expired external jobs (`linkedin-noneasy`)
+
+Missing-job pages are detected locally before résumé generation or agent execution,
+including Personio's HTTP-200 page saying "This URL does not exist", main-document
+HTTP 404/410 responses, and visible closed/expired job messages. These count as
+`Expired/unavailable` skips, not successful applications or company cooldowns, and
+do not consume the external-application limit. The runner closes that application's
+tabs and continues scanning. The browser agent is also stopped between steps if
+navigation later reaches an unavailable job, rather than starting repeated
+continuation attempts. Mailbox tabs, hidden error templates, scripts, and missing
+images/iframes are not treated as missing jobs. Detection makes no LLM requests.
+
+### Email verification (`linkedin-noneasy`)
+
+Greenhouse security codes from a signed-in Proton inbox are handled locally
+between agent steps. The helper opens the matching employer conversation, checks
+the Greenhouse sender domain, applicant recipient, employer subject and message
+timestamp, and reads the code from Proton's **Email content** iframe. It preserves
+letter case and fills either a single field or separate character boxes with real
+browser input events, reacquiring controls after re-renders. Ordinary answer
+defaults never fill verification-code fields. The helper does not submit, request
+another code, send/delete mail, log codes, or mark an application successful.
+
+The existing mailbox session must be logged in. Missing or unreadable codes get
+at most three polls, with ten seconds between polls, then a specific email
+verification failure instead of repeated agent continuations. Other boards and
+mail interfaces retain the browser agent's email-verification instructions.
 
 ### Configured answers on external applications
 

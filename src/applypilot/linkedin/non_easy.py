@@ -23,10 +23,12 @@ from applypilot.apply.chrome import (
     launch_chrome,
     reset_worker_dir,
 )
+from applypilot.linkedin.email_verification import EmailVerificationHandler
 from applypilot.linkedin.filters import configured_title_exclusion, title_is_ignored
 from applypilot.linkedin.greenhouse import prefill_greenhouse_application
 from applypilot.linkedin.intelligent_apply import PreparationError, intelligent_enabled, intelligent_session
 from applypilot.linkedin.jobboards import JobboardFilter, load_jobboard_filter
+from applypilot.linkedin.job_status import JobAvailabilityMonitor
 from applypilot.linkedin.non_easy_questions import UNKNOWN_QUESTION_POLICY
 from applypilot.linkedin.pagination import advance_results_page, wait_for_fresh_cards
 from applypilot.linkedin.pagination import configured_max_scan_pages as _configured_max_scan_pages
@@ -34,11 +36,13 @@ from applypilot.linkedin.unified_apply import (
     _click_action_button,
     _configured_language_resume_paths,
     _detect_job_language,
+    _ensure_configured_linkedin_search_location,
     _extract_company_name,
     _extract_job_title_from_card,
     _find_linkedin_next_page_button,
     _is_blacklisted_company,
     _job_language_allowed,
+    _log_active_linkedin_search_state,
     _normalize_company_name,
     _select_resume_path_for_job,
 )
@@ -156,6 +160,27 @@ def _close_application_tabs(context, keep):
                 pass
 
 
+def _application_state_check(monitor, application_page, initial_pages, *, mailbox_host=None):
+    """Watch this application and tabs it opens, excluding preexisting/mailbox tabs."""
+    def check():
+        pages = [application_page, *(page for page in monitor.context.pages
+                                   if page not in initial_pages and page is not application_page)]
+        for page in pages:
+            try:
+                if page.is_closed():
+                    continue
+                if mailbox_host and urlparse(page.url).hostname == mailbox_host:
+                    continue
+                reason = monitor.reason(page)
+                if reason:
+                    log.info("External job unavailable at %s: %s; stopping this application", page.url, reason)
+                    return "RESULT:EXPIRED"
+            except PlaywrightError:
+                continue
+        return None
+    return check
+
+
 def _configured_company_blacklist(settings: dict) -> tuple[str, ...]:
     """Use the same normalized company-name matching as Easy Apply."""
     companies = settings.get("company_blacklist")
@@ -166,6 +191,13 @@ def _configured_company_blacklist(settings: dict) -> tuple[str, ...]:
     return tuple(dict.fromkeys(
         normalized for name in companies if (normalized := _normalize_company_name(name))
     ))
+
+
+def _application_progress_check(availability_check, verification):
+    """Check terminal pages first, then perform the local email-code handoff."""
+    def check():
+        return availability_check() or verification.check()
+    return check
 
 
 def _non_easy_company_name(detail_page, card=None) -> str:
@@ -322,6 +354,20 @@ Mailbox URL: {mailbox_url}
 - Use the existing mailbox tab. If it is absent, open the configured inbox URL.
 - Check the newest relevant employer/ATS verification message for this application,
   read its code, return to the application tab, and enter the code.
+- Greenhouse/Proton verification is handled locally between browser steps.
+  FIRST inspect the CURRENT application: if the code inputs are already complete,
+  leave them unchanged and continue. Do not request another code or reopen mail.
+- Proton renders email bodies inside iframe[data-testid="content-iframe"] with
+  title "Email content". The outer article HTML does not include that body.
+  Preserve every character and its case; codes may contain letters AND digits.
+- A code is NOT a screening answer: never use a placeholder or random answer.
+  Code widgets can be one input or a group of one-character inputs; verify their
+  actual values and validation state before resubmitting.
+- Snapshot refs such as e877/f3e12 are NOT HTML attributes. Never use selectors
+  like input[ref="e877"] or treat semantic roles such as heading as HTML tags.
+  Use real labels, IDs, input[autocomplete="one-time-code"], or inputs scoped to
+  the verification fieldset/group. Use browser typing/fill actions, not direct
+  input.value assignment, so React receives normal input events.
 - Check at most three times, waiting at most 10 seconds between checks. If the
   inbox requires a login you cannot complete using the existing session, or no
   matching code arrives, output RESULT:FAILED:email_2fa_unavailable.
@@ -484,6 +530,10 @@ an explicit configured answer takes precedence.
 1. Start by listing tabs/windows and select the page matching the external application URL above, allowing redirects to the employer's ATS only when permitted by JOB-BOARD FILTER if enabled. Exclude mailbox tabs, including mailbox login pages. The external application page is expected to already be open from LinkedIn. Use that live page instead of trying to rediscover the job.
 2. If no external tab is already open, navigate directly to the external application URL as a fallback.
 3. Read the page with browser_snapshot. Use the visible page content/HTML structure to understand the form.
+   A 404/410, "This URL does not exist", "Page not found", "Job not found", or
+   closed/expired job message is terminal: immediately output RESULT:EXPIRED.
+   Do not reload, change the language, guess replacement URLs, click Back to all
+   jobs, search other listings, or restart this application to work around it.
 4. Upload the resume PDF when asked.
 5. Fill all identifiable required fields from the provided profile.
 6. Answer screening questions using the question policy above.
@@ -874,6 +924,10 @@ def search_non_easy_jobs(config_dict: dict, headless: bool = False) -> tuple[lis
             log.info("Searching LinkedIn non-Easy-Apply jobs: %s in %s", job_title, location)
             page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(3000)
+            _log_active_linkedin_search_state(page, job_title, location)
+            if not _ensure_configured_linkedin_search_location(page, location):
+                raise RuntimeError("Could not set the configured LinkedIn search location")
+            _log_active_linkedin_search_state(page, job_title, location)
 
             page_num = 1
             scanned_urls: set[str] = set()
@@ -1019,6 +1073,9 @@ def _run_external_application_once(
     provider: str, model: str, agent: QwenMCPAgent | None, job: dict, config_dict: dict, port: int, dry_run: bool,
 ) -> tuple[str, int]:
     """Run the configured browser agent against a single external application URL."""
+    page_check = config_dict.get("_application_state_check")
+    if callable(page_check) and (terminal := page_check()):
+        return _extract_result(terminal), 0
     jobboard_filter = load_jobboard_filter(config_dict)
     if jobboard_filter:
         if not jobboard_filter.matches(job.get("application_url", "")):
@@ -1065,6 +1122,15 @@ def _run_external_application_once(
         with open(log_file, "w", encoding="utf-8") as lf:
             assert proc.stdout is not None
             for line in proc.stdout:
+                if callable(page_check) and (terminal := page_check()):
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    lf.write(f"[INFO] Deterministic page guard stopped the agent.\n{terminal}\n")
+                    return _extract_result(terminal), int((time.time() - start) * 1000)
                 line = line.strip()
                 if not line:
                     continue
@@ -1096,7 +1162,8 @@ def _run_external_application_once(
 
     suffix = "_answer_retry" if config_dict.get("_answer_fallback_retry") else ""
     log_file = config.LOG_DIR / f"linkedin_noneasy_{provider}_{int(start)}{suffix}.log"
-    output = agent.run_prompt(prompt, log_path=log_file)
+    guard = {"stop_check": page_check} if callable(page_check) else {}
+    output = agent.run_prompt(prompt, log_path=log_file, **guard)
     status = _extract_result(output)
     duration_ms = int((time.time() - start) * 1000)
     return status, duration_ms
@@ -1189,6 +1256,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
             "company_blacklisted": 0,
             "company_cooldown": 0,
             "jobboard_filtered": 0,
+            "expired": 0,
             "no_external_url": 0,
             "pages_scanned": 0,
             "stop_reason": "",
@@ -1223,6 +1291,16 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                 search_page = context.new_page()
             detail_page = context.new_page()
             mailbox_page = None
+            availability = JobAvailabilityMonitor(context)
+
+            def skip_unavailable(page):
+                reason = availability.reason(page)
+                if not reason:
+                    return False
+                summary["skipped"] += 1
+                summary["search_stats"]["expired"] += 1
+                log.info("Skipping unavailable external job %s: %s", page.url, reason)
+                return True
 
             try:
                 mailbox_page = _ensure_mailbox_tab(context, config_dict, (search_page, detail_page))
@@ -1230,6 +1308,13 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                 log.info("Searching LinkedIn non-Easy-Apply jobs: %s in %s", job_title, location)
                 search_page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
                 search_page.wait_for_timeout(3000)
+                _log_active_linkedin_search_state(search_page, job_title, location)
+                if not _ensure_configured_linkedin_search_location(search_page, location):
+                    summary["failed"] += 1
+                    summary["stopped_reason"] = "location_mismatch"
+                    summary["search_stats"]["stop_reason"] = "location_mismatch"
+                    return summary
+                _log_active_linkedin_search_state(search_page, job_title, location)
 
                 page_num = 1
                 seen_urls: set[str] = set()
@@ -1373,17 +1458,17 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                         prepared = None
                         outcome = "failed"
                         try:
-                            application_page, application_url = None, None
+                            # Open and inspect before any paid résumé generation,
+                            # whether or not the hostname allowlist is enabled.
+                            application_page, application_url = _open_external_application_page(detail_page)
+                            if not application_page:
+                                summary["skipped"] += 1
+                                summary["search_stats"]["no_external_url"] += 1
+                                outcome = "skipped"
+                                log.info("No external application page opened after Apply click: %s", linkedin_url)
+                                continue
+                            application_url = application_page.url
                             if jobboard_filter:
-                                # Inspect the landed destination before spending a résumé API call.
-                                application_page, application_url = _open_external_application_page(detail_page)
-                                if not application_page:
-                                    summary["skipped"] += 1
-                                    summary["search_stats"]["no_external_url"] += 1
-                                    outcome = "skipped"
-                                    log.info("No external application page opened after Apply click: %s", linkedin_url)
-                                    continue
-                                application_url = application_page.url
                                 if not jobboard_filter.matches(application_url):
                                     summary["skipped"] += 1
                                     summary["search_stats"]["jobboard_filtered"] += 1
@@ -1392,19 +1477,17 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                              application_url, jobboard_filter.path)
                                     continue
                                 job_settings = {**job_settings, "_jobboard_filter": jobboard_filter}
+                            if skip_unavailable(application_page):
+                                outcome = "skipped"
+                                continue
                             if preparer:
                                 prepared = preparer.prepare({**details, **job})
                                 prepared.verify_published()
                                 job_settings = {**job_settings, "resume_path": str(prepared.published_pdf),
                                                 "_intelligent_resume_text": prepared.text,
                                                 "_intelligent_pdf_sha256": prepared.pdf_sha256}
-                            if not jobboard_filter:
-                                application_page, application_url = _open_external_application_page(detail_page)
-                            if not application_page:
-                                summary["skipped"] += 1
-                                summary["search_stats"]["no_external_url"] += 1
+                            if skip_unavailable(application_page):
                                 outcome = "skipped"
-                                log.info("No external application page opened after Apply click: %s", linkedin_url)
                                 continue
 
                             prefill_report = prefill_greenhouse_application(application_page, job_settings)
@@ -1423,6 +1506,18 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                     continue
                                 log.info("Jobboard filter matched application host: %s", urlparse(application_url).hostname)
 
+                            if skip_unavailable(application_page):
+                                outcome = "skipped"
+                                continue
+                            availability_check = _application_state_check(
+                                availability, application_page, set(context.pages), mailbox_host=inbox_host,
+                            )
+                            verification = EmailVerificationHandler(
+                                application_page, mailbox_page, job_settings, job["company"],
+                            )
+                            job_settings = {**job_settings, "_application_state_check": _application_progress_check(
+                                availability_check, verification,
+                            )}
                             job["application_url"] = application_url or ""
                             summary["jobs"].append(job)
                             summary["found"] += 1
@@ -1436,7 +1531,14 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                                 port=port,
                                 dry_run=dry_run,
                             )
-                            if jobboard_filter and result == "failed:jobboard_filtered":
+                            if result == "expired":
+                                summary["found"] -= 1
+                                summary["jobs"].pop()
+                                summary["skipped"] += 1
+                                summary["search_stats"]["expired"] += 1
+                                outcome = "skipped"
+                                log.info("Application skipped: external job is missing, closed, or expired")
+                            elif jobboard_filter and result == "failed:jobboard_filtered":
                                 summary["found"] -= 1
                                 summary["jobs"].pop()
                                 summary["skipped"] += 1
@@ -1506,6 +1608,7 @@ def _run_non_easy_apply_direct(config_dict: dict, model: str = "qwen-flash",
                          summary["search_stats"]["stop_reason"] or "max_applications_reached",
                          summary["search_stats"]["pages_scanned"], max_pages, inspected)
             finally:
+                availability.close()
                 _close_application_tabs(context, (search_page, detail_page))
                 try:
                     detail_page.close()

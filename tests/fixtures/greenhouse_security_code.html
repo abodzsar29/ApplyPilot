@@ -1,0 +1,31 @@
+<!doctype html>
+<html><body>
+<form id="application-form">
+  <label for="first-name">First Name</label><input id="first-name" value="Candidate">
+  <fieldset id="verification" aria-label="A verification code was sent to candidate@example.test. To submit your application, enter the 8-character code to confirm you're a human.">
+    <legend>Security code</legend><div id="code-inputs"></div>
+  </fieldset>
+  <button type="submit" id="submit" disabled>Submit application</button>
+</form>
+<script>
+window.verificationState = Array(8).fill('');
+window.inputEvents = [];
+window.submitCount = 0;
+window.segmented = true;
+window.rerender = false;
+window.renderInputs = () => {
+  document.querySelector('#code-inputs').innerHTML = window.segmented
+    ? window.verificationState.map((value, index) => `<input type="text" id="code-${index}" maxlength="1" data-index="${index}" value="${value}" ${index === 0 ? 'aria-label="Security code" autocomplete="one-time-code"' : ''}>`).join('')
+    : `<input type="text" aria-label="Security code" id="security-code" autocomplete="one-time-code" maxlength="8" value="${window.verificationState.join('')}">`;
+};
+document.querySelector('#code-inputs').addEventListener('input', event => {
+  window.inputEvents.push(event.isTrusted);
+  if (window.segmented) window.verificationState[Number(event.target.dataset.index)] = event.target.value;
+  else window.verificationState = event.target.value.split('');
+  document.querySelector('#submit').disabled = window.verificationState.join('').length !== 8;
+  if (window.rerender) window.renderInputs();
+});
+document.querySelector('form').onsubmit = event => { event.preventDefault(); window.submitCount++; };
+window.renderInputs();
+</script>
+</body></html>

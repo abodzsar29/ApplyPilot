@@ -582,6 +582,7 @@ def linkedin_noneasy(
     console.print(f"  Skipped:             {result['skipped']}")
     console.print(f"  Company blacklisted: {result.get('search_stats', {}).get('company_blacklisted', 0)}")
     console.print(f"  Company cooldown:    {result.get('search_stats', {}).get('company_cooldown', 0)}")
+    console.print(f"  Expired/unavailable: {result.get('search_stats', {}).get('expired', 0)}")
     if jobboard_filter:
         console.print(f"  Jobboard filtered:   {result.get('search_stats', {}).get('jobboard_filtered', 0)}")
     console.print(f"  Failed:              {result['failed']}")

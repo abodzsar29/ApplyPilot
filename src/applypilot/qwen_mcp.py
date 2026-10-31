@@ -448,28 +448,44 @@ class QwenMCPAgent:
             description="Autonomous browser agent for job applications.",
         )
 
-    def _run_once(self, prompt: str, log_handle) -> str:
+    def _run_once(self, prompt: str, log_handle, *, stop_check=None) -> str:
         """Execute one prompt against the current assistant config."""
         rendered = ""
         last_rendered = ""
-        for response in self._assistant.run(messages=[{"role": "user", "content": prompt}]):
-            if not isinstance(response, list):
-                continue
-            rendered = _render_messages(response)
-            if not rendered:
-                continue
-            delta = rendered[len(last_rendered):] if rendered.startswith(last_rendered) else rendered
-            if delta:
-                log_handle.write(delta)
-            last_rendered = rendered
+        responses = iter(self._assistant.run(messages=[{"role": "user", "content": prompt}]))
+        try:
+            while True:
+                # A browser tool yields before the next model request. Inspect
+                # deterministic terminal states here, not in another LLM turn.
+                terminal = stop_check() if stop_check is not None else None
+                if terminal:
+                    log_handle.write(f"\n[INFO] Deterministic page guard stopped the agent.\n{terminal}\n")
+                    return terminal
+                try:
+                    response = next(responses)
+                except StopIteration:
+                    break
+                if not isinstance(response, list):
+                    continue
+                rendered = _render_messages(response)
+                if not rendered:
+                    continue
+                delta = rendered[len(last_rendered):] if rendered.startswith(last_rendered) else rendered
+                if delta:
+                    log_handle.write(delta)
+                last_rendered = rendered
+        finally:
+            close = getattr(responses, "close", None)
+            if close is not None:
+                close()
         if rendered:
             log_handle.write("\n")
         return rendered
 
-    def _run_with_reasoning_fallback(self, prompt: str, log_handle) -> str:
+    def _run_with_reasoning_fallback(self, prompt: str, log_handle, *, stop_check=None) -> str:
         """Run once, enabling mandatory reasoning when a provider requires it."""
         try:
-            return self._run_once(prompt, log_handle)
+            return self._run_once(prompt, log_handle, stop_check=stop_check)
         except Exception as exc:
             message = str(exc)
             needs_reasoning = (
@@ -479,9 +495,9 @@ class QwenMCPAgent:
                 raise
             self._rebuild_with_reasoning(True)
             log_handle.write("[INFO] Retrying with reasoning enabled.\n")
-            return self._run_once(prompt, log_handle)
+            return self._run_once(prompt, log_handle, stop_check=stop_check)
 
-    def run_prompt(self, prompt: str, log_path=None) -> str:
+    def run_prompt(self, prompt: str, log_path=None, *, stop_check=None) -> str:
         """Execute one prompt and return the final rendered transcript."""
         if log_path is None:
             class _NullWriter:
@@ -502,7 +518,7 @@ class QwenMCPAgent:
                     log_handle.write(
                         f"[INFO] No terminal RESULT line; continuing agent attempt {attempt}/3.\n"
                     )
-                output = self._run_with_reasoning_fallback(attempt_prompt, log_handle)
+                output = self._run_with_reasoning_fallback(attempt_prompt, log_handle, stop_check=stop_check)
                 outputs.append(output)
                 if _has_terminal_result(output):
                     break

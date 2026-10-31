@@ -1,0 +1,55 @@
+<!doctype html>
+<html><body>
+<input componentkey="semanticSearchBox" value="Software">
+<div componentkey="JobsSearchFilters">
+  <label><input aria-label="Filter by Easy Apply" type="checkbox">Easy Apply</label>
+</div>
+<header componentkey="searchResultsHeaderComponent">
+  <div class="ajrayf ajrij2 ajrjqu ajrjp7 ajrjqi ajrima ajrluf">
+    <p>99+ results</p>
+    <div role="button" tabindex="0" class="ajrl2k ajrl2j ajrayf"
+      componentkey="424948b2-ba05-4ebb-bad1-977064119f35" aria-expanded="false">
+      <div class="ajraez ajrajr ajraoj ajratb ajrikq"
+        componentkey="424948b2-ba05-4ebb-bad1-977064119f35" aria-label="Location Vienna, Austria">
+        <svg id="location-dot-outline-small" aria-hidden="true" width="16" height="16"></svg>
+        <p id="current-search-location">Vienna, Austria</p>
+        <svg id="caret-down-fill-small" aria-hidden="true" width="16" height="16"></svg>
+      </div>
+    </div>
+    <div role="button" tabindex="0" aria-haspopup="dialog" aria-expanded="false">
+      <p>How promoted jobs are ranked</p>
+    </div>
+  </div>
+</header>
+<!-- The supplied snippet shows the closed control; this simulates its popover. -->
+<div id="location-popover" role="dialog" aria-label="Search location" hidden>
+  <div componentkey="LocationTypeahead_TextEditor" contenteditable="true" role="textbox" aria-label="Location"></div>
+  <div componentkey="semanticSearchBoxLocationList"></div>
+</div>
+<script>
+const control = document.querySelector('header [role="button"]');
+const popover = document.getElementById('location-popover');
+control.onclick = () => {
+  window.locationOpens = (window.locationOpens || 0) + 1;
+  control.setAttribute('aria-expanded', 'true');
+  popover.hidden = false;
+};
+document.querySelector('[contenteditable]').oninput = event => {
+  const location = event.target.innerText;
+  const list = document.querySelector('[componentkey="semanticSearchBoxLocationList"]');
+  list.innerHTML = '';
+  const option = document.createElement('a');
+  option.href = '/jobs/search-results/?location=' + encodeURIComponent(location);
+  option.textContent = location;
+  option.onclick = event => {
+    event.preventDefault();
+    document.getElementById('current-search-location').textContent = location;
+    document.querySelector('[aria-label^="Location "]').setAttribute('aria-label', 'Location ' + location);
+    control.setAttribute('aria-expanded', 'false');
+    popover.hidden = true;
+    window.locationCommitted = location;
+  };
+  list.append(option);
+};
+</script>
+</body></html>
